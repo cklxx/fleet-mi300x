@@ -59,6 +59,7 @@
 using namespace fleet;
 
 extern "C" hipError_t fleet_occupancy(int* blocks_per_cu);
+extern "C" hipError_t fleet_probe_xcds(uint32_t* d_hist, hipStream_t stream);
 extern "C" hipError_t fleet_launch_step(const RuntimeState*, const ModelDims*,
                                         const Weights*, const Activations*,
                                         const KVCache*, int token, hipStream_t);
@@ -351,18 +352,26 @@ int main(int argc, char** argv) {
     auto q = build_queues(tasks);
     auto labels = load_event_labels(graph_path);
     int max_event = -1, kv_chunks = 1;
+    std::vector<char> is_global;
     for (const auto& t : tasks) {
         max_event = std::max(max_event, (int)t.signal_event);
         if (t.kind == TASK_ATTENTION) kv_chunks = std::max(kv_chunks, (int)t.n_split);
+        if (t.signal_event >= 0 && t.signal_scope == SCOPE_GLOBAL) {
+            if ((int)is_global.size() <= t.signal_event) is_global.resize(t.signal_event + 1, 0);
+            is_global[t.signal_event] = 1;
+        }
     }
     const int n_events = max_event + 1;
+    std::vector<int32_t> global_ids;   // what the schedulers mirror; nothing else
+    for (int e = 0; e < (int)is_global.size(); ++e) if (is_global[e]) global_ids.push_back(e);
     const int done_event = tasks.back().signal_event;
     if (n_events > kMaxEvents) die("n_events " + std::to_string(n_events) + " exceeds kMaxEvents");
     if (tasks.back().kind != TASK_ARGMAX) die("last descriptor is not ARGMAX; done_event would be wrong");
-    std::printf("graph: %zu descriptors across %d workers, %d events, kv_chunks %d, "
-                "final event %d (%s)\n", tasks.size(), kXCDs * kWorkersPerXCD,
-                n_events, kv_chunks, done_event,
+    std::printf("graph: %zu descriptors across %d workers, %d events (%zu global, mirrored), "
+                "kv_chunks %d, final event %d (%s)\n", tasks.size(), kXCDs * kWorkersPerXCD,
+                n_events, global_ids.size(), kv_chunks, done_event,
                 labels.count(done_event) ? labels[done_event].c_str() : "?");
+    if (!is_global.empty() && !is_global[done_event]) die("final event is not global-scope");
 
     // ---- runtime state
     const bool uncached = std::getenv("FLEET_UNCACHED_EVENTS") != nullptr;
@@ -387,6 +396,8 @@ int main(int argc, char** argv) {
     rt.xcd_arrivals = misc;
     rt.grid_arrivals = misc + kXCDs;
     rt.abort = misc + kXCDs + 1;
+    rt.global_event_ids = dev_upload(global_ids);
+    rt.n_global_events = (int32_t)global_ids.size();
     rt.n_events = n_events;
     rt.done_event = done_event;
     rt.use_uncached_counters = uncached ? 1 : 0;
@@ -525,9 +536,31 @@ int main(int argc, char** argv) {
             "per CU. Check register pressure with -Rpass-analysis=kernel-resource-usage.");
     }
 
-    // ---- decode loop: one launch per token (v1 in §4)
     hipStream_t stream;
     HIP_CHECK(hipStreamCreate(&stream));
+
+    // ---- placement probe: kGrid blocks, counted per XCC_ID
+    {
+        uint32_t* d_hist = dev_alloc<uint32_t>(16);
+        HIP_CHECK(fleet_probe_xcds(d_hist, stream));
+        HIP_CHECK(hipStreamSynchronize(stream));
+        uint32_t hist[16];
+        HIP_CHECK(hipMemcpy(hist, d_hist, sizeof(hist), hipMemcpyDeviceToHost));
+        std::printf("placement: %d workgroups by XCC_ID:", kGrid);
+        bool ok = true;
+        for (int x = 0; x < 16; ++x) {
+            if (hist[x] || x < kXCDs) std::printf(" [%d]=%u", x, hist[x]);
+            if (x < kXCDs ? hist[x] != (uint32_t)kCUsPerXCD : hist[x] != 0) ok = false;
+        }
+        std::printf("%s\n", ok ? "  (8 x 38, as assumed)" : "");
+        if (!ok) {
+            die("workgroups are not placed 38 per XCD on this device/partition mode; "
+                "the per-XCD queues in design.md §4 assume they are (SPX mode, 304 CUs)");
+        }
+        HIP_CHECK(hipFree(d_hist));
+    }
+
+    // ---- decode loop: one launch per token (v1 in §4)
     hipEvent_t ev0, ev1;
     HIP_CHECK(hipEventCreate(&ev0));
     HIP_CHECK(hipEventCreate(&ev1));

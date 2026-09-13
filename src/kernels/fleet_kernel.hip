@@ -314,6 +314,21 @@ void fleet_decode_step(RuntimeState rt, ModelDims d, Weights w,
 // registers for fleet_decode_step is the one being launched; the launcher
 // only ever sees these two C functions.
 
+// Pre-flight: where do kGrid workgroups actually land? One ordinary launch,
+// each block counts itself under its HW_REG_XCC_ID. The launcher prints the
+// histogram and refuses to continue unless every XCD got kCUsPerXCD blocks,
+// which is the placement assumption design.md §4 makes and claim_role() would
+// otherwise only report after a cooperative launch has been paid for.
+__global__ void fleet_probe_xcc(uint32_t* hist) {
+    if (threadIdx.x == 0) atomicAdd(&hist[fleet::xcd_id() & 15], 1u);
+}
+
+extern "C" hipError_t fleet_probe_xcds(uint32_t* d_hist, hipStream_t stream) {
+    hipLaunchKernelGGL(fleet_probe_xcc, dim3(fleet::kGrid), dim3(fleet::kBlock), 0,
+                       stream, d_hist);
+    return hipGetLastError();
+}
+
 extern "C" hipError_t fleet_occupancy(int* blocks_per_cu) {
     return hipOccupancyMaxActiveBlocksPerMultiprocessor(
         blocks_per_cu, (const void*)fleet::fleet_decode_step, fleet::kBlock, 0);

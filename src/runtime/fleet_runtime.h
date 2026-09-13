@@ -102,6 +102,12 @@ struct RuntimeState {
     uint32_t* __restrict__ grid_arrivals;       // [1] grid barrier, reset per launch
     uint32_t* __restrict__ abort;               // [1] 0 = fine, else a reason code
 
+    // The ids of the GLOBAL-scope events, compact. XCD-local events never
+    // touch global_events, so the scheduler must not poll their slots: with
+    // 165 global among 805 events that would be 80% wasted fabric reads.
+    const int32_t* __restrict__ global_event_ids;
+    int32_t  n_global_events;
+
     uint32_t epoch;        // 1-based token index; counters are never reset (§12)
     int32_t  n_events;
     int32_t  done_event;   // the graph's final event: schedulers stop at epoch
@@ -261,11 +267,12 @@ __device__ __forceinline__ bool wait_event(
 
 // ---------------------------------------------------------------- scheduler
 //
-// The per-XCD scheduler's entire job: mirror global counters into this XCD's
-// flag array so its 37 workers poll that instead of the global counters.
-// Global-counter polling drops from 296 pollers to 8. It stops once the
-// graph's final event reaches this epoch — every task precedes that event
-// transitively, so nothing can still be waiting.
+// The per-XCD scheduler's entire job: mirror the global counters (only the
+// global-scope events, from the compact id list) into this XCD's flag array
+// so its 37 workers poll that instead of the global counters. Global-counter
+// polling drops from 296 pollers to 8. It stops once the graph's final event
+// reaches this epoch — every task precedes that event transitively, so
+// nothing can still be waiting.
 __device__ __forceinline__ void run_scheduler(const RuntimeState& rt, int xcd) {
     asm volatile("s_setprio 3");     // scheduler waves win arbitration
     const int lane = threadIdx.x;
@@ -283,7 +290,8 @@ __device__ __forceinline__ void run_scheduler(const RuntimeState& rt, int xcd) {
         // producer never released on, and the payload's visibility would rest
         // on cache behaviour rather than on the memory model.
         bool changed = false;
-        for (int e = lane; e < rt.n_events; e += blockDim.x) {
+        for (int k = lane; k < rt.n_global_events; k += blockDim.x) {
+            const int e = rt.global_event_ids[k];
             const uint32_t g = poll(&rt.global_events[e]);
             if (poll(&mirror[e]) != g) {
                 if (!changed) { fence_acquire(); fence_release(); changed = true; }

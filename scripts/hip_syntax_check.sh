@@ -67,8 +67,10 @@ for src in "$ROOT"/bench/microbench.hip "$ROOT"/src/kernels/fleet_kernel.hip \
            "$ROOT"/src/host/fleet_launch.hip; do
     for mode in --cuda-device-only --cuda-host-only; do
         printf '  %-30s %-19s ' "${src#$ROOT/}" "${mode#--cuda-}"
+        # -D__gfx942__=1: parse the gfx942-only branches (the XCC_ID inline
+        # asm) even when the local clang only knows an older gfx9.
         out=$("$CXX" -x hip $mode --offload-arch=$ARCH -nogpuinc -nogpulib \
-                -std=c++17 -fsyntax-only "${SDKFLAGS[@]}" \
+                -std=c++17 -fsyntax-only "${SDKFLAGS[@]}" -D__gfx942__=1 \
                 -I"$STUBS" -I"$ROOT/src" \
                 -Wall -Wextra -Wno-unused-parameter -Wno-unused-function \
                 -Wno-unused-variable -Wno-missing-field-initializers \

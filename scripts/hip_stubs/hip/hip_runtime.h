@@ -102,6 +102,7 @@ struct hipDeviceProp_t {
 };
 
 const char* hipGetErrorString(hipError_t);
+hipError_t hipGetLastError();
 hipError_t hipMalloc(void**, size_t);
 template <typename T> hipError_t hipMalloc(T** p, size_t n) {
     return hipMalloc(reinterpret_cast<void**>(p), n);

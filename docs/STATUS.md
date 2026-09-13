@@ -68,6 +68,15 @@ happening to be zero; the routing weight is multiplied by
 | `setup_env.sh` downloaded the model before the checks and skipped the HF comparison | Reordered: checks, build, graphs, smoke test, *then* the download |
 | Not adopted: "the event microbench should model fan-in, relay and payload" | `fleet_decode --smoke` runs the real protocol (296 producers, relay, all 805 events) per token; the microbench measures one hop on purpose |
 
+### Third pass (Hermes), four items, all adopted
+
+| Finding | Done |
+|---|---|
+| The one semantic the design rests on was untested: whether four waves' stores are published by *thread 0's* release fence after `__syncthreads()`. (a) only counts events | microbench **(d)**: producer's 4 waves write 32 KB, barrier, thread 0 releases and signals; consumer on another XCD acquires (thread 0) and verifies every word, 2,000 rounds. Runs first; a single stale word fails the whole benchmark |
+| The scheduler polled all 805 event slots, of which 640 are XCD-local and never touch `global_events`: 80% of its agent-scope reads were wasted fabric traffic competing with the weight stream | `RuntimeState.global_event_ids` (165 ids, built by the launcher from the descriptors); the scheduler loops over that list only |
+| (a) and (b) measured an idle fabric: 302 workgroups exit immediately, the real kernel has 296 workers streaming HBM | microbench **(e)**: the same ping-pong while the other 302 workgroups stream a 2 GiB buffer; this is the number for design.md §9 |
+| `hip_syntax_check.sh` never parsed the `#if defined(__gfx942__)` branch (the XCC_ID asm); placement was only checked after a paid cooperative launch | `-D__gfx942__=1` in the parse; a pre-flight probe launch histograms `kGrid` workgroups by `HW_REG_XCC_ID` and refuses to continue unless it is 8 × 38 |
+
 ## Done and verified locally
 
 | Component | What it does | Verified by |
@@ -82,7 +91,7 @@ happening to be zero; the routing weight is multiplied by
 | `src/runtime/fleet_runtime.h` | AOT queues, events with wait-side fields, XCD-local role tickets, grid-distribution check, wait timeouts → abort codes | Layout test 6/6; interface test 14/14; queue simulation 10/10 |
 | `src/kernels/fleet_kernel.hip`, `gemv.h`, `attention.h`, `expert.h` | Persistent kernel and task bodies; LDS-only scratch; wave-per-row GEMV; wave-per-position attention | **Parsed in HIP language mode, device and host passes, by clang 14 with the AMDGPU backend** (`scripts/hip_syntax_check.sh`): 0 errors, 0 warnings at `-Wall -Wextra`. The compiler's own `__hip_atomic_*`, `__builtin_amdgcn_fence`, attributes and inline asm are exercised; only the runtime API is stubbed |
 | `src/host/fleet_launch.hip` | Queues, event buffers, weights/cache/golden loading, YaRN tables, per-token cooperative launch, HF comparison, abort decoding, `--smoke` / `--teacher-force` / `--json` | Same parse, both passes, 0 errors |
-| `bench/microbench.hip` | D1 (a) cross-XCD event cost with the runtime's exact protocol, cached vs uncached counters; (b) same-XCD cost, with an XCC_ID check that the pair really shares a chiplet; (c) streamed read bandwidth vs depth | Same parse, 0 errors; never run |
+| `bench/microbench.hip` | D1 (d) cross-XCD payload visibility under the kernel's exact fence placement; (a) cross-XCD event cost, cached vs uncached counters; (e) the same under a 302-workgroup HBM stream; (b) same-XCD cost; (c) streamed read bandwidth vs depth; XCC_ID checks on every pair | Same parse, 0 errors; never run |
 | `src/host/pack_weights.py` | Flat bf16 blob, 256-B aligned, fused q‖kv_a, interleaved gate/up, `.manifest` the launcher parses | Syntax and CLI only; needs the checkpoint |
 | `scripts/setup_env.sh` | One-shot environment build on the MI300X: the seven local tests, hipcc, task graphs, the protocol smoke test, and only then the 31 GB download and the packing | Written; unrun |
 | `tests/test_expert_addressing.py` | Builds the packer's byte layout, resolves the 8 units as `expert.h` does, runs the kernel's arithmetic with HF's rounding points against `reference_decode.moe` | 7/7: routing exact, phase output within 4.1e-3 of the reference (bf16-ulp level), and the pre-review offsets produce a 37% error that the test reports |
