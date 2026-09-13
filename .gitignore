@@ -1,0 +1,7 @@
+.venv/
+build/
+results/
+__pycache__/
+*.pyc
+*.npz
+*.bin
