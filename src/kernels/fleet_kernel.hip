@@ -304,9 +304,12 @@ void fleet_decode_step(RuntimeState rt, ModelDims d, Weights w,
         const TaskDescriptor* t = fetch_task(rt, xcd, worker, slot);
         if (t == nullptr) break;
 
+        uint64_t t_start = 0, t_ready = 0;
         if (threadIdx.x == 0) {
+            if (rt.trace) t_start = __builtin_amdgcn_s_memrealtime();
             ok_smem = wait_event(rt, t->wait_event, (EventScope)t->wait_scope, xcd,
                                  t->wait_count) ? 1 : 0;
+            if (rt.trace) t_ready = __builtin_amdgcn_s_memrealtime();
         }
         __syncthreads();
         if (!ok_smem) break;          // abort raised somewhere: drain, exit
@@ -316,6 +319,13 @@ void fleet_decode_step(RuntimeState rt, ModelDims d, Weights w,
 
         if (threadIdx.x == 0) {
             signal_event(rt, t->signal_event, (EventScope)t->signal_scope, xcd);
+            if (rt.trace) {
+                uint64_t* tr = rt.trace + (int64_t)t->index * 4;
+                tr[0] = t_start;                                  // began waiting
+                tr[1] = t_ready;                                  // wait satisfied
+                tr[2] = __builtin_amdgcn_s_memrealtime();         // signalled
+                tr[3] = (uint64_t)xcd;
+            }
         }
     }
 }

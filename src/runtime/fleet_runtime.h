@@ -115,6 +115,11 @@ struct RuntimeState {
     int32_t  smoke;        // 1 = run the protocol only, skip every task body
     int32_t  dump_layers;  // 1 = copy every layer's output x to act.layer_dump
     uint32_t spin_limit;   // polls before a wait declares a deadlock
+
+    // Optional per-descriptor trace (design.md §10): [n_descriptors][3] of
+    // s_memrealtime ticks — wait done, task done — plus the XCD id. nullptr
+    // disables it. Written by thread 0 of the worker, so it costs one store.
+    uint64_t* __restrict__ trace;
 };
 
 // Abort reason codes, read back by the host after the launch.

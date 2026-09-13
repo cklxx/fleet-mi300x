@@ -317,7 +317,7 @@ int main(int argc, char** argv) {
     std::string cache_path = "build/fleet_cache.bin";
     std::string golden_path = "build/golden_tokens.txt";
     std::string hidden_path = "build/golden_hidden.bin";
-    std::string json_path, dump_path;
+    std::string json_path, dump_path, trace_path;
     int tokens = 32, context = 1024, first_token = -1;
     bool smoke = false, teacher = false;
     uint32_t spin_limit = 1u << 22;
@@ -330,6 +330,7 @@ int main(int argc, char** argv) {
         else if (a == "--golden") golden_path = next();
         else if (a == "--hidden") hidden_path = next();
         else if (a == "--dump-layers") dump_path = next();   // write our [layers][hidden] fp32
+        else if (a == "--trace") trace_path = next();        // per-task timeline of token 1
         else if (a == "--json") json_path = next();
         else if (a == "--tokens") tokens = std::atoi(next().c_str());
         else if (a == "--context") context = std::atoi(next().c_str());
@@ -413,6 +414,8 @@ int main(int argc, char** argv) {
     rt.smoke = smoke ? 1 : 0;
     rt.dump_layers = 0;   // set for token 0 below
     rt.spin_limit = spin_limit;
+    uint64_t* d_trace = trace_path.empty() ? nullptr : dev_alloc<uint64_t>(tasks.size() * 4);
+    rt.trace = nullptr;   // enabled for token 1 only (token 0 carries the warm-up)
     rt.epoch = 0;   // set per token below; a zero epoch makes every wait trivially true
     std::printf("event counters: %s\n",
                 uncached ? "uncached (scheme ii)" : "cached + release fence (scheme i)");
@@ -524,9 +527,22 @@ int main(int argc, char** argv) {
 
         // KV cache: [layers][max_pos][576] bf16, prefill rows filled by
         // reference_run.py, decode rows zero until the kernel appends them.
-        kv.max_pos = max_pos;
+        // max_pos comes from the file (reference_run wrote context + decode
+        // rows); this run may decode fewer tokens than that, never more.
         kv.row = d.kv_lora + d.qk_rope;
-        const size_t cache_bytes = (size_t)d.layers * max_pos * kv.row * sizeof(__hip_bfloat16);
+        {
+            std::ifstream f(cache_path, std::ios::binary | std::ios::ate);
+            if (!f) die("cannot open " + cache_path + " (reference_run.py writes it)");
+            const size_t bytes = (size_t)f.tellg();
+            const size_t per_row = (size_t)d.layers * kv.row * sizeof(__hip_bfloat16);
+            if (bytes % per_row) die(cache_path + " size is not a whole number of positions");
+            kv.max_pos = (int)(bytes / per_row);
+        }
+        if (max_pos > kv.max_pos) {
+            die("cache holds " + std::to_string(kv.max_pos) + " positions but context + tokens = " +
+                std::to_string(max_pos) + "; re-run reference_run.py with a larger --decode");
+        }
+        const size_t cache_bytes = (size_t)d.layers * kv.max_pos * kv.row * sizeof(__hip_bfloat16);
         __hip_bfloat16* cache_dev = nullptr;
         HIP_CHECK(hipMalloc(&cache_dev, cache_bytes));
         upload_file(cache_path, cache_dev, cache_bytes);
@@ -608,6 +624,7 @@ int main(int argc, char** argv) {
         rt.epoch = (uint32_t)(i + 1);       // never reset; targets are epoch x producers
         d.seq_len = context + i + 1;        // rows valid after this step
         rt.dump_layers = (!smoke && i == 0) ? 1 : 0;
+        rt.trace = (d_trace && i == 1) ? d_trace : nullptr;
         if (!smoke) {
             act.cos = d_cos + (size_t)(context + i) * d.qk_rope;
             act.sin = d_sin + (size_t)(context + i) * d.qk_rope;
@@ -679,6 +696,59 @@ int main(int argc, char** argv) {
                 std::printf("  consecutive layers within the gate: %d of %d\n\n", layers_ok, d.layers);
             }
         }
+    }
+
+    // ---- per-task timeline of token 1 (design.md §10): where the time goes.
+    // Each descriptor has (began waiting, wait satisfied, signalled, xcd) in
+    // 100 MHz ticks. Aggregated per task kind and per layer; the raw rows are
+    // written for bench/gantt.py.
+    if (d_trace && tokens > 1) {
+        std::vector<uint64_t> tr(tasks.size() * 4);
+        HIP_CHECK(hipMemcpy(tr.data(), d_trace, tr.size() * sizeof(uint64_t), hipMemcpyDeviceToHost));
+        uint64_t t0 = ~0ull, t1 = 0;
+        for (size_t i = 0; i < tasks.size(); ++i) {
+            if (tr[4 * i] == 0) continue;
+            t0 = std::min(t0, tr[4 * i]); t1 = std::max(t1, tr[4 * i + 2]);
+        }
+        static const char* kind_names[] = {"QKV_FUSED", "ATTENTION", "MERGE_UV", "O_PROJ",
+            "NORM_ROUTER", "EXPERT_GATE_UP", "EXPERT_DOWN", "REDUCE", "DENSE_GATE_UP",
+            "DENSE_DOWN", "EMBED", "LM_HEAD", "ARGMAX"};
+        // per kind: busy (sum of run time), waiting (sum of wait time), and the
+        // phase span (first start to last end across all its descriptors).
+        struct Agg { double busy = 0, wait = 0; uint64_t first = ~0ull, last = 0; int n = 0; };
+        std::map<int, Agg> by_kind;
+        std::map<int, std::pair<uint64_t, uint64_t>> by_layer;   // span per layer
+        for (size_t i = 0; i < tasks.size(); ++i) {
+            if (tr[4 * i] == 0) continue;
+            const auto& t = tasks[i];
+            Agg& a = by_kind[t.kind];
+            a.busy += (double)(tr[4 * i + 2] - tr[4 * i + 1]);
+            a.wait += (double)(tr[4 * i + 1] - tr[4 * i]);
+            a.first = std::min(a.first, tr[4 * i + 1]); a.last = std::max(a.last, tr[4 * i + 2]); ++a.n;
+            auto& L = by_layer[t.layer];
+            if (L.first == 0) L = {tr[4 * i + 1], tr[4 * i + 2]};
+            L.first = std::min(L.first, tr[4 * i + 1]); L.second = std::max(L.second, tr[4 * i + 2]);
+        }
+        const double us = 0.01;   // 100 MHz ticks -> us
+        std::printf("\ntrace of token 1: %.3f ms from first wait to last signal\n", (t1 - t0) * us / 1e3);
+        std::printf("  %-15s %6s %10s %10s %10s\n", "kind", "tasks", "busy-sum", "wait-sum", "avg-busy");
+        for (auto& [k, a] : by_kind) {
+            std::printf("  %-15s %6d %8.2f ms %8.2f ms %8.1f us\n", kind_names[k], a.n,
+                        a.busy * us / 1e3, a.wait * us / 1e3, a.busy * us / a.n);
+        }
+        std::printf("  per-layer span (first task ready -> last task signalled): ");
+        double sum_layers = 0;
+        for (auto& [L, sp] : by_layer) {
+            if (L < 0) continue;
+            const double span = (sp.second - sp.first) * us;
+            sum_layers += span;
+            if (L <= 2 || L == 26) std::printf("L%d %.0f us  ", L, span);
+        }
+        std::printf("... sum %.2f ms\n", sum_layers / 1e3);
+        std::ofstream o(trace_path, std::ios::binary);
+        o.write((const char*)tr.data(), tr.size() * sizeof(uint64_t));
+        std::printf("wrote %s (%zu descriptors x 4 uint64: wait-start, ready, done, xcd; 10 ns ticks)\n",
+                    trace_path.c_str(), tasks.size());
     }
 
     // ---- summary

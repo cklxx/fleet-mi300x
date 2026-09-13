@@ -101,7 +101,7 @@ def main() -> int:
 
     # 3. descriptor fields read by the kernel must exist in the struct
     body = re.search(r"struct TaskDescriptor \{(.*?)\};", r, re.S).group(1)
-    fields = set(re.findall(r"\b(?:uint16_t|int16_t|uint8_t)\s+(\w+)", body))
+    fields = set(re.findall(r"\b(?:uint16_t|int16_t|int32_t|uint8_t)\s+(\w+)", body))
     used = set(re.findall(r"\bt(?:->|\.)(\w+)", kc))
     bad = sorted(used - fields)
     results.append(check("descriptor fields exist", not bad,

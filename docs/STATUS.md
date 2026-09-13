@@ -7,14 +7,39 @@ This file tracks what is done, what is verified, and what is known to be
 missing — the task asks for the milestone reached and the remaining limitations
 to be stated plainly, not just for code.
 
-## Where this is
+## Where this is (2026-09-14, first day on the MI300X)
 
-All work so far is **D0: local, no GPU**. Nothing has run on an MI300X yet;
-every GPU-dependent number in design.md §9 is still an estimate and is labelled
-as such. The GPU budget is ~24–30 hours, so the plan is to arrive with the code
-written, the arithmetic validated against HuggingFace on CPU, every HIP source
-parsed by a real clang front end in HIP mode, the synchronisation protocol
-executed end to end in a simulator, and the build scripted.
+**End to end works and matches HuggingFace.** On a Hot Aisle 1×MI300X VM
+(ROCm 7.2, gfx942), the persistent kernel decodes 32 greedy tokens over the
+1,024-token context, free-running (its own tokens fed back) and teacher-forced,
+and every token equals HF's; the smallest top-2 logit margin in the run is
+6.6, so this is not a lucky tie. On the first decode step all 27 layers are
+inside the §6 gate against HF's per-layer states (max rel ≤ 1.5e-2, cosine
+≥ 0.9995; layer 1, the first MoE layer, is at 3.1e-3 / 0.999993). The
+required milestone — one MoE layer through the Fleet path — is therefore met
+for every MoE layer, and the stretch goal (full model, e2e) as well.
+Raw numbers: [`results/`](../results/).
+
+| Measured | Value |
+|---|---|
+| Tokens matching HF greedy, free-running / teacher-forced | 32/32 and 32/32 |
+| Layers inside the §6 gate on step 0 | 27 of 27 |
+| Per-token latency, median / p95 (1 launch per token) | 22.05 ms / 22.16 ms (45 tok/s) |
+| Protocol only (`--smoke`, all 805 events, no task bodies) | 1.17 ms per token |
+| Cross-XCD event, idle / under a 1.46 TB/s stream | 1.44 µs / 6.0 µs (§9 was 2–4 µs) |
+| Cross-XCD payload visibility (4 waves store, thread 0 releases) | 0 stale words in 16.4 M |
+| Streamed read bandwidth, best depth | 4.25 TB/s at depth 8 (80% of peak) |
+| Kernel resources | 244 VGPRs, 0 AGPRs, 24 KB LDS, 2 waves/SIMD, 387 SGPR spills, 132 B/lane scratch |
+| KV-cache conversion vs HF's own cache | K_nope, K_rope, V all exactly 0 error, 27 layers |
+
+**Where the 22 ms goes** (per-task trace of token 1, `results/trace_d2_summary.txt`):
+each MoE layer's critical path is ~810 µs, of which attention is ~300 µs
+(16 tasks in parallel, 296 µs each: the position loop issues one load and
+waits on it, ~1 µs per position) and the router task is 371 µs (its top-k
+scan keeps a `bool taken[64]` in scratch memory and thread 0 does ~380
+serial scratch loads). Those two are the next fixes; the rest of the layer
+is ~150 µs. The byte floor is 1.2 ms and the protocol costs 1.2 ms, so the
+target after fixing them is ~5 ms per token, then §12's optimisations.
 
 ## Review pass before GPU time (2026-09-13)
 
