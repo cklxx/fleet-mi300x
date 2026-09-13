@@ -78,13 +78,14 @@ __device__ inline void expert_gate_up(
                       /*xcd=*/0, /*n_xcds=*/1, worker, n_workers);
 }
 
-// out[n] = weight * (down_n . h): this XCD's partial of the layer output. The
-// reduce task later sums the 8 partials in a fixed order — no float atomics,
-// so the result is bitwise reproducible (§4).
+// out[n] = bf16(weight * bf16(down_n . h)): this XCD's partial of the layer
+// output, with HF's roundings (down_proj yields bf16, then `mul_(weight)` in
+// bf16). The reduce task later sums the 8 partials in a fixed order — no
+// float atomics, so the result is bitwise reproducible (§4).
 __device__ inline void expert_down(
         const ExpertUnit& u, const float* __restrict__ h_lds,
         float* __restrict__ out, int hidden, int worker, int n_workers) {
-    gemv_rows(u.down, u.down_ld, h_lds, out, nullptr, EPI_NONE, u.weight,
+    gemv_rows(u.down, u.down_ld, h_lds, out, nullptr, EPI_BF16, u.weight,
               hidden, u.inter, /*xcd=*/0, /*n_xcds=*/1, worker, n_workers);
 }
 

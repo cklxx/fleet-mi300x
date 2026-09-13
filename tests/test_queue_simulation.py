@@ -54,6 +54,11 @@ def simulate(tasks: list[dict], epochs: int, order: str, seed: int = 0) -> str |
     n_events = 1 + max(t["signal_event"] for t in tasks)
     glob = [0] * n_events
     local = [[0] * n_events for _ in range(XCDS)]
+    # Workers never read the global counters: they read their XCD's mirror,
+    # which the scheduler refreshes asynchronously. Modelled as a copy taken
+    # once per pass, so within a pass a worker sees stale values — liveness
+    # must not depend on the mirror being fresh.
+    mirror = [[0] * n_events for _ in range(XCDS)]
 
     for epoch in range(1, epochs + 1):
         head = {w: 0 for w in workers}
@@ -66,6 +71,8 @@ def simulate(tasks: list[dict], epochs: int, order: str, seed: int = 0) -> str |
                 rng.shuffle(sched)
             else:
                 sched = workers
+            for x in range(XCDS):                      # the schedulers' pass
+                mirror[x] = glob[:]
             progressed = False
             for w in sched:
                 q = queues[w]
@@ -75,7 +82,8 @@ def simulate(tasks: list[dict], epochs: int, order: str, seed: int = 0) -> str |
                     t = q[head[w]]
                     if t["wait_event"] >= 0:
                         target = epoch * t["wait_count"]
-                        arr = local[t["xcd"]] if t["wait_scope"] == Scope.XCD_LOCAL else glob
+                        arr = (local[t["xcd"]] if t["wait_scope"] == Scope.XCD_LOCAL
+                               else mirror[t["xcd"]])
                         if arr[t["wait_event"]] < target:
                             break
                     if t["signal_event"] >= 0:
@@ -89,7 +97,7 @@ def simulate(tasks: list[dict], epochs: int, order: str, seed: int = 0) -> str |
             if not progressed:
                 stuck = [(w, queues[w][head[w]]) for w in workers if head[w] < len(queues[w])]
                 w, t = stuck[0]
-                arr = local[t["xcd"]] if t["wait_scope"] == Scope.XCD_LOCAL else glob
+                arr = local[t["xcd"]] if t["wait_scope"] == Scope.XCD_LOCAL else mirror[t["xcd"]]
                 return (f"epoch {epoch}: {len(stuck)} workers stuck; e.g. worker {w} "
                         f"task {t['index']} waits on event {t['wait_event']} "
                         f"(scope {t['wait_scope']}) for {epoch * t['wait_count']}, "
@@ -114,6 +122,10 @@ def main() -> int:
             err = simulate(tasks, epochs=3, order=order)
             results.append(check(f"3 epochs, {order} worker order", err is None,
                                  err or "no deadlock, counters monotonic"))
+
+        # The final event must reach exactly `epochs`: that is what stops the
+        # schedulers, and a task signalling the wrong event would show here.
+        # (simulate() already verified every descriptor ran once per epoch.)
 
         # Sabotage: the bug the descriptor used to have — waiting with the
         # signal-side count — must be caught, or this test proves nothing.

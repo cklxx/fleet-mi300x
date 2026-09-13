@@ -104,6 +104,8 @@ __global__ __launch_bounds__(kBlock) void event_pingpong(
   const bool is_producer = (wg == 0);
   const bool is_consumer = (wg == 1);
   if (!is_producer && !is_consumer) return;
+  // Record both XCC_IDs so the host can confirm the pair really spans XCDs.
+  if (threadIdx.x == 0) out_cycles[iters + (is_producer ? 0 : 1)] = xcc_id();
 
   __shared__ unsigned long long t0;
 
@@ -223,10 +225,10 @@ static double tick_ns() {
   return rate_khz > 0 ? 1e6 / rate_khz : 10.0;
 }
 
-static Stats run_event(int scheme, int iters, double ns) {
+static Stats run_event(int scheme, int iters, double ns, bool* cross_xcd) {
   unsigned *ping, *pong;
   unsigned long long* cyc;
-  HIP_CHECK(hipMalloc(&cyc, iters * sizeof(unsigned long long)));
+  HIP_CHECK(hipMalloc(&cyc, (iters + 2) * sizeof(unsigned long long)));
   if (scheme == SCHEME_UNCACHED) {
     // Uncached device memory: the atomic resolves past the XCD L2.
     HIP_CHECK(hipExtMallocWithFlags((void**)&ping, 64, hipDeviceMallocUncached));
@@ -242,8 +244,10 @@ static Stats run_event(int scheme, int iters, double ns) {
                      cyc, iters);
   HIP_CHECK(hipDeviceSynchronize());
 
-  std::vector<unsigned long long> h(iters);
-  HIP_CHECK(hipMemcpy(h.data(), cyc, iters * sizeof(h[0]), hipMemcpyDeviceToHost));
+  std::vector<unsigned long long> h(iters + 2);
+  HIP_CHECK(hipMemcpy(h.data(), cyc, h.size() * sizeof(h[0]), hipMemcpyDeviceToHost));
+  *cross_xcd = h[iters] != h[iters + 1];
+  h.resize(iters);
   HIP_CHECK(hipFree(ping)); HIP_CHECK(hipFree(pong)); HIP_CHECK(hipFree(cyc));
   return summarise(std::move(h), ns);
 }
@@ -303,12 +307,17 @@ int main(int argc, char** argv) {
 
   const int iters = 2000;
   std::printf("(a) cross-XCD event round-trip (ping-pong, us; release+atomic+poll+acquire)\n");
-  Stats wbl2 = run_event(SCHEME_CACHED, iters, ns);
-  Stats wt = run_event(SCHEME_UNCACHED, iters, ns);
+  bool cross_a = false, cross_b = false;
+  Stats wbl2 = run_event(SCHEME_CACHED, iters, ns, &cross_a);
+  Stats wt = run_event(SCHEME_UNCACHED, iters, ns, &cross_b);
   std::printf("    (i)  counters in device memory   median %6.2f  p95 %6.2f\n",
               wbl2.median / 1e3, wbl2.p95 / 1e3);
   std::printf("    (ii) counters uncached           median %6.2f  p95 %6.2f\n",
               wt.median / 1e3, wt.p95 / 1e3);
+  if (!cross_a || !cross_b) {
+    std::printf("    !! blocks 0 and 1 landed on the SAME XCD; this is not a "
+                "cross-XCD number (round-robin placement assumption failed)\n");
+  }
   std::printf("    -> design picks the cheaper: %s  (FLEET_UNCACHED_EVENTS=1 selects ii)\n\n",
               wt.median < wbl2.median ? "(ii)" : "(i)");
 

@@ -4,9 +4,11 @@
 Runs the stock DeepseekV2 implementation on the 1,024-token prompt and decodes
 32 greedy tokens, saving:
 
-  * per-layer hidden states for the first decode step  -> layer-boundary checks
+  * per-layer hidden states of the first decode step (the forward that takes
+    the prefill's output token as input)               -> layer-boundary checks
   * the compressed KV rows captured at kv_a_proj_with_mqa -> Fleet cache
-  * the 32 generated token ids and their top-2 logit margins -> end-to-end check
+  * 33 greedy token ids (prefill output + 32 decode outputs) and their top-2
+    logit margins                                        -> end-to-end check
 
 and, next to the .npz, the two files the C++ launcher consumes directly:
 `fleet_cache.bin` (the converted cache, bf16, see kv_convert.py) and
@@ -94,34 +96,52 @@ def main() -> None:
         handles.append(layer.register_forward_hook(layer_hook(i)))
         handles.append(layer.self_attn.kv_a_proj_with_mqa.register_forward_hook(kv_hook(i)))
 
-    print("prefill + first decode step")
+    # Greedy pick = torch.argmax on the bf16 logits: on a tie it returns the
+    # lowest index, which is the rule the kernel's argmax task implements.
+    # topk/argsort are only used for the margin and do not order ties.
+    def pick(logits_bf16):
+        lg = logits_bf16.float()
+        tok = int(torch.argmax(lg))
+        top2 = torch.topk(lg, 2).values
+        return tok, float(top2[0] - top2[1])
+
+    print("prefill")
     with torch.no_grad():
         out = model(ids, use_cache=True)
+    # The kv hooks have captured the prefill rows; the layer hooks captured
+    # the last *prompt* position, which is not what the decode step sees.
     for h in handles:
         h.remove()
+    handles = [layer.register_forward_hook(layer_hook(i))
+               for i, layer in enumerate(model.model.layers)]
+    hidden.clear()
 
-    first_logits = out.logits[0, -1].float().cpu().numpy()
-    order = np.argsort(-first_logits)
-    print(f"  first token {int(order[0])}, top-2 logit margin "
-          f"{first_logits[order[0]] - first_logits[order[1]]:.4f}")
+    first_logits = out.logits[0, -1]
+    tok0, m0 = pick(first_logits)
+    print(f"  first token {tok0}, top-2 logit margin {m0:.4f}")
 
-    # ---- greedy decode, no sampling, so the token sequence is a hard check
+    # ---- greedy decode, no sampling, so the token sequence is a hard check.
+    # gen_ids[0] is the prefill's output and the first decode *input*; each
+    # decode step i then has gen_ids[i+1] as its expected output, so a.decode
+    # launches need a.decode + 1 entries.
     print(f"decoding {a.decode} tokens greedily")
-    gen_ids, margins = [], []
-    past, cur = out.past_key_values, ids
-    next_id = torch.tensor([[int(order[0])]], device=a.device)
-    gen_ids.append(int(order[0]))
-    margins.append(float(first_logits[order[0]] - first_logits[order[1]]))
+    gen_ids, margins = [tok0], [m0]
+    past = out.past_key_values
+    next_id = torch.tensor([[tok0]], device=a.device)
 
     with torch.no_grad():
-        for _ in range(a.decode - 1):
+        for step in range(a.decode):
             o = model(next_id, past_key_values=past, use_cache=True)
+            if step == 0:
+                # Per-layer hidden states of the first decode step: the
+                # golden for layer-boundary checks of Fleet's step 0.
+                for h in handles:
+                    h.remove()
             past = o.past_key_values
-            lg = o.logits[0, -1].float()
-            top2 = torch.topk(lg, 2)
-            next_id = top2.indices[:1][None, :]
-            gen_ids.append(int(top2.indices[0]))
-            margins.append(float(top2.values[0] - top2.values[1]))
+            tok, m = pick(o.logits[0, -1])
+            next_id = torch.tensor([[tok]], device=a.device)
+            gen_ids.append(tok)
+            margins.append(m)
 
     print("  " + repr(tok.decode(gen_ids))[:160])
 
@@ -133,7 +153,7 @@ def main() -> None:
         prompt_ids=ids[0].cpu().numpy(),
         token_ids=np.array(gen_ids, dtype=np.int64),
         margins=np.array(margins, dtype=np.float32),
-        first_logits=first_logits,
+        first_logits=first_logits.float().cpu().numpy(),
     )
     meta = {
         "model": str(a.model), "context": a.context, "decode": a.decode,

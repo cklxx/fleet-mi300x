@@ -34,11 +34,35 @@ import numpy as np
 
 # ---------------------------------------------------------------- primitives
 
-def rms_norm(x: np.ndarray, weight: np.ndarray, eps: float) -> np.ndarray:
-    """DeepseekV2RMSNorm: normalise in fp32, scale by weight."""
+def bf16_round(x: np.ndarray) -> np.ndarray:
+    """Round fp32 to the nearest bf16 (ties to even), returned as fp32.
+
+    HuggingFace runs the model in bf16, so every tensor a bf16 module emits is
+    rounded like this. With ModelConfig.bf16 the reference applies it at the
+    same points HF does, and the HIP kernel applies it at the same points
+    (bf16_round in gemv.h). Without it the reference is the fp32 ideal.
+    """
+    x = np.array(x, dtype=np.float32)          # contiguous copy; keeps 0-d scalars 0-d
+    u = x.view(np.uint32)
+    r = (u + np.uint32(0x7FFF) + ((u >> np.uint32(16)) & np.uint32(1))) & np.uint32(0xFFFF0000)
+    return r.astype(np.uint32).view(np.float32)
+
+
+def rms_norm(x: np.ndarray, weight: np.ndarray, eps: float,
+             bf16: bool = False) -> np.ndarray:
+    """DeepseekV2RMSNorm: normalise in fp32, scale by weight.
+
+    In bf16 HF casts the normalised value to bf16 *before* multiplying by the
+    bf16 weight, and the product is bf16 again: two roundings, both applied
+    when bf16=True.
+    """
     x32 = x.astype(np.float32)
     var = np.mean(x32 * x32, axis=-1, keepdims=True)
-    return (x32 * (1.0 / np.sqrt(var + eps))) * weight.astype(np.float32)
+    y = x32 * (1.0 / np.sqrt(var + eps))
+    if bf16:
+        y = bf16_round(y)
+    out = y * weight.astype(np.float32)
+    return bf16_round(out) if bf16 else out
 
 
 def silu(x: np.ndarray) -> np.ndarray:
@@ -160,6 +184,11 @@ class ModelConfig:
     mscale_all_dim: float = 0.707
     routed_scaling: float = 1.0
     norm_topk_prob: bool = False
+    bf16: bool = False   # apply HF's bf16 rounding boundaries
+
+    def r(self, x: np.ndarray) -> np.ndarray:
+        """Round to bf16 where HF's bf16 modules would."""
+        return bf16_round(x) if self.bf16 else x
 
     @property
     def q_head_dim(self) -> int:
@@ -189,20 +218,21 @@ def attention_absorbed(cfg: ModelConfig, w: LayerWeights, x: np.ndarray,
     H, Dk, Dr, Dv = cfg.heads, cfg.qk_nope, cfg.qk_rope, cfg.v_head
     L = cfg.kv_lora_rank
 
-    x_n = rms_norm(x, w.input_layernorm, cfg.rms_eps)
+    R = cfg.r
+    x_n = rms_norm(x, w.input_layernorm, cfg.rms_eps, cfg.bf16)
 
     # q_proj then split per head into the nope/rope halves
-    q = (w.q_proj @ x_n).reshape(H, cfg.q_head_dim)
+    q = R(w.q_proj @ x_n).reshape(H, cfg.q_head_dim)
     q_nope, q_pe = q[:, :Dk], q[:, Dk:]
 
     # kv_a: compressed KV plus the single shared rope key
-    kv_a = w.kv_a_proj_with_mqa @ x_n
+    kv_a = R(w.kv_a_proj_with_mqa @ x_n)
     c_new, k_pe_new = kv_a[:L], kv_a[L:]
-    c_new = rms_norm(c_new, w.kv_a_layernorm, cfg.rms_eps)
+    c_new = rms_norm(c_new, w.kv_a_layernorm, cfg.rms_eps, cfg.bf16)
 
     # RoPE on this position, then append the row shared by every head
-    k_pe_new = apply_rope(k_pe_new[None, :], cos[pos][None, :], sin[pos][None, :])[0]
-    q_pe = apply_rope(q_pe, cos[pos][None, :], sin[pos][None, :])
+    k_pe_new = R(apply_rope(k_pe_new[None, :], cos[pos][None, :], sin[pos][None, :])[0])
+    q_pe = R(apply_rope(q_pe, cos[pos][None, :], sin[pos][None, :]))
     cache[pos, :L] = c_new
     cache[pos, L:] = k_pe_new
 
@@ -223,11 +253,21 @@ def attention_absorbed(cfg: ModelConfig, w: LayerWeights, x: np.ndarray,
         o_c = p @ c                                   # [L]
         out[h * Dv:(h + 1) * Dv] = w_uv @ o_c         # absorb W_UV into the output
 
-    return w.o_proj @ out
+    return R(w.o_proj @ R(out))                       # attn output and o_proj are bf16
+
+
+def mlp_unit(cfg: ModelConfig, gate: np.ndarray, up: np.ndarray, down: np.ndarray,
+             x_n: np.ndarray) -> np.ndarray:
+    """down(SiLU(gate x) * (up x)) with HF's bf16 roundings: gate_proj,
+    act_fn, up_proj, the product and down_proj each emit a bf16 tensor."""
+    R = cfg.r
+    h = R(R(silu(R(gate @ x_n))) * R(up @ x_n))
+    return R(down @ h)
 
 
 def moe(cfg: ModelConfig, w: LayerWeights, x_n: np.ndarray) -> np.ndarray:
     """Router + top-k routed experts + shared experts, matching HF's MoE path."""
+    R = cfg.r
     logits = w.gate_weight @ x_n                      # fp32 router, as in HF
     scores = softmax(logits)
     idx = np.argpartition(-scores, cfg.top_k - 1)[: cfg.top_k]  # topk, unsorted
@@ -239,21 +279,24 @@ def moe(cfg: ModelConfig, w: LayerWeights, x_n: np.ndarray) -> np.ndarray:
 
     y = np.zeros_like(x_n)
     for k, e in enumerate(idx):
-        h = silu(w.experts_gate[e] @ x_n) * (w.experts_up[e] @ x_n)
-        y += weights[k] * (w.experts_down[e] @ h)
+        # expert_out.mul_(weight) in HF is a bf16 in-place multiply
+        y += R(weights[k] * mlp_unit(cfg, w.experts_gate[e], w.experts_up[e],
+                                     w.experts_down[e], x_n))
 
-    h_s = silu(w.shared_gate @ x_n) * (w.shared_up @ x_n)
-    return y + w.shared_down @ h_s
+    shared = mlp_unit(cfg, w.shared_gate, w.shared_up, w.shared_down, x_n)
+    return R(R(y) + shared)
 
 
-def dense_mlp(w: LayerWeights, x_n: np.ndarray) -> np.ndarray:
-    return w.mlp_down @ (silu(w.mlp_gate @ x_n) * (w.mlp_up @ x_n))
+def dense_mlp(cfg: ModelConfig, w: LayerWeights, x_n: np.ndarray) -> np.ndarray:
+    return mlp_unit(cfg, w.mlp_gate, w.mlp_up, w.mlp_down, x_n)
 
 
 def decoder_layer(cfg: ModelConfig, w: LayerWeights, x: np.ndarray,
                   cache: np.ndarray, pos: int,
                   cos: np.ndarray, sin: np.ndarray) -> np.ndarray:
-    """One full decoder layer: attention + residual, MLP/MoE + residual."""
-    x = x + attention_absorbed(cfg, w, x, cache, pos, cos, sin)
-    x_n2 = rms_norm(x, w.post_attention_layernorm, cfg.rms_eps)
-    return x + (moe(cfg, w, x_n2) if w.is_moe else dense_mlp(w, x_n2))
+    """One full decoder layer: attention + residual, MLP/MoE + residual.
+    The residual adds are bf16 adds in HF."""
+    R = cfg.r
+    x = R(x + attention_absorbed(cfg, w, x, cache, pos, cos, sin))
+    x_n2 = rms_norm(x, w.post_attention_layernorm, cfg.rms_eps, cfg.bf16)
+    return R(x + (moe(cfg, w, x_n2) if w.is_moe else dense_mlp(cfg, w, x_n2)))

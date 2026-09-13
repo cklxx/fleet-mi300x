@@ -72,8 +72,8 @@ __device__ inline void kv_post(
     const float ssq = block_reduce_ordered(local, smem);
     const float inv = rsqrtf(ssq / kv_lora + eps);
 
-    for (int i = threadIdx.x; i < kv_lora; i += blockDim.x) {
-        row_lds[i] = kv_a_raw[i] * inv * __bfloat162float(kv_a_norm_w[i]);
+    for (int i = threadIdx.x; i < kv_lora; i += blockDim.x) {   // HF's two roundings
+        row_lds[i] = bf16_round(bf16_round(kv_a_raw[i] * inv) * __bfloat162float(kv_a_norm_w[i]));
     }
     for (int i = threadIdx.x; i < qk_rope; i += blockDim.x) {
         row_lds[kv_lora + i] = kv_a_raw[kv_lora + i];
@@ -245,11 +245,12 @@ __device__ inline void merge_and_uv(
     }
     __syncthreads();
 
-    // W_UV[h] is [v_head, kv_lora] row-major: a plain row GEMV from LDS.
+    // W_UV[h] is [v_head, kv_lora] row-major: a plain row GEMV from LDS. The
+    // attention output is a bf16 tensor in HF before o_proj, hence EPI_BF16.
     const int row_stride = qk_nope + v_head;
     const __hip_bfloat16* w_uv =
         kv_b + (int64_t)head * row_stride * kv_lora + (int64_t)qk_nope * kv_lora;
-    gemv_rows(w_uv, kv_lora, o_c_lds, o + head * v_head, nullptr, EPI_NONE, 1.f,
+    gemv_rows(w_uv, kv_lora, o_c_lds, o + head * v_head, nullptr, EPI_BF16, 1.f,
               v_head, kv_lora, /*xcd=*/0, /*n_xcds=*/1, /*worker=*/0, /*n_workers=*/1);
 }
 

@@ -53,6 +53,10 @@ __device__ void task_embed(const ModelDims& d, const Weights& w,
 // GEMV task that needs it (§3 fusion 1): the vector is 8 KB, so recomputation
 // is far cheaper than an extra global event, and the GEMV then streams its
 // operand from LDS.
+//
+// HF's DeepseekV2RMSNorm in bf16: variance and scaling in fp32, the scaled
+// value cast to bf16, then multiplied by the bf16 weight — two roundings,
+// reproduced exactly here (reference_decode.py rms_norm with bf16=True).
 __device__ inline void rms_norm_to_lds(const ModelDims& d,
                                        const __hip_bfloat16* __restrict__ gamma,
                                        const float* __restrict__ in,
@@ -65,7 +69,7 @@ __device__ inline void rms_norm_to_lds(const ModelDims& d,
     const float ssq = block_reduce_ordered(local, smem);
     const float inv = rsqrtf(ssq / d.hidden + d.rms_eps);
     for (int i = threadIdx.x; i < d.hidden; i += blockDim.x) {
-        out[i] = in[i] * inv * __bfloat162float(gamma[i]);
+        out[i] = bf16_round(bf16_round(in[i] * inv) * __bfloat162float(gamma[i]));
     }
     __syncthreads();
 }
@@ -111,15 +115,18 @@ __device__ void task_norm_router(const ModelDims& d, const Weights& w,
 
 // Fixed-order reduction of the 8 expert partials plus the residual. No float
 // atomics anywhere: the determinism rule in §4 is what makes the bitwise
-// reproducibility check in §6 meaningful.
+// reproducibility check in §6 meaningful. The MoE output is a bf16 tensor in
+// HF and the residual add is a bf16 add, hence the two roundings.
 __device__ void task_reduce(const ModelDims& d, Activations& act) {
     for (int i = threadIdx.x; i < d.hidden; i += blockDim.x) {
         float acc = 0.f;
         for (int x = 0; x < kXCDs; ++x) acc += act.expert_out[x * d.hidden + i];
-        act.x[i] = bf16_round(act.x[i] + acc);
+        act.x[i] = bf16_round(act.x[i] + bf16_round(acc));
     }
 }
 
+// Greedy pick over the bf16 logits (lm_head writes them bf16-rounded, as HF's
+// lm_head does); ties go to the lower index, as torch.argmax does.
 __device__ void task_argmax(const ModelDims& d, Activations& act) {
     __shared__ float best_val[kBlock];
     __shared__ int best_idx[kBlock];
@@ -170,7 +177,7 @@ __device__ void run_task(const TaskDescriptor& t, const ModelDims& d,
         case TASK_QKV_FUSED: {
             rms_norm_to_lds(d, w.layer_norm_in[L], act.x, s.vec, s.smem);
             const int N = d.heads * d.q_head_dim + d.kv_lora + d.qk_rope;
-            gemv_rows(w.layer_qkv[L], d.hidden, s.vec, act.q, nullptr, EPI_NONE,
+            gemv_rows(w.layer_qkv[L], d.hidden, s.vec, act.q, nullptr, EPI_BF16,
                       1.f, N, d.hidden, xcd, kXCDs, worker, nw);
             break;
         }
@@ -247,7 +254,7 @@ __device__ void run_task(const TaskDescriptor& t, const ModelDims& d,
 
         case TASK_LM_HEAD:
             rms_norm_to_lds(d, w.final_norm, act.x, s.vec, s.smem);
-            gemv_rows(w.lm_head, d.hidden, s.vec, act.logits, nullptr, EPI_NONE,
+            gemv_rows(w.lm_head, d.hidden, s.vec, act.logits, nullptr, EPI_BF16,
                       1.f, d.vocab, d.hidden, xcd, kXCDs, worker, nw);
             break;
 

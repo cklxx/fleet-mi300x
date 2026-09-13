@@ -150,12 +150,17 @@ __device__ __forceinline__ RowSlice xcd_rows(int N, int xcd, int n_xcds) {
     return s;
 }
 
-enum GemvEpilogue { EPI_NONE = 0, EPI_RESIDUAL = 1 };
+// bf16 boundaries (reference_decode.py with bf16=True): HuggingFace runs the
+// model in bf16, so every linear layer's output is rounded to bf16 before it
+// is used, and the residual add is a bf16 add. Reproducing those roundings is
+// what keeps routing decisions and argmax ties on the same side as HF.
+//   EPI_NONE      y = sum                       (router: HF's gate runs in fp32)
+//   EPI_BF16      y = bf16(scale * sum)         (every other linear output)
+//   EPI_RESIDUAL  y = bf16(residual + bf16(sum)) (o_proj, dense down)
+enum GemvEpilogue { EPI_NONE = 0, EPI_BF16 = 1, EPI_RESIDUAL = 2 };
 
 // y[n] = W[n, :] . x  for this (xcd, worker)'s rows of [0, N), with x already
 // wherever the caller wants it read from (LDS for the ≤ 2048-wide operands).
-// EPI_RESIDUAL: y[n] = bf16(residual[n] + sum), rounding through bf16 at the
-// residual point so the hidden state matches the reference's bf16 state (§5).
 __device__ inline void gemv_rows(
         const __hip_bfloat16* __restrict__ w, int ld,
         const float* __restrict__ x, float* __restrict__ y,
@@ -180,14 +185,20 @@ __device__ inline void gemv_rows(
             const int nr = two ? 2 : 1;
             for (int r = 0; r < nr; ++r) {
                 const int n = r ? r1 : r0;
-                const float v = sums[r] * scale;
-                y[n] = (epi == EPI_RESIDUAL) ? bf16_round(residual[n] + v) : v;
+                const float v = sums[r];
+                switch (epi) {
+                    case EPI_BF16:     y[n] = bf16_round(scale * bf16_round(v)); break;
+                    case EPI_RESIDUAL: y[n] = bf16_round(residual[n] + bf16_round(v)); break;
+                    default:           y[n] = v;
+                }
             }
         }
     }
 }
 
-// h[n] = SiLU(gate[n] . x) * (up[n] . x) for this worker's n in [0, inter).
+// h[n] = bf16(bf16(SiLU(bf16(gate[n] . x))) * bf16(up[n] . x)) for this
+// worker's n in [0, inter) — the roundings are HF's (gate_proj, act_fn and
+// up_proj each produce a bf16 tensor, and their product is bf16).
 // gate/up rows are interleaved offline (§12): row 2n is gate_n, row 2n+1 is
 // up_n, so the pair is exactly what one wave streams together and the product
 // is formed in registers with no shuffle or LDS round trip.
@@ -208,7 +219,9 @@ __device__ inline void gemv_gate_up_rows(
                                          gate_up + (int64_t)(2 * n + 1) * K};
         float sums[2];
         wave_dot<2>(rows, x, K, sums);
-        if (lane == 0) h[n] = silu(sums[0]) * sums[1];
+        if (lane == 0) {
+            h[n] = bf16_round(bf16_round(silu(bf16_round(sums[0]))) * bf16_round(sums[1]));
+        }
     }
 }
 

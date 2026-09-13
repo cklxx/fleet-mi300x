@@ -46,26 +46,14 @@ if torch.cuda.is_available():
     print(f"  device: {p.name}  {p.total_memory/1e9:.1f} GB  CUs {p.multi_processor_count}")
 PY
 
-if [[ $WANT_MODEL -eq 1 ]]; then
-    log "model: $MODEL_ID -> $MODEL_DIR (31 GB, the slow step)"
-    mkdir -p "$MODEL_DIR"
-    python3 -m pip install --quiet "huggingface_hub[hf_transfer]"
-    HF_HUB_ENABLE_HF_TRANSFER=1 python3 - <<PY
-from huggingface_hub import snapshot_download
-p = snapshot_download("$MODEL_ID", local_dir="$MODEL_DIR",
-                      allow_patterns=["*.json","*.safetensors","*.py","tokenizer*"],
-                      max_workers=8)
-print("  downloaded to", p)
-PY
-    du -sh "$MODEL_DIR"
-fi
-
 log "local checks that need no GPU (fail here = fix before spending GPU time)"
 python3 "$REPO_ROOT/tests/test_descriptor_layout.py"
 python3 "$REPO_ROOT/tests/test_kernel_interface.py"
 python3 "$REPO_ROOT/tests/test_queue_simulation.py"
 python3 "$REPO_ROOT/tests/test_row_partition.py"
+python3 "$REPO_ROOT/tests/test_expert_addressing.py"
 python3 "$REPO_ROOT/tests/test_absorbed_equivalence.py"
+python3 "$REPO_ROOT/tests/test_reference_vs_hf.py"
 
 log "build HIP"
 mkdir -p "$REPO_ROOT/build" "$REPO_ROOT/results"
@@ -94,7 +82,20 @@ python3 "$REPO_ROOT/src/host/taskgraph.py" --kv-chunks 4 \
 log "protocol smoke test (no weights): residency, XCD roles, every event"
 "$REPO_ROOT/build/fleet_decode" --graph "$REPO_ROOT/build/taskgraph_d2.bin" --smoke --tokens 4
 
+# Everything above ran without the checkpoint; only now spend the download.
 if [[ $WANT_MODEL -eq 1 ]]; then
+    log "model: $MODEL_ID -> $MODEL_DIR (31 GB, the slow step)"
+    mkdir -p "$MODEL_DIR"
+    python3 -m pip install --quiet "huggingface_hub[hf_transfer]"
+    HF_HUB_ENABLE_HF_TRANSFER=1 python3 - <<PY
+from huggingface_hub import snapshot_download
+p = snapshot_download("$MODEL_ID", local_dir="$MODEL_DIR",
+                      allow_patterns=["*.json","*.safetensors","*.py","tokenizer*"],
+                      max_workers=8)
+print("  downloaded to", p)
+PY
+    du -sh "$MODEL_DIR"
+
     log "pack weights (one-time; excluded from decode latency by the task spec)"
     # Flattens the checkpoint into base+id*stride form and interleaves gate/up
     # rows so SiLU(gate)*up needs no cross-lane shuffle (§12).

@@ -275,9 +275,18 @@ __device__ __forceinline__ void run_scheduler(const RuntimeState& rt, int xcd) {
     if (lane == 0) stop = 0;
     __syncthreads();
     while (!stop) {
+        // Relay with a formal happens-before chain: the producer's release
+        // fence -> its counter increment -> our relaxed read -> our acquire
+        // fence -> our release fence -> our mirror store -> the worker's
+        // relaxed read of the mirror -> the worker's acquire fence. Without
+        // the two fences here the worker would acquire on an object the
+        // producer never released on, and the payload's visibility would rest
+        // on cache behaviour rather than on the memory model.
+        bool changed = false;
         for (int e = lane; e < rt.n_events; e += blockDim.x) {
             const uint32_t g = poll(&rt.global_events[e]);
             if (poll(&mirror[e]) != g) {
+                if (!changed) { fence_acquire(); fence_release(); changed = true; }
                 __hip_atomic_store(&mirror[e], g, __ATOMIC_RELAXED,
                                    __HIP_MEMORY_SCOPE_AGENT);
             }

@@ -20,8 +20,11 @@ executed end to end in a simulator, and the build scripted.
 
 A full read of the implementation before booking the GPU found that the first
 version could not have run at all, and would have burned hours looking like a
-hang. Everything below is fixed and covered by a local check that fails if it
-comes back. Numbered for reference from the commit message.
+hang. Everything below is fixed; the "Now" column says which local check
+would catch a regression, and where none can (device-only behaviour), says so.
+A second, independent review pass (Codex) over the fixed tree then found the
+items in the section after this one. Numbered for reference from the commit
+message.
 
 | # | Defect | Where | Now |
 |---|---|---|---|
@@ -35,8 +38,8 @@ comes back. Numbered for reference from the commit message.
 | 8 | `__threadfence_block()` used as a release for cross-CU counters | `fleet_runtime.h` | Agent-scope release/acquire fences and agent-scope atomics everywhere, per the LLVM gfx942 memory model; consumers acquire (the original had no acquire at all) |
 | 9 | Scheduler/worker roles came from `blockIdx`, XCD identity from `HW_REG_XCC_ID`; an XCD with zero schedulers hangs forever | `fleet_runtime.h` | Roles are XCD-local tickets; a grid barrier checks each XCD got exactly 38 blocks and aborts with a decoded reason otherwise |
 | 10 | `done_flag` fired when each XCD's worker 0 drained its own queue, and was never zeroed | `fleet_kernel.hip` | Schedulers stop when the graph's final event reaches this epoch |
-| 11 | Shared-expert half offset dropped the ×2 for interleaved gate/up rows | `expert.h` | `half * 2 * rows * hidden` |
-| 12 | Shared-expert `down` rows were strided by 1408, the true leading dimension is 2816 | `expert.h` | `ExpertUnit.down_ld` |
+| 11 | Shared-expert half offset dropped the ×2 for interleaved gate/up rows | `expert.h` | `half * 2 * rows * hidden`; `test_expert_addressing.py` executes the packed layout and fails with the old offsets |
+| 12 | Shared-expert `down` rows were strided by 1408, the true leading dimension is 2816 | `expert.h` | `ExpertUnit.down_ld`; same test |
 | 13 | `struct.pack` used `H` for `layer`, and embed/lm_head/argmax have `layer = -1` — `--emit` raised on the very first task | `taskgraph.py` | `layer` is `int16`; `index` is `int32` (33k descriptors); layout test packs both |
 | 14 | `__builtin_amdgcn_buffer_wbl2` and `__builtin_amdgcn_s_setprio` are not clang builtins; the microbench and the scheduler would not have compiled | `microbench.hip`, `fleet_runtime.h` | Release fence (which *is* `buffer_wbl2` on gfx942) and inline `s_setprio`; caught by the local HIP-mode parse |
 | 15 | The GEMV put all 256 threads on one row: with K = 2048 that is one load per lane and a block reduction per row, so the "depth-8 streaming" loop never executed | `gemv.h` | One wave per row pair, 8 loads in flight per lane, shuffle reductions, no barrier in the row loop; attention likewise went from a block reduction per position to one wave per position |
@@ -47,6 +50,23 @@ allocated for nothing (no allocation existed); `q_proj` and `kv_a` are now
 packed as one fused tensor rather than relying on the alignment padding
 happening to be zero; the routing weight is multiplied by
 `routed_scaling_factor` as in the reference.
+
+### Second review pass (Codex, independent), what it found and what was done
+
+| Finding | Done |
+|---|---|
+| The scheduler relayed counters with relaxed loads and stores, so the producer's release never formally synchronised with the worker's acquire on a *different* atomic | Scheduler acquires after reading a changed counter and releases before storing the mirror: a complete fence-to-fence chain |
+| The kernel kept fp32 where HF rounds to bf16: RMSNorm output (before and after γ), every linear output, the residual add, gate/up/SiLU products, logits before argmax. Routing and argmax ties could land on the other side | All of those roundings implemented (`EPI_BF16`, `EPI_RESIDUAL = bf16(x + bf16(sum))`, `bf16_round` in the norms) and mirrored in `reference_decode.py` (`ModelConfig.bf16`); `test_reference_vs_hf.py` now runs a second pass against HF in bf16 |
+| `golden.npz` "first decode step" hidden states were the last *prefill* position | Captured from the forward that consumes the prefill's token |
+| Golden tokens picked with unstable `argsort`/`topk`; HF's greedy is `argmax` (lowest index on ties) | `torch.argmax`; top-k only for margins |
+| 32 launches but 31 reference outputs, and exit 0 regardless | Reference writes `decode + 1` tokens; the launcher exits 0 only if every launch was compared and matched |
+| Cache verification skipped all 64 RoPE columns and checked the fp32 tensor, not what the launcher loads; `FAIL` exited 0 | Verifies `K_nope`, `K_rope` and `V` from the bf16-rounded cache; non-zero exit |
+| RoPE in the converter ran in fp32 where HF runs bf16 | Runs in the model's dtype through HF's own module; prefill rows are bit-identical to HF's |
+| Cross-XCD microbench never checked its two blocks were on different XCDs | Both blocks record `HW_REG_XCC_ID`; the host flags a same-XCD pair |
+| Shared-expert addressing had no execution test; the simulation let workers read global counters directly | `test_expert_addressing.py` (packed layout → slot resolution → 8-unit phase vs reference, sabotage checked); the simulation now reads a per-pass stale mirror |
+| Seven statements in `design.md` were stale or described unimplemented mechanisms (W_UK redundancy 6.3 MB not 0.5 MB; q-column ownership; scheduler protocol; last-worker flush and cache modifiers; memory table; §10 tooling) | Corrected in place; unimplemented items are marked *planned* / *not implemented* |
+| `setup_env.sh` downloaded the model before the checks and skipped the HF comparison | Reordered: checks, build, graphs, smoke test, *then* the download |
+| Not adopted: "the event microbench should model fan-in, relay and payload" | `fleet_decode --smoke` runs the real protocol (296 producers, relay, all 805 events) per token; the microbench measures one hop on purpose |
 
 ## Done and verified locally
 
@@ -64,7 +84,8 @@ happening to be zero; the routing weight is multiplied by
 | `src/host/fleet_launch.hip` | Queues, event buffers, weights/cache/golden loading, YaRN tables, per-token cooperative launch, HF comparison, abort decoding, `--smoke` / `--teacher-force` / `--json` | Same parse, both passes, 0 errors |
 | `bench/microbench.hip` | D1 (a) cross-XCD event cost with the runtime's exact protocol, cached vs uncached counters; (b) same-XCD cost, with an XCC_ID check that the pair really shares a chiplet; (c) streamed read bandwidth vs depth | Same parse, 0 errors; never run |
 | `src/host/pack_weights.py` | Flat bf16 blob, 256-B aligned, fused q‖kv_a, interleaved gate/up, `.manifest` the launcher parses | Syntax and CLI only; needs the checkpoint |
-| `scripts/setup_env.sh` | One-shot environment build on the MI300X; runs every local check first, then the protocol smoke test before any weights are needed | Written; unrun |
+| `scripts/setup_env.sh` | One-shot environment build on the MI300X: the seven local tests, hipcc, task graphs, the protocol smoke test, and only then the 31 GB download and the packing | Written; unrun |
+| `tests/test_expert_addressing.py` | Builds the packer's byte layout, resolves the 8 units as `expert.h` does, runs the kernel's arithmetic with HF's rounding points against `reference_decode.moe` | 7/7: routing exact, phase output within 4.1e-3 of the reference (bf16-ulp level), and the pre-review offsets produce a 37% error that the test reports |
 
 ## Decisions the design text did not make, made here
 
@@ -118,9 +139,9 @@ happening to be zero; the routing weight is multiplied by
 2. `bench/microbench.hip` — replaces the §9 synchronisation and bandwidth
    estimates with measurements and decides the event scheme.
 3. HF reference run → golden tokens and the converted cache.
-4. `fleet_decode --teacher-force` — every step fed HF's token, so the first
-   mismatching step names the layer to look at; then free-running decode.
-5. If tokens diverge: per-layer hidden-state comparison against `golden.npz`
-   (the states are captured; the per-layer dump path in the launcher is the
-   next thing to write). **The required milestone is one MoE layer (index ≥ 1)
-   matching HF through the Fleet path.**
+4. `fleet_decode --teacher-force` — every step fed HF's token, so a mismatch
+   is isolated to the step it appears in; then free-running decode.
+5. If tokens diverge: per-layer hidden-state comparison against the
+   first-decode-step states in `golden.npz` (captured; the per-layer dump path
+   in the launcher is the next thing to write). **The required milestone is one
+   MoE layer (index ≥ 1) matching HF through the Fleet path.**

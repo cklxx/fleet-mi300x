@@ -105,11 +105,14 @@ def build_fleet_cache(model, raw, layout: CacheLayout):
             k_pe = raw[i, :, layout.kv_lora_rank:].to(dev)
             pos_ids = torch.arange(S, device=dev)[None, :]
 
-            c_norm = attn.kv_a_layernorm(c_part.to(attn.kv_a_layernorm.weight.dtype))
+            dtype = attn.kv_a_layernorm.weight.dtype          # bf16 for the real model
+            c_norm = attn.kv_a_layernorm(c_part.to(dtype))
 
-            # HF's own rotary module supplies cos/sin, so YaRN lives in one place.
-            cos, sin = attn.rotary_emb(k_pe[None, None], seq_len=S)
-            k_pe_4d = k_pe[None, None]                       # [1,1,S,64]
+            # HF's own rotary module supplies cos/sin, so YaRN lives in one
+            # place — and the rotation runs in the model's dtype, as it does
+            # inside HF's forward, so the rows are bit-identical to HF's.
+            k_pe_4d = k_pe.to(dtype)[None, None]              # [1,1,S,64]
+            cos, sin = attn.rotary_emb(k_pe_4d, seq_len=S)
             _, k_rot = apply_rotary_pos_emb(k_pe_4d, k_pe_4d, cos, sin, pos_ids)
 
             cache[i, :, : layout.kv_lora_rank] = c_norm.float().cpu()
@@ -137,30 +140,37 @@ def write_fleet_cache_bin(cache, layout: CacheLayout, path: Path) -> None:
 
 
 def verify(model, cache, hf_past, layout: CacheLayout, tol: float = 1e-2) -> bool:
-    """Reconstruct K,V from the compressed cache and compare with HF's."""
+    """Reconstruct the full K (nope ‖ rope) and V from the cache *as the
+    launcher will load it* (rounded to bf16) and compare with HF's own cache.
+    """
     import torch
 
     ok = True
+    cache = cache.to(torch.bfloat16).float()             # what fleet_cache.bin holds
+    L = layout.kv_lora_rank
     for i, layer in enumerate(model.model.layers):
         attn = layer.self_attn
         Dk, Dv = attn.qk_nope_head_dim, attn.v_head_dim
         H = attn.num_heads
+        dev = attn.kv_b_proj.weight.device
 
-        c = cache[i, :, : layout.kv_lora_rank]
+        c = cache[i, :, :L].to(dev)
+        k_pe = cache[i, :, L:].to(dev)                   # [S, 64], post-RoPE
         kv = attn.kv_b_proj(c.to(attn.kv_b_proj.weight.dtype)).float()
         kv = kv.view(-1, H, Dk + Dv)
         k_nope, v = kv[..., :Dk], kv[..., Dk:]
 
         k_hf, v_hf = hf_past[i]
-        k_hf = k_hf[0].transpose(0, 1).float()           # [S, H, 192]
-        v_hf = v_hf[0].transpose(0, 1).float()           # [S, H, 128]
+        k_hf = k_hf[0].transpose(0, 1).float().to(dev)   # [S, H, 192] = nope ‖ rope
+        v_hf = v_hf[0].transpose(0, 1).float().to(dev)   # [S, H, 128]
 
         e_k = (k_nope - k_hf[..., :Dk]).abs().max().item()
+        e_r = (k_pe[:, None, :] - k_hf[..., Dk:]).abs().max().item()   # same for every head
         e_v = (v - v_hf).abs().max().item()
-        good = e_k <= tol and e_v <= tol
+        good = e_k <= tol and e_r <= tol and e_v <= tol
         ok &= good
-        print(f"  layer {i:2d}: K err {e_k:.2e}  V err {e_v:.2e}  "
-              f"[{'PASS' if good else 'FAIL'}]")
+        print(f"  layer {i:2d}: K_nope err {e_k:.2e}  K_rope err {e_r:.2e}  "
+              f"V err {e_v:.2e}  [{'PASS' if good else 'FAIL'}]")
     return ok
 
 
@@ -198,8 +208,10 @@ def main() -> None:
 
     if a.verify:
         past = out.past_key_values
-        print("reconstruction check (K,V from compressed cache vs HF):")
-        print("PASS" if verify(model, cache, past, layout) else "FAIL")
+        print("reconstruction check (K,V from the bf16 compressed cache vs HF):")
+        ok = verify(model, cache, past, layout)
+        print("PASS" if ok else "FAIL")
+        raise SystemExit(0 if ok else 1)
 
 
 if __name__ == "__main__":

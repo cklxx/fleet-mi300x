@@ -100,8 +100,8 @@ Solid arrows are global events, dashed are XCD-local. Four changes remove 4 glob
 |---|---|---|
 | Pre-attention RMSNorm → q/kv_a GEMV prologue | every worker recomputes the norm of the 4 KB `x` vector before its tile | 0 |
 | kv post (RMSNorm_kv, RoPE, cache append) → attention task prologue | the fused GEMV's 3648 output columns are split evenly (456 per XCD = 2 heads' 384 q columns + 72 kv_a columns); after the global event every attention task re-derives the new token's cache row from the raw 576-vector (2.3 KB fp32) and one designated task writes it to the cache | 8 × 2.3 KB ≈ 0 |
-| q-absorb → attention task prologue | each attention task computes `q_c[h]` from its own W_UK[h] slice (131 KB) | 0.5 MB/layer with 4 KV chunks (0.3%) |
-| Head-to-XCD affinity makes AT→MG XCD-local | 3072 q columns ÷ 8 = 384 = exactly 2 heads; XCD k owns heads 2k, 2k+1: their q columns, their 4 KV-chunk attention tasks and their merge+W_UV task. The merge waits on an XCD-local counter; only o_proj (needs all 16 heads) is a global event | 0 |
+| q-absorb → attention task prologue | each attention task computes `q_c[h]` from its own W_UK[h] slice (131 KB); `q_pe[h]` gets its RoPE here too | 16 × 131 KB = 2.1 MB/layer read once; with 4 KV chunks the 3 extra reads are 6.3 MB/layer (3.8% of the layer's 166 MB), mostly L2 hits since a head's chunks share an XCD |
+| Head-to-XCD affinity makes AT→MG XCD-local | XCD k runs the attention tasks (all KV chunks) and the merge+W_UV task of heads 2k, 2k+1, so the merge waits on an XCD-local counter; only o_proj (needs all 16 heads) is a global event. (The fused q‖kv_a GEMV itself is split into 8 × 456 rows regardless of head boundaries; q is read back after the global event, so its ownership is irrelevant.) | 0 |
 
 Key mappings and why:
 
@@ -128,11 +128,12 @@ Four synchronization scopes from Fleet §5.2; the launch policy is MPK's AOT mod
 
 1. Task descriptors: built on host once, immutable, read without sync.
 2. Task launch is ahead-of-time for every task: at bs=1 with fixed context and fixed top-6, no task has a data-dependent duration, so each worker's queue is filled once before launch (round-robin within its XCD, expert tasks by slot k) and a worker waits locally on its task's dependent event instead of being dispatched by a scheduler after the event fires. This is one synchronization hop per event (event → worker) instead of two (worker → scheduler → worker).
-   The per-XCD scheduler therefore has one job: mirror global events into XCD-local flags. One wave of the scheduler workgroup polls the global counters over the fabric and writes `xcd_flag[e] = 1` into its L2; the 37 workers of that XCD poll the L2 flag. Global-counter polling traffic drops from 296 pollers to 8. The scheduler keeps a dedicated CU (1 of 38 per XCD, 2.6% of CUs), irrelevant in a bandwidth-bound regime.
-3. Worker→worker inside a Chiplet-task: XCD-local counter, no fence. Used for gate_up→down and for split-KV partial completion.
-4. XCD→global event: two implementations, selected by D1 microbenchmark (a):
-   - (i) `buffer_wbl2` on the last worker of the XCD, then GPU-scope `atomicAdd` (sc0 sc1); schedulers poll with non-temporal loads.
-   - (ii) producers store the event's payload with `sc1` (write-through past the XCD L2; every payload is < 100 KB) and the event counters live in `hipExtMallocWithFlags(..., hipDeviceMallocUncached)` memory (MTYPE UC), so the atomic resolves at the Infinity Cache with no L2 flush. Expected faster: (i) walks the 4 MB L2 for dirty lines, (ii) pays only per-store write-through on tiny payloads.
+   The per-XCD scheduler therefore has one job: mirror global events into XCD-local flags. The scheduler workgroup (all four waves, one event per lane per pass) polls the global counters and copies each *count* into its XCD's mirror array; the 37 workers of that XCD poll the mirror. Global-counter polling traffic drops from 296 pollers to 8. The scheduler keeps a dedicated CU (1 of 38 per XCD, 2.6% of CUs), irrelevant in a bandwidth-bound regime. Whether the mirror actually stays L2-resident under the agent-scope protocol below is a D1 (b) measurement, not an assumption.
+3. Worker→worker inside a Chiplet-task: XCD-local counter. Used for gate_up→down and for split-KV partial completion. *Implemented with the same agent-scope fences as 4; the fence-free variant is a planned optimisation.*
+4. XCD→global event: two implementations, selected by D1 microbenchmark (a). Both use the same code path (agent-scope release fence on every producer, agent-scope atomic, agent-scope polling, acquire on the consumer); they differ only in where the counters live:
+   - (i) ordinary device memory: the release fence's `buffer_wbl2` walks the XCD L2 for dirty lines.
+   - (ii) counters in `hipExtMallocWithFlags(..., hipDeviceMallocUncached)` memory (MTYPE UC), so the atomic resolves at the Infinity Cache.
+   *Not implemented:* last-worker-only flushing (every producer fences), `sc1` write-through payload stores, and explicit `nt`/`sc1` cache modifiers on weight streams; the cache-residency claims below therefore describe intent, to be checked against `rocprofv3` counters.
 
 Residency: the kernel is launched with `hipLaunchCooperativeKernel` so all 304 workgroups are guaranteed co-resident (or the launch fails), which removes the scheduler-waits-for-absent-worker deadlock by construction. Scheduler waves run at `s_setprio 3`; polling loops insert `s_sleep 1` between reads to keep fabric traffic down.
 
@@ -154,8 +155,8 @@ Launch model: v1 = one kernel launch per token (32 launches/32 tokens); v2 (stre
 |---|---|---|---|
 | Weights | per-layer contiguous; experts `[layer][expert][gate_up ‖ down]`, gate_up interleaved as `[gate;up]` rows | 31.4 GB | ptr arithmetic `base + id·stride` for indirect expert tasks |
 | KV cache (Fleet) | `[27][1056][576]` bf16, cols 0–511 = c, 512–575 = k_pe (post-RoPE) | 32.8 MB | 1024 prefill + 32 decode; no paging |
-| Activations | x stored bf16 and re-rounded at exactly the two residual-add points per layer (matches the reference's bf16 hidden state), fp32 inside every task; x_n fp32 [2048]; q [3072]; q_c [16×512]; attn partials [16×4×(514)] fp32; o [2048]; expert h `[8][2816]` bf16; expert partials `[8][2048]` fp32; topk ids/w; logits fp32 [102400]; argmax scratch [8] | < 1 MB | all allocated once |
-| Task queue + events | descriptors (~3.1k × 64 B), per-XCD counters, global event counters | < 1 MB | reset counters per token in v1; monotonic epochs in v2 |
+| Activations | fp32 buffers holding bf16-valued data at every point HF rounds (residual adds, every linear output, gate/up/SiLU products, logits), fp32 inside every task; x, x_norm [2048]; q‖kv_a [3648]; attn partials [16×chunks×514]; o [2048]; expert h `[8][1408]`; expert partials `[8][2048]`; topk ids/w; logits [102400]. Per-task scratch (normed x, cache row, q_c, q_pe, wave partials) is LDS, ~26 KB per workgroup | < 1 MB | all allocated once |
+| Task queue + events | descriptors (33,183 × 64 B = 2.1 MB, or 34,479 with split-KV), per-XCD counters and mirrors, global event counters | ~2.3 MB | monotonic epochs already in v1: counters are never reset, the wait target is `epoch × producers` |
 
 Prefill→decode interface:
 - HF's DeepseekV2 reference caches full per-head K `[b,16,S,192]` and V `[b,16,S,128]` — incompatible with the absorbed path.
@@ -227,12 +228,12 @@ Dominant risk to the target: expert GEMV efficiency at N-tile granularity (17.3 
 
 | Metric | Command / mechanism |
 |---|---|
-| Correctness error | `tests/*.py` (§6) |
+| Correctness error | `tests/*.py` (§6); on device `fleet_decode --teacher-force` (per-step token check) and free-running decode vs `golden_tokens.txt` |
 | Fleet-native ops / fallbacks | `taskgraph.py --report` prints per-op {fleet, torch-fallback} |
-| Consecutive layers | `run_layers.py --layers 1..N` |
-| GPU launches | `rocprofv3 --kernel-trace -o trace -- python decode.py` → count per token |
-| Median / P95 latency | 32-token run × 10 repeats, `hipEvent` per token + in-kernel `s_memrealtime` per layer |
-| Per-XCD timeline | every task writes start/end `s_memrealtime` + XCD id to a trace buffer; `bench/gantt.py` renders 8 XCD lanes per token, exposing bubbles, imbalance and tails |
+| Consecutive layers | *planned:* per-layer hidden-state dump from the launcher against `golden.npz` (first-decode-step states are already captured) |
+| GPU launches | `rocprofv3 --kernel-trace -o trace -- ./build/fleet_decode` → count per token |
+| Median / P95 latency | `fleet_decode --json` records `hipEvent` time per token; `--smoke` isolates the synchronisation cost |
+| Per-XCD timeline | *planned:* every task writes start/end `s_memrealtime` + XCD id to a trace buffer; a `bench/gantt.py` renders 8 XCD lanes per token, exposing bubbles, imbalance and tails |
 | Memory traffic / bandwidth | `rocprofv3 --pmc FETCH_SIZE WRITE_SIZE` (gfx942 TCC counters); achieved BW = bytes / kernel time |
 | Occupancy / resources | `hipcc -Rpass-analysis=kernel-resource-usage` (VGPR/SGPR/LDS), `rocprofv3 --pmc SQ_WAVES SQ_BUSY_CYCLES GRBM_GUI_ACTIVE` |
 | TPOT / tok/s | derived from e2e run |
@@ -241,9 +242,9 @@ The D5 report presents these as follows; no estimate from §9 survives into it u
 
 | Section | Content | Source |
 |---|---|---|
-| Milestone | exact consecutive-layer count; e2e reached or not; per-op list of Fleet-native vs torch-fallback | `taskgraph.py --report`, `run_layers.py` |
+| Milestone | exact consecutive-layer count; e2e reached or not; per-op list of Fleet-native vs torch-fallback | `taskgraph.py --report`, the planned per-layer dump |
 | Correctness | §6 table with measured values at every completed boundary; drift curve over layers; first divergent token and its logit margin if any | `tests/*.py` |
-| Per-layer XCD Gantt | 8 lanes per layer, one figure per layer type (dense, MoE, lm_head); every idle interval classified as (a) global-event wait — worker idle between its XCD's signal and the next dispatch, (b) tile tail — inside a Chiplet-task, workers idle after their tile while the last tile finishes, (c) XCD imbalance — an XCD's Chiplet-task ends before the slowest XCD's. Reported as % of layer time and aggregated per token | per-task and per-event `s_memrealtime` trace; classifier in `bench/attribution.py` |
+| Per-layer XCD Gantt | 8 lanes per layer, one figure per layer type (dense, MoE, lm_head); every idle interval classified as (a) global-event wait — worker idle between its XCD's signal and the next dispatch, (b) tile tail — inside a Chiplet-task, workers idle after their tile while the last tile finishes, (c) XCD imbalance — an XCD's Chiplet-task ends before the slowest XCD's. Reported as % of layer time and aggregated per token | *planned:* per-task and per-event `s_memrealtime` trace; classifier in a `bench/attribution.py` |
 | Achieved bandwidth by phase | bytes ÷ phase time for q/kv_a, o_proj, expert, lm_head GEMV phases, the attention phase and the small-op phase, each against the 4.0 TB/s ceiling; the phase farthest from the ceiling is named with its cause (tile size, in-flight depth, or sync) | bytes per phase from the §1 accounting (static), phase time from the trace timestamps; `rocprofv3 --pmc FETCH_SIZE` validates the per-token total only — hardware counters aggregate per dispatch and cannot be split inside one persistent kernel |
 | Next five days | ordered list; each item = change, expected gain, and the measured bubble or bandwidth gap in the two rows above that it is derived from. Items whose gain cannot be tied to a measurement are not listed | derived |
 | Known failures | reproducible failing cases with the boundary at which they appear | `tests/` |

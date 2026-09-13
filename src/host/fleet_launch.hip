@@ -591,6 +591,11 @@ int main(int argc, char** argv) {
     if (!smoke) {
         std::printf("tokens: %d/%d match HF greedy", matched, compared);
         if (first_div >= 0) std::printf(", first divergence at step %d", first_div);
+        if (compared < tokens) {
+            std::printf("  (%d step(s) had no reference token: reference_run.py "
+                        "writes decode+1 tokens; --tokens must not exceed that)",
+                        tokens - compared);
+        }
         std::printf("\n");
     }
     if (!json_path.empty()) {
@@ -605,5 +610,6 @@ int main(int argc, char** argv) {
         j << "]\n}\n";
         std::printf("wrote %s\n", json_path.c_str());
     }
-    return (smoke || (compared > 0 && matched == compared)) ? 0 : 3;
+    // Success means every launch was compared and every comparison matched.
+    return (smoke || (compared == tokens && matched == compared)) ? 0 : 3;
 }

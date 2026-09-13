@@ -46,8 +46,22 @@ from reference.modeling_deepseek import (  # noqa: E402
 
 import reference_decode as ref  # noqa: E402
 
-TORCH_DTYPE = torch.float32
+TORCH_DTYPE = torch.float32   # set per pass by main(): fp32, then bf16
 RNG = np.random.default_rng(1234)
+
+# Tolerances per pass. fp32: the reference must be the same arithmetic as HF
+# to accumulation-order noise. bf16: HF rounds every module output to bf16 and
+# the reference reproduces those roundings (ModelConfig.bf16), but the
+# absorbed attention path cannot reproduce HF's bf16-materialised K/V, so a
+# bf16-ulp-level gap remains there and in anything downstream of it.
+TOL = {
+    torch.float32: {"rmsnorm": (1e-6, 1 - 1e-9), "rope_tab": (1e-6, 1 - 1e-9),
+                    "rope_app": (1e-5, 1 - 1e-9), "attn": (2e-4, 1 - 1e-7),
+                    "moe": (2e-4, 1 - 1e-7)},
+    torch.bfloat16: {"rmsnorm": (1e-6, 1 - 1e-9), "rope_tab": (8e-3, 1 - 1e-5),
+                     "rope_app": (2e-2, 1 - 1e-4), "attn": (3e-2, 0.9995),
+                     "moe": (3e-2, 0.9995)},
+}
 
 
 def tiny_config() -> DeepseekV2Config:
@@ -102,7 +116,12 @@ def cfg_to_ref(c: DeepseekV2Config) -> ref.ModelConfig:
         mscale=rs["mscale"], mscale_all_dim=rs["mscale_all_dim"],
         routed_scaling=c.routed_scaling_factor,
         norm_topk_prob=c.norm_topk_prob,
+        bf16=(TORCH_DTYPE == torch.bfloat16),
     )
+
+
+def tol(name: str) -> tuple[float, float]:
+    return TOL[TORCH_DTYPE][name]
 
 
 def np_of(t: torch.Tensor) -> np.ndarray:
@@ -126,10 +145,11 @@ def compare(name: str, a: np.ndarray, b: np.ndarray,
 def test_rmsnorm(c) -> bool:
     mod = DeepseekV2RMSNorm(c.hidden_size, eps=c.rms_norm_eps).to(TORCH_DTYPE)
     torch.nn.init.uniform_(mod.weight, 0.5, 1.5)
-    x = torch.randn(c.hidden_size, dtype=TORCH_DTYPE)
-    got = ref.rms_norm(np_of(x), np_of(mod.weight), c.rms_norm_eps)
+    x = torch.randn(c.hidden_size).to(TORCH_DTYPE)
+    got = ref.rms_norm(np_of(x), np_of(mod.weight), c.rms_norm_eps,
+                       bf16=(TORCH_DTYPE == torch.bfloat16))
     want = np_of(mod(x))
-    return compare("rmsnorm", got, want, 1e-6, 1 - 1e-9)
+    return compare("rmsnorm", got, want, *tol("rmsnorm"))
 
 
 def test_rope(c) -> bool:
@@ -150,17 +170,18 @@ def test_rope(c) -> bool:
     cos, sin = ref.yarn_cos_sin(d, S, rc.rope_theta, rc.rope_factor,
                                 rc.rope_original_max, rc.beta_fast, rc.beta_slow,
                                 rc.mscale, rc.mscale_all_dim)
-    ok_tab = compare("rope cos/sin table", cos, np_of(cos_t), 1e-6, 1 - 1e-9)
+    ok_tab = compare("rope cos/sin table", cos, np_of(cos_t), *tol("rope_tab"))
 
     # And the rotation itself, including the interleave step.
     pos = 7
-    q = torch.randn(1, 2, 1, d, dtype=TORCH_DTYPE)
-    k = torch.randn(1, 1, 1, d, dtype=TORCH_DTYPE)
+    q = torch.randn(1, 2, 1, d).to(TORCH_DTYPE)
+    k = torch.randn(1, 1, 1, d).to(TORCH_DTYPE)
     from reference.modeling_deepseek import apply_rotary_pos_emb
     q_hf, k_hf = apply_rotary_pos_emb(q, k, cos_t, sin_t,
                                       torch.tensor([[pos]]))
-    q_np = ref.apply_rope(np_of(q)[0, :, 0, :], cos[pos][None, :], sin[pos][None, :])
-    ok_rot = compare("rope applied", q_np, np_of(q_hf)[0, :, 0, :], 1e-5, 1 - 1e-9)
+    rc = cfg_to_ref(c)
+    q_np = rc.r(ref.apply_rope(np_of(q)[0, :, 0, :], cos[pos][None, :], sin[pos][None, :]))
+    ok_rot = compare("rope applied", q_np, np_of(q_hf)[0, :, 0, :], *tol("rope_app"))
     return ok_tab and ok_rot
 
 
@@ -190,10 +211,11 @@ def test_attention(c) -> bool:
     torch.nn.init.uniform_(mod.kv_a_layernorm.weight, 0.8, 1.2)
 
     S = 12
-    x = torch.randn(1, S, c.hidden_size, dtype=TORCH_DTYPE) * 0.5
-    mask = torch.full((1, 1, S, S), float("-inf"), dtype=TORCH_DTYPE).triu(1)
+    x = (torch.randn(1, S, c.hidden_size) * 0.5).to(TORCH_DTYPE)
+    mask = torch.full((1, 1, S, S), float("-inf")).triu(1).to(TORCH_DTYPE)
     pos_ids = torch.arange(S)[None, :]
 
+    rc = cfg_to_ref(c)
     # HF's attention module starts at q_proj: input_layernorm lives in the
     # DecoderLayer. Our task folds that norm into the q/kv_a prologue (§3), so
     # the equivalent input for HF is the already-normed vector. Feeding raw x to
@@ -201,13 +223,12 @@ def test_attention(c) -> bool:
     # that looks like a kernel bug but is a harness bug.
     x_normed = torch.from_numpy(
         ref.rms_norm(np_of(x), np.ones(c.hidden_size, dtype=np.float32),
-                     c.rms_norm_eps)).to(TORCH_DTYPE)
+                     c.rms_norm_eps, rc.bf16)).to(TORCH_DTYPE)
     with torch.no_grad():
         hf_out, _, _ = mod(hidden_states=x_normed, attention_mask=mask,
                            position_ids=pos_ids)
     want = np_of(hf_out)[0, -1]
 
-    rc = cfg_to_ref(c)
     w = _attn_weights(mod)
     cos, sin = ref.yarn_cos_sin(rc.qk_rope, S, rc.rope_theta, rc.rope_factor,
                                 rc.rope_original_max, rc.beta_fast, rc.beta_slow,
@@ -217,7 +238,7 @@ def test_attention(c) -> bool:
     got = None
     for t in range(S):
         got = ref.attention_absorbed(rc, w, xn[t], cache, t, cos, sin)
-    return compare("attention (absorbed)", got, want, 2e-4, 1 - 1e-7)
+    return compare("attention (absorbed)", got, want, *tol("attn"))
 
 
 def test_moe(c) -> bool:
@@ -226,7 +247,7 @@ def test_moe(c) -> bool:
     for p in mod.parameters():
         torch.nn.init.normal_(p, std=0.08)
 
-    x = torch.randn(1, 1, c.hidden_size, dtype=TORCH_DTYPE) * 0.5
+    x = (torch.randn(1, 1, c.hidden_size) * 0.5).to(TORCH_DTYPE)
     with torch.no_grad():
         want = np_of(mod(x))[0, 0]
 
@@ -260,20 +281,21 @@ def test_moe(c) -> bool:
     ok_route = ours == theirs
     print(f"  {'moe top-k ids':<28} ours {sorted(ours)} vs hf {sorted(theirs)}  "
           f"[{'PASS' if ok_route else 'FAIL'}]")
-    return ok_route and compare("moe output", got, want, 2e-4, 1 - 1e-7)
+    return ok_route and compare("moe output", got, want, *tol("moe"))
 
 
 def main() -> int:
+    global TORCH_DTYPE
     c = tiny_config()
     print(f"tiny config: hidden={c.hidden_size} heads={c.num_attention_heads} "
           f"kv_lora={c.kv_lora_rank} experts={c.n_routed_experts}/top-{c.num_experts_per_tok}")
-    print("boundary checks (numpy reference vs HuggingFace, fp32 CPU):")
-    results = [
-        test_rmsnorm(c),
-        test_rope(c),
-        test_attention(c),
-        test_moe(c),
-    ]
+    results = []
+    for dtype in (torch.float32, torch.bfloat16):
+        TORCH_DTYPE = dtype
+        torch.manual_seed(0)
+        print(f"\nboundary checks (numpy reference vs HuggingFace, "
+              f"{'fp32' if dtype == torch.float32 else 'bf16 with HF rounding points'} CPU):")
+        results += [test_rmsnorm(c), test_rope(c), test_attention(c), test_moe(c)]
     print(f"\n{sum(results)}/{len(results)} boundaries passed")
     return 0 if all(results) else 1
 

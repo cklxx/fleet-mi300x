@@ -57,6 +57,7 @@ python3 -m venv .venv && .venv/bin/pip install numpy torch transformers
 .venv/bin/python tests/test_kernel_interface.py      # kernel vs runtime vs launcher
 .venv/bin/python tests/test_queue_simulation.py      # the event protocol, 3 tokens
 .venv/bin/python tests/test_row_partition.py         # every GEMV row owned exactly once
+.venv/bin/python tests/test_expert_addressing.py     # packed experts, shared halves, 8-unit phase
 bash scripts/hip_syntax_check.sh                     # clang front end, HIP mode
 ```
 
