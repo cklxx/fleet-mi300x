@@ -64,6 +64,7 @@ log "local checks that need no GPU (fail here = fix before spending GPU time)"
 python3 "$REPO_ROOT/tests/test_descriptor_layout.py"
 python3 "$REPO_ROOT/tests/test_kernel_interface.py"
 python3 "$REPO_ROOT/tests/test_queue_simulation.py"
+python3 "$REPO_ROOT/tests/test_row_partition.py"
 python3 "$REPO_ROOT/tests/test_absorbed_equivalence.py"
 
 log "build HIP"
