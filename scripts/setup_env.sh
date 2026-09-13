@@ -60,33 +60,38 @@ PY
     du -sh "$MODEL_DIR"
 fi
 
+log "local checks that need no GPU (fail here = fix before spending GPU time)"
+python3 "$REPO_ROOT/tests/test_descriptor_layout.py"
+python3 "$REPO_ROOT/tests/test_kernel_interface.py"
+python3 "$REPO_ROOT/tests/test_queue_simulation.py"
+python3 "$REPO_ROOT/tests/test_absorbed_equivalence.py"
+
 log "build HIP"
-mkdir -p "$REPO_ROOT/build"
+mkdir -p "$REPO_ROOT/build" "$REPO_ROOT/results"
 # Microbenchmarks first: they are self-contained, so a compile failure here is
 # a toolchain problem, not a kernel problem.
 hipcc --offload-arch=gfx942 -O3 -std=c++17 \
     "$REPO_ROOT/bench/microbench.hip" -o "$REPO_ROOT/build/microbench" 2>&1 | tail -20
 echo "  compiled -> build/microbench"
 
-if [[ -f "$REPO_ROOT/src/kernels/fleet_kernel.hip" ]]; then
-    # -Rpass-analysis prints VGPR/SGPR/LDS use: the design assumes one 256-thread
-    # workgroup per CU, and spilling past 512 VGPR+AGPR would break that (§11).
-    hipcc --offload-arch=gfx942 -O3 -std=c++17 \
-        -Rpass-analysis=kernel-resource-usage \
-        -I"$REPO_ROOT/src" \
-        "$REPO_ROOT/src/host/fleet_launch.hip" \
-        "$REPO_ROOT/src/kernels/fleet_kernel.hip" \
-        -o "$REPO_ROOT/build/fleet_decode" 2>&1 | tail -40
-    echo "  compiled -> build/fleet_decode"
-else
-    echo "  (persistent kernel not present yet — skipping)"
-fi
+# -Rpass-analysis prints VGPR/SGPR/LDS use: the design assumes one 256-thread
+# workgroup per CU, and spilling past 512 VGPR+AGPR would break that (§11).
+hipcc --offload-arch=gfx942 -O3 -std=c++17 \
+    -Rpass-analysis=kernel-resource-usage \
+    -I"$REPO_ROOT/src" \
+    "$REPO_ROOT/src/host/fleet_launch.hip" \
+    "$REPO_ROOT/src/kernels/fleet_kernel.hip" \
+    -o "$REPO_ROOT/build/fleet_decode" 2>&1 | tail -40
+echo "  compiled -> build/fleet_decode"
 
 log "task graph"
 python3 "$REPO_ROOT/src/host/taskgraph.py" --kv-chunks 1 \
     --emit "$REPO_ROOT/build/taskgraph_d2.bin"
 python3 "$REPO_ROOT/src/host/taskgraph.py" --kv-chunks 4 \
     --emit "$REPO_ROOT/build/taskgraph_d4.bin"
+
+log "protocol smoke test (no weights): residency, XCD roles, every event"
+"$REPO_ROOT/build/fleet_decode" --graph "$REPO_ROOT/build/taskgraph_d2.bin" --smoke --tokens 4
 
 if [[ $WANT_MODEL -eq 1 ]]; then
     log "pack weights (one-time; excluded from decode latency by the task spec)"
@@ -95,10 +100,6 @@ if [[ $WANT_MODEL -eq 1 ]]; then
     python3 "$REPO_ROOT/src/host/pack_weights.py" \
         --model "$MODEL_DIR" --out "$REPO_ROOT/build/weights.bin"
 fi
-
-log "local checks that need no GPU"
-python3 "$REPO_ROOT/src/host/model_analysis.py"
-python3 "$REPO_ROOT/tests/test_absorbed_equivalence.py"
 
 log "done"
 cat <<EOF
@@ -110,12 +111,15 @@ Next, in the order the design's D1 expects:
        in §4. Needs no model weights.
 
   2. python3 src/host/reference_run.py --model $MODEL_DIR --out build/golden.npz
-       Golden hidden states + 32 greedy tokens. Everything later is compared
-       against this.
+       Golden hidden states + 32 greedy tokens, and the two launcher inputs
+       build/fleet_cache.bin and build/golden_tokens.txt from the same prefill.
 
   3. python3 src/host/kv_convert.py --model $MODEL_DIR --verify
        Confirms K,V rebuilt from the compressed cache match HF's own, <= 1e-2.
 
-  4. ./build/fleet_decode --graph build/taskgraph_d2.bin
-       Residency and queue construction only, before any task bodies are trusted.
+  4. ./build/fleet_decode --graph build/taskgraph_d2.bin --teacher-force
+       Every step fed HF's token: a mismatch is isolated to the step it appears in.
+
+  5. ./build/fleet_decode --graph build/taskgraph_d2.bin --json results/decode_d2.json
+       Free-running 32-token decode, compared with HF greedy; latency per token.
 EOF

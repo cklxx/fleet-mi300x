@@ -3,15 +3,20 @@
 // These three numbers decide whether the design's latency budget survives
 // contact with the hardware, and none of them needs model weights:
 //
-//   (a) cross-XCD event round-trip, for both schemes in §4:
-//         (i)  buffer_wbl2 on the last worker, then GPU-scope atomicAdd
-//         (ii) write-through stores (sc1) + event counters in uncached memory
+//   (a) cross-XCD event round-trip, for both schemes in §4, using exactly the
+//       protocol src/runtime/fleet_runtime.h runs: agent-scope release fence
+//       (buffer_wbl2 on gfx942), agent-scope atomic, agent-scope atomic-load
+//       polling, agent-scope acquire fence (buffer_inv). The schemes differ in
+//       where the counter lives:
+//         (i)  ordinary device memory
+//         (ii) hipDeviceMallocUncached memory, so the atomic resolves at the
+//              Infinity Cache instead of walking the XCD L2
 //       §9 budgets ~166 global events x 2-4 us; at 4.94 GB/token the whole
 //       token is 1.24 ms, so an extra microsecond per event costs ~13% of it.
 //
-//   (b) XCD-local flag latency — the scheduler mirrors a global counter into
-//       its L2 and 37 workers poll that instead of the fabric. This is the
-//       "one hop instead of two" claim in §4.
+//   (b) XCD-local flag latency — producer and consumer on the same chiplet,
+//       same protocol. The difference between (b) and (a) is what the
+//       scheduler's mirroring (§4) can save per event at most.
 //
 //   (c) register-streamed GEMV bandwidth vs outstanding-load depth and tile
 //       size. §12 needs ~18 KB in flight per CU to reach 75% of HBM peak;
@@ -61,9 +66,24 @@ __device__ __forceinline__ unsigned long long clk() {
   return __builtin_amdgcn_s_memrealtime();
 }
 
-// Non-temporal load: event polling must not park lines in L2 (§4).
-__device__ __forceinline__ unsigned nt_load(const volatile unsigned* p) {
-  return __builtin_nontemporal_load(const_cast<const unsigned*>(p));
+// Agent-scope atomic load: never satisfied by a stale L1/L2 line. This is the
+// poll the runtime uses (fleet_runtime.h poll()).
+__device__ __forceinline__ unsigned poll(unsigned* p) {
+  return __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+}
+__device__ __forceinline__ void fence_release() {
+  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");   // buffer_wbl2 on gfx942
+}
+__device__ __forceinline__ void fence_acquire() {
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");   // buffer_inv on gfx942
+}
+__device__ __forceinline__ void signal(unsigned* p) {
+  fence_release();
+  __hip_atomic_fetch_add(p, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+}
+__device__ __forceinline__ void wait_for(unsigned* p, unsigned target) {
+  while (poll(p) < target) { __builtin_amdgcn_s_sleep(1); }
+  fence_acquire();
 }
 
 // ---------------------------------------------------------------- (a) event round-trip
@@ -72,11 +92,14 @@ __device__ __forceinline__ unsigned nt_load(const volatile unsigned* p) {
 // waits. Measuring a ping-pong rather than a one-way trip keeps both clocks on
 // the same side of the fabric, so no cross-XCD clock skew enters the number.
 
-enum EventScheme { SCHEME_WBL2 = 0, SCHEME_WRITETHROUGH = 1 };
+enum EventScheme { SCHEME_CACHED = 0, SCHEME_UNCACHED = 1 };
 
+// The kernel is the same for both schemes; the host allocates `ping`/`pong`
+// differently. Every hop pays the full protocol (release, atomic, poll,
+// acquire), so the number is what one global event costs the runtime.
 __global__ __launch_bounds__(kBlock) void event_pingpong(
     unsigned* __restrict__ ping, unsigned* __restrict__ pong,
-    unsigned long long* __restrict__ out_cycles, int iters, int scheme) {
+    unsigned long long* __restrict__ out_cycles, int iters) {
   const int wg = blockIdx.x;
   const bool is_producer = (wg == 0);
   const bool is_consumer = (wg == 1);
@@ -88,36 +111,16 @@ __global__ __launch_bounds__(kBlock) void event_pingpong(
     if (is_producer) {
       if (threadIdx.x == 0) t0 = clk();
       __syncthreads();
-
       if (threadIdx.x == 0) {
-        if (scheme == SCHEME_WBL2) {
-          // (i) flush this XCD's dirty L2 lines, then a device-scope atomic.
-          __builtin_amdgcn_buffer_wbl2();
-          __threadfence();
-          atomicAdd(ping, 1u);
-        } else {
-          // (ii) write-through store; the counter itself lives in uncached
-          // memory so the atomic resolves at the Infinity Cache.
-          __threadfence();
-          atomicAdd(ping, 1u);
-        }
-      }
-      // wait for the echo
-      if (threadIdx.x == 0) {
-        while (nt_load(pong) < (unsigned)i) { __builtin_amdgcn_s_sleep(1); }
+        signal(ping);
+        wait_for(pong, (unsigned)i);      // the echo
         out_cycles[i - 1] = clk() - t0;
       }
       __syncthreads();
     } else {  // consumer, different XCD by construction of the grid
       if (threadIdx.x == 0) {
-        while (nt_load(ping) < (unsigned)i) { __builtin_amdgcn_s_sleep(1); }
-        if (scheme == SCHEME_WBL2) {
-          __builtin_amdgcn_buffer_wbl2();
-          __threadfence();
-        } else {
-          __threadfence();
-        }
-        atomicAdd(pong, 1u);
+        wait_for(ping, (unsigned)i);
+        signal(pong);
       }
       __syncthreads();
     }
@@ -126,40 +129,36 @@ __global__ __launch_bounds__(kBlock) void event_pingpong(
 
 // ---------------------------------------------------------------- (b) XCD-local mirror
 //
-// The design's claim: a worker should poll an L2-resident flag written by its
-// own XCD's scheduler, not the global counter over the fabric. This measures
-// the L2 hop alone, with producer and consumer pinned to the same XCD.
+// The design's claim: a worker should poll a flag written on its own chiplet,
+// not a counter on another one. This pins producer and consumer to the same
+// XCD and runs the same protocol as (a); the gap between the two is the most
+// the scheduler's mirroring can save per event.
 
 __global__ __launch_bounds__(kBlock) void xcd_local_flag(
     unsigned* __restrict__ flag, unsigned long long* __restrict__ out_cycles,
     int iters) {
   const int wg = blockIdx.x;
   // Workgroups are dispatched round-robin over XCDs, so wg and wg+kXCDs land
-  // on the same chiplet.
+  // on the same chiplet. xcc_id() is recorded by the host-side check below.
   const bool is_writer = (wg == 0);
   const bool is_reader = (wg == kXCDs);
   if (!is_writer && !is_reader) return;
+  if (threadIdx.x == 0) out_cycles[iters + (is_writer ? 0 : 1)] = xcc_id();
 
   __shared__ unsigned long long t0;
   for (int i = 1; i <= iters; ++i) {
     if (is_writer) {
       if (threadIdx.x == 0) {
         t0 = clk();
-        __threadfence_block();
-        atomicAdd(flag, 1u);            // stays in this XCD's L2
-      }
-      __syncthreads();
-      if (threadIdx.x == 0) {
-        while (nt_load(flag + 1) < (unsigned)i) { __builtin_amdgcn_s_sleep(1); }
+        signal(flag);
+        wait_for(flag + 16, (unsigned)i);   // separate cache line
         out_cycles[i - 1] = clk() - t0;
       }
       __syncthreads();
     } else {
       if (threadIdx.x == 0) {
-        while (*(volatile unsigned*)flag < (unsigned)i) {
-          __builtin_amdgcn_s_sleep(1);
-        }
-        atomicAdd(flag + 1, 1u);
+        wait_for(flag, (unsigned)i);
+        signal(flag + 16);
       }
       __syncthreads();
     }
@@ -228,7 +227,7 @@ static Stats run_event(int scheme, int iters, double ns) {
   unsigned *ping, *pong;
   unsigned long long* cyc;
   HIP_CHECK(hipMalloc(&cyc, iters * sizeof(unsigned long long)));
-  if (scheme == SCHEME_WRITETHROUGH) {
+  if (scheme == SCHEME_UNCACHED) {
     // Uncached device memory: the atomic resolves past the XCD L2.
     HIP_CHECK(hipExtMallocWithFlags((void**)&ping, 64, hipDeviceMallocUncached));
     HIP_CHECK(hipExtMallocWithFlags((void**)&pong, 64, hipDeviceMallocUncached));
@@ -240,7 +239,7 @@ static Stats run_event(int scheme, int iters, double ns) {
   HIP_CHECK(hipMemset(pong, 0, 64));
 
   hipLaunchKernelGGL(event_pingpong, dim3(kGrid), dim3(kBlock), 0, 0, ping, pong,
-                     cyc, iters, scheme);
+                     cyc, iters);
   HIP_CHECK(hipDeviceSynchronize());
 
   std::vector<unsigned long long> h(iters);
@@ -249,16 +248,18 @@ static Stats run_event(int scheme, int iters, double ns) {
   return summarise(std::move(h), ns);
 }
 
-static Stats run_xcd_local(int iters, double ns) {
+static Stats run_xcd_local(int iters, double ns, bool* same_xcd) {
   unsigned* flag;
   unsigned long long* cyc;
-  HIP_CHECK(hipMalloc(&flag, 64));
-  HIP_CHECK(hipMemset(flag, 0, 64));
-  HIP_CHECK(hipMalloc(&cyc, iters * sizeof(unsigned long long)));
+  HIP_CHECK(hipMalloc(&flag, 256));
+  HIP_CHECK(hipMemset(flag, 0, 256));
+  HIP_CHECK(hipMalloc(&cyc, (iters + 2) * sizeof(unsigned long long)));
   hipLaunchKernelGGL(xcd_local_flag, dim3(kGrid), dim3(kBlock), 0, 0, flag, cyc, iters);
   HIP_CHECK(hipDeviceSynchronize());
-  std::vector<unsigned long long> h(iters);
-  HIP_CHECK(hipMemcpy(h.data(), cyc, iters * sizeof(h[0]), hipMemcpyDeviceToHost));
+  std::vector<unsigned long long> h(iters + 2);
+  HIP_CHECK(hipMemcpy(h.data(), cyc, h.size() * sizeof(h[0]), hipMemcpyDeviceToHost));
+  *same_xcd = h[iters] == h[iters + 1];   // both sides recorded their XCC_ID
+  h.resize(iters);
   HIP_CHECK(hipFree(flag)); HIP_CHECK(hipFree(cyc));
   return summarise(std::move(h), ns);
 }
@@ -301,21 +302,24 @@ int main(int argc, char** argv) {
   std::printf("grid: %d workgroups x %d threads   tick %.2f ns\n\n", kGrid, kBlock, ns);
 
   const int iters = 2000;
-  std::printf("(a) cross-XCD event round-trip (ping-pong, us)\n");
-  Stats wbl2 = run_event(SCHEME_WBL2, iters, ns);
-  Stats wt = run_event(SCHEME_WRITETHROUGH, iters, ns);
-  std::printf("    (i)  wbl2 + atomicAdd        median %6.2f  p95 %6.2f\n",
+  std::printf("(a) cross-XCD event round-trip (ping-pong, us; release+atomic+poll+acquire)\n");
+  Stats wbl2 = run_event(SCHEME_CACHED, iters, ns);
+  Stats wt = run_event(SCHEME_UNCACHED, iters, ns);
+  std::printf("    (i)  counters in device memory   median %6.2f  p95 %6.2f\n",
               wbl2.median / 1e3, wbl2.p95 / 1e3);
-  std::printf("    (ii) write-through/uncached  median %6.2f  p95 %6.2f\n",
+  std::printf("    (ii) counters uncached           median %6.2f  p95 %6.2f\n",
               wt.median / 1e3, wt.p95 / 1e3);
-  std::printf("    -> design picks the cheaper: %s\n\n",
+  std::printf("    -> design picks the cheaper: %s  (FLEET_UNCACHED_EVENTS=1 selects ii)\n\n",
               wt.median < wbl2.median ? "(ii)" : "(i)");
 
-  std::printf("(b) XCD-local flag round-trip (us)\n");
-  Stats loc = run_xcd_local(iters, ns);
-  std::printf("    median %6.3f  p95 %6.3f   (vs global %.2f)\n\n",
+  std::printf("(b) same-XCD flag round-trip (us)\n");
+  bool same_xcd = false;
+  Stats loc = run_xcd_local(iters, ns, &same_xcd);
+  std::printf("    median %6.3f  p95 %6.3f   (vs cross-XCD %.2f)%s\n\n",
               loc.median / 1e3, loc.p95 / 1e3,
-              std::min(wbl2.median, wt.median) / 1e3);
+              std::min(wbl2.median, wt.median) / 1e3,
+              same_xcd ? "" : "   !! producer and consumer were NOT on the same XCD; "
+                              "the round-robin placement assumption failed");
 
   std::printf("(c) register-streamed read bandwidth by in-flight depth\n");
   const size_t bytes = 2ull << 30;  // 2 GiB, larger than the 256 MB LLC

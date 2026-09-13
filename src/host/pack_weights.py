@@ -11,6 +11,10 @@ the kernel resolves `topk_ids[k]` into an address without any host round trip �
 and it moves the repack cost out of the decode path entirely, where the task
 spec requires one-time conversions to be excluded from measured latency.
 
+Outputs: `weights.bin` (the blob), `weights.bin.json` (human-readable) and
+`weights.bin.manifest` (the same facts as `scalar name value` /
+`tensor name offset bytes` lines, which is all the C++ launcher parses).
+
     python3 src/host/pack_weights.py --model ~/models/dsv2-lite-base \
         --out build/weights.bin
 """
@@ -18,7 +22,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import struct
 from pathlib import Path
 
 import numpy as np
@@ -66,7 +69,7 @@ def to_bf16_u16(t) -> np.ndarray:
 
 
 def interleave_gate_up(gate, up):
-    """Rows [g0, u0, g1, u1, ...] so a lane holds adjacent gate/up pairs.
+    """Rows [g0, u0, g1, u1, ...] so a wave streams adjacent gate/up pairs.
 
     §12: with this layout SiLU(gate)*up is computed in registers — no
     cross-lane shuffle, no LDS round trip — and the epilogue writes h directly.
@@ -78,6 +81,16 @@ def interleave_gate_up(gate, up):
     out[0::2] = gate
     out[1::2] = up
     return out
+
+
+def write_manifest(path: Path, meta: dict) -> None:
+    lines = []
+    for k, v in meta.items():
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            lines.append(f"scalar {k} {v!r}\n")
+    for name, t in meta["tensors"].items():
+        lines.append(f"tensor {name} {t['offset']} {t['bytes']}\n")
+    path.write_text("".join(lines))
 
 
 def pack(model_dir: Path, out: Path) -> None:
@@ -99,8 +112,10 @@ def pack(model_dir: Path, out: Path) -> None:
         a = layer.self_attn
         p.write(f"L{i}.norm_in", layer.input_layernorm.weight)
         p.write(f"L{i}.norm_post", layer.post_attention_layernorm.weight)
-        p.write(f"L{i}.q_proj", a.q_proj.weight)
-        p.write(f"L{i}.kv_a", a.kv_a_proj_with_mqa.weight)
+        # q_proj ‖ kv_a_proj_with_mqa as one [3072 + 576, hidden] matrix: the
+        # kernel runs them as a single fused GEMV (§3 fusion 1), so they must
+        # be contiguous by construction, not by luck of the alignment padding.
+        p.write(f"L{i}.qkv", torch.cat([a.q_proj.weight, a.kv_a_proj_with_mqa.weight], 0))
         p.write(f"L{i}.kv_a_norm", a.kv_a_layernorm.weight)
         p.write(f"L{i}.kv_b", a.kv_b_proj.weight)
         p.write(f"L{i}.o_proj", a.o_proj.weight)
@@ -135,10 +150,11 @@ def pack(model_dir: Path, out: Path) -> None:
     strides = set(expert_strides)
     assert len(strides) <= 1, f"expert stride differs across layers: {strides}"
 
+    rs = getattr(cfg, "rope_scaling", None) or {}
     meta = {
         "bytes": p.pos,
         "dtype": "bfloat16",
-        "expert_stride_elems": expert_strides[0] if expert_strides else 0,
+        "expert_stride": expert_strides[0] if expert_strides else 0,
         "hidden": cfg.hidden_size,
         "layers": cfg.num_hidden_layers,
         "first_k_dense": cfg.first_k_dense_replace,
@@ -154,13 +170,23 @@ def pack(model_dir: Path, out: Path) -> None:
         "v_head": cfg.v_head_dim,
         "vocab": cfg.vocab_size,
         "rms_eps": cfg.rms_norm_eps,
+        "routed_scaling": float(getattr(cfg, "routed_scaling_factor", 1.0)),
+        "rope_theta": float(getattr(cfg, "rope_theta", 10000.0)),
+        "rope_factor": float(rs.get("factor", 1.0)),
+        "rope_original_max": int(rs.get("original_max_position_embeddings",
+                                        cfg.max_position_embeddings)),
+        "beta_fast": float(rs.get("beta_fast", 32)),
+        "beta_slow": float(rs.get("beta_slow", 1)),
+        "mscale": float(rs.get("mscale", 1)),
+        "mscale_all_dim": float(rs.get("mscale_all_dim", 0)),
         "gate_up_layout": "interleaved [g0,u0,g1,u1,...]",
         "tensors": p.offsets,
     }
-    out.with_suffix(".json").write_text(json.dumps(meta, indent=2))
-    print(f"\nwrote {out} ({p.pos/1e9:.2f} GB) and {out.with_suffix('.json')}")
-    print(f"  expert stride: {meta['expert_stride_elems']} elems "
-          f"({meta['expert_stride_elems']*2/1e6:.1f} MB) — matches design.md §1's "
+    Path(str(out) + ".json").write_text(json.dumps(meta, indent=2))
+    write_manifest(Path(str(out) + ".manifest"), meta)
+    print(f"\nwrote {out} ({p.pos/1e9:.2f} GB), {out}.json and {out}.manifest")
+    print(f"  expert stride: {meta['expert_stride']} elems "
+          f"({meta['expert_stride']*2/1e6:.1f} MB) — matches design.md §1's "
           f"17.3 MB per routed expert")
 
 

@@ -1,93 +1,97 @@
 #!/usr/bin/env bash
-# Parse the .hip sources with a host compiler and minimal HIP stubs.
+# Parse the .hip sources in HIP language mode with a stock clang + stubs.
 #
 # There is no ROCm toolchain on the laptop, so the first real compile happens on
-# the MI300X — where the clock is running. This catches the ordinary C++ errors
-# (braces, typos, wrong arity, template mistakes) before that, and says plainly
-# what it cannot catch.
+# the MI300X — where the clock is running. Any clang built with the AMDGPU
+# backend (Homebrew's llvm is) can still run the *front end* over HIP code:
+# `-x hip -nogpuinc -nogpulib -fsyntax-only` exercises the real
+# `__builtin_amdgcn_*` / `__hip_atomic_*` builtins, the host/device call rules,
+# `__shared__`/`__launch_bounds__`, and inline asm parsing, with only the
+# runtime API stubbed (scripts/hip_stubs). Each file is checked in both the
+# device and the host compilation pass, as hipcc would.
 #
 #   bash scripts/hip_syntax_check.sh
+#   HIP_SYNTAX_CLANG=/path/to/clang++ bash scripts/hip_syntax_check.sh
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STUBS="$ROOT/scripts/hip_stubs"
-# Prefer the platform compiler: a Homebrew clang first on PATH does not know
-# where the macOS SDK headers live and dies on <stdio.h>.
-if [[ -z "${CXX:-}" ]]; then
-    if [[ -x /usr/bin/clang++ ]]; then CXX=/usr/bin/clang++; else CXX=clang++; fi
+
+# Find a clang that knows the amdgcn target. Apple's does not.
+candidates=("${HIP_SYNTAX_CLANG:-}" /opt/homebrew/opt/llvm/bin/clang++
+            /usr/local/opt/llvm/bin/clang++)
+# Versioned installs, newest first: older LLVMs lack the __HIP_MEMORY_SCOPE_*
+# macros the runtime uses.
+while IFS= read -r c; do candidates+=("$c"); done < <(
+    ls -d /opt/homebrew/opt/llvm@*/bin/clang++ /usr/lib/llvm-*/bin/clang++ 2>/dev/null \
+        | sort -t@ -k2 -V -r)
+candidates+=(clang++)
+CXX=""
+for c in "${candidates[@]}"; do
+    [[ -n "$c" ]] || continue
+    if command -v "$c" >/dev/null 2>&1 && "$c" -print-targets 2>/dev/null | grep -q amdgcn; then
+        CXX="$c"; break
+    fi
+done
+if [[ -z "$CXX" ]]; then
+    echo "SKIPPED: no clang with the AMDGPU backend found (brew install llvm)" >&2
+    exit 0
 fi
 
-command -v "$CXX" >/dev/null || { echo "no $CXX on PATH" >&2; exit 1; }
-
-# `-x c++` on a .hip file also discards the implicit SDK include path on macOS,
-# so <cstddef> stops resolving. Put it back explicitly.
-#
-# Pass it as an array: `${SDK:+-isysroot "$SDK"}` expands to a single word with
-# an embedded space, and clang then looks for a sysroot literally named
-# " /Library/...", warns, and carries on without it.
+# The parse still needs the host's C/C++ headers (macOS: the SDK sysroot).
 SDKFLAGS=()
-if [[ "$(uname -s)" == "Darwin" ]] && command -v xcrun >/dev/null; then
+if [[ "$(uname -s)" == "Darwin" ]]; then
     _sdk="$(xcrun --show-sdk-path 2>/dev/null || true)"
+    [[ -z "$_sdk" || ! -d "$_sdk" ]] && _sdk="$(ls -d /Library/Developer/CommandLineTools/SDKs/MacOSX*.sdk 2>/dev/null | tail -1)"
     [[ -n "$_sdk" && -d "$_sdk" ]] && SDKFLAGS=(-isysroot "$_sdk")
 fi
 
+# Newest gfx9 this clang accepts: gfx942 if it knows it, else gfx90a. Both are
+# wave64 with the same builtins; only `#if defined(__gfx942__)` differs.
+ARCH=""
+for a in gfx942 gfx90a gfx908; do
+    if echo "" | "$CXX" -x hip --cuda-device-only --offload-arch=$a -nogpuinc -nogpulib \
+            -fsyntax-only "${SDKFLAGS[@]}" - >/dev/null 2>&1; then
+        ARCH=$a; break
+    fi
+done
+[[ -n "$ARCH" ]] || { echo "SKIPPED: $CXX accepts none of gfx942/gfx90a/gfx908" >&2; exit 0; }
+
 echo "syntax check: $($CXX --version | head -1)"
-echo "stubs:        $STUBS  (host-only, never linked)"
-
-# Establish that the toolchain can compile *anything* before blaming our
-# sources. On a machine with CommandLineTools but no Xcode, clang may fail to
-# resolve <cstddef> for even a trivial file; reporting that as an error in
-# microbench.hip would be actively misleading.
-probe=$(mktemp -t hipprobe).cpp
-printf '#include <cstddef>\nint main(){return 0;}\n' > "$probe"
-if ! "$CXX" -fsyntax-only -std=c++17 "${SDKFLAGS[@]}" "$probe" >/dev/null 2>&1; then
-    rm -f "$probe"
-    cat <<'EOF'
-
-SKIPPED: this toolchain cannot compile a trivial C++ file (<cstddef> not found),
-so it cannot say anything about the .hip sources either. This is an environment
-problem, not a code problem — on macOS it usually means CommandLineTools without
-a full Xcode install.
-
-Static checks that do run without a compiler:
-  python3 tests/test_descriptor_layout.py   host/device wire format
-  python3 tests/test_kernel_interface.py    symbols, task kinds, struct fields
-
-First real parse happens on the MI300X via scripts/setup_env.sh, which compiles
-bench/microbench.hip first so a failure there is a toolchain diagnosis.
-EOF
-    exit 0
-fi
-rm -f "$probe"
+echo "target:       $ARCH (front end only, -fsyntax-only)"
+echo "stubs:        ${STUBS#$ROOT/}  (runtime API only; builtins are the compiler's)"
 echo
 
 fail=0
-shopt -s nullglob
-for src in "$ROOT"/bench/*.hip "$ROOT"/src/kernels/*.hip; do
-    printf '  %-34s ' "${src#$ROOT/}"
-    out=$("$CXX" -fsyntax-only -std=c++17 -x c++ \
-            "${SDKFLAGS[@]}" \
-            -I"$STUBS" -I"$ROOT/src" \
-            -Wno-unused-value -Wno-unused-function -Wno-unused-variable \
-            "$src" 2>&1)
-    if [[ -z "$out" ]]; then
-        echo "OK"
-    else
+for src in "$ROOT"/bench/microbench.hip "$ROOT"/src/kernels/fleet_kernel.hip \
+           "$ROOT"/src/host/fleet_launch.hip; do
+    for mode in --cuda-device-only --cuda-host-only; do
+        printf '  %-30s %-19s ' "${src#$ROOT/}" "${mode#--cuda-}"
+        out=$("$CXX" -x hip $mode --offload-arch=$ARCH -nogpuinc -nogpulib \
+                -std=c++17 -fsyntax-only "${SDKFLAGS[@]}" \
+                -I"$STUBS" -I"$ROOT/src" \
+                -Wall -Wextra -Wno-unused-parameter -Wno-unused-function \
+                -Wno-unused-variable -Wno-missing-field-initializers \
+                "$src" 2>&1)
         errs=$(printf '%s\n' "$out" | grep -c 'error:')
+        warns=$(printf '%s\n' "$out" | grep -c 'warning:')
         if [[ "$errs" -gt 0 ]]; then
-            echo "$errs error(s)"
-            printf '%s\n' "$out" | grep 'error:' | head -12 | sed 's/^/      /'
+            echo "$errs error(s), $warns warning(s)"
+            printf '%s\n' "$out" | grep -E 'error:' | head -15 | sed 's/^/      /'
             fail=1
+        elif [[ "$warns" -gt 0 ]]; then
+            echo "OK, $warns warning(s)"
+            printf '%s\n' "$out" | grep -E 'warning:' | head -8 | sed 's/^/      /'
         else
-            echo "OK (warnings only)"
+            echo "OK"
         fi
-    fi
+    done
 done
 
 cat <<'EOF'
 
 Not covered here — verify on device:
-  * __builtin_amdgcn_* semantics and inline asm (s_getreg_b32 HW_REG_XCC_ID)
+  * semantics of the builtins and the inline asm (s_getreg_b32 HW_REG_XCC_ID)
   * register/LDS pressure and occupancy (-Rpass-analysis=kernel-resource-usage)
   * availability of hipExtMallocWithFlags / hipDeviceMallocUncached in the
     installed ROCm

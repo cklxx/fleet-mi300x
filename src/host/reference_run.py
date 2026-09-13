@@ -8,6 +8,11 @@ Runs the stock DeepseekV2 implementation on the 1,024-token prompt and decodes
   * the compressed KV rows captured at kv_a_proj_with_mqa -> Fleet cache
   * the 32 generated token ids and their top-2 logit margins -> end-to-end check
 
+and, next to the .npz, the two files the C++ launcher consumes directly:
+`fleet_cache.bin` (the converted cache, bf16, see kv_convert.py) and
+`golden_tokens.txt` (the greedy token ids, one per line; the first is the
+prefill's output and is the first decode input).
+
 Prefill is explicitly out of scope for optimisation (task spec), so this is a
 stock eager run; its latency is not a baseline and is not reported as one.
 
@@ -18,10 +23,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 from pathlib import Path
 
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from kv_convert import CacheLayout, build_fleet_cache, write_fleet_cache_bin  # noqa: E402
 
 
 def build_prompt(tokenizer, n_tokens: int) -> "torch.Tensor":
@@ -132,6 +142,16 @@ def main() -> None:
     }
     a.out.with_suffix(".json").write_text(json.dumps(meta, indent=2))
     print(f"wrote {a.out} and {a.out.with_suffix('.json')}")
+
+    # Launcher inputs: the converted cache from *this* prefill, and the tokens.
+    layout = CacheLayout(layers=n_layers, max_pos=a.context + a.decode,
+                         kv_lora_rank=cfg.kv_lora_rank, qk_rope=cfg.qk_rope_head_dim)
+    raw = torch.from_numpy(np.stack([compressed[i] for i in range(n_layers)]))
+    cache = build_fleet_cache(model, raw, layout)
+    write_fleet_cache_bin(cache, layout, a.out.parent / "fleet_cache.bin")
+    (a.out.parent / "golden_tokens.txt").write_text(
+        "".join(f"{t}\n" for t in gen_ids))
+    print(f"wrote {a.out.parent / 'golden_tokens.txt'} ({len(gen_ids)} tokens)")
     print(f"  smallest top-2 margin over the run: {min(margins):.4f} "
           f"(a small margin here is where bf16 drift would flip a token)")
 

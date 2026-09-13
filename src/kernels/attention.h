@@ -1,7 +1,7 @@
 // Absorbed-MLA decode attention — the CU-task body.
 //
 // docs/design.md §2, §3. The cache holds one compressed row per position,
-// `c ‖ k_pe` (576 floats), shared by all 16 heads, so a whole layer's cache is
+// `c ‖ k_pe` (576 bf16), shared by all 16 heads, so a whole layer's cache is
 // 1.2 MB and sits in each XCD's 4 MB L2. Materialising K and V per head would
 // read 7.1x more per position and add ~2 GFLOP, which at batch 1 is pure loss.
 //
@@ -9,9 +9,18 @@
 //   1. kv post-processing: RMSNorm on c, RoPE on k_pe, and the cache append
 //      are re-derived here from the raw 576-vector rather than costing an event
 //   2. q-absorb: q_c[h] = q_nope[h] @ W_UK[h], each task reading its own
-//      131 KB W_UK slice
+//      131 KB W_UK slice; q_pe gets its RoPE here too
 //   3. head-to-XCD affinity: XCD k owns heads 2k and 2k+1, so the merge that
 //      follows waits on an XCD-local counter instead of a global event
+//
+// Everything the prologue produces lives in this workgroup's LDS: the cache
+// row, q_c and q_pe. No two attention tasks share scratch, so the 16 (or 64)
+// tasks of a layer can run in any order on any XCD.
+//
+// The new token's row is *not* read back from the cache: one designated task
+// writes it there for later tokens, but every task scores the current
+// position from its own LDS copy, so there is no cross-XCD read of a line
+// another workgroup is still writing.
 //
 // Split-KV (D4) turns each head into kv_chunks tasks emitting flash-decoding
 // partials (m, l, acc[512]); with kv_chunks == 1 the partial is the answer.
@@ -19,98 +28,92 @@
 
 #include <hip/hip_runtime.h>
 #include "gemv.h"
+#include "../runtime/fleet_types.h"
 
 namespace fleet {
-
-// Partial state per (head, chunk): running max, running sum, accumulator.
-// Laid out so the merge task reads them contiguously.
-struct AttnPartial {
-    float m;            // max score seen
-    float l;            // sum of exp(score - m)
-    // acc[kv_lora] follows immediately in memory
-};
-
-__device__ __forceinline__ float* partial_acc(float* base, int kv_lora) {
-    return base + 2;   // skip m, l
-}
 
 // DeepseekV2 RoPE: interleave-transpose, then the standard rotation.
 // x[0..d) becomes [x0,x2,...,x_{d-2}, x1,x3,...,x_{d-1}] before rotate_half.
 // Implementing the plain form instead is silently wrong, which is why
 // tests/test_absorbed_equivalence.py checks the two differ.
+//
+// In place on an LDS vector; d = 64 so one wave covers it, and the gather
+// happens before any write because each lane holds both of its inputs.
 __device__ __forceinline__ void apply_rope_interleaved(
         float* __restrict__ v, const float* __restrict__ cos,
-        const float* __restrict__ sin, int d, int lane, int lanes) {
+        const float* __restrict__ sin, int d) {
     const int half = d / 2;
-    // Gather into the transposed order first; d is 64 here, so a small
-    // scratch in registers per lane is enough.
-    for (int i = lane; i < half; i += lanes) {
-        const float a = v[2 * i];        // -> position i
-        const float b = v[2 * i + 1];    // -> position i + half
+    const int i = threadIdx.x;
+    float a = 0.f, b = 0.f;
+    if (i < half) { a = v[2 * i]; b = v[2 * i + 1]; }
+    __syncthreads();
+    if (i < half) {
         // rotate_half pairs (i, i+half): out_i = a*cos_i - b*sin_i
         //                                out_{i+half} = b*cos_{i+half} + a*sin_{i+half}
-        const float o1 = a * cos[i] - b * sin[i];
-        const float o2 = b * cos[i + half] + a * sin[i + half];
-        v[i] = o1;
-        v[i + half] = o2;
+        v[i] = a * cos[i] - b * sin[i];
+        v[i + half] = b * cos[i + half] + a * sin[i + half];
     }
+    __syncthreads();
 }
 
-// Prologue step 1: rebuild this token's cache row from the raw kv_a output.
-// Every attention task recomputes it (2.3 KB fp32); one designated task writes
-// it to the cache. Recomputation is free next to an extra global event.
+// Prologue step 1: rebuild this token's cache row from the raw kv_a output,
+// into LDS, rounded through bf16 so it is bit-identical to what later tokens
+// will read back from the cache. One designated task also stores it.
 __device__ inline void kv_post(
         const float* __restrict__ kv_a_raw, const __hip_bfloat16* __restrict__ kv_a_norm_w,
         const float* __restrict__ cos, const float* __restrict__ sin,
-        float* __restrict__ row_out, int kv_lora, int qk_rope, float eps,
+        float* __restrict__ row_lds, int kv_lora, int qk_rope, float eps,
         float* smem, bool write_cache, __hip_bfloat16* __restrict__ cache_row) {
-    // RMSNorm over the compressed part
     float local = 0.f;
     for (int i = threadIdx.x; i < kv_lora; i += blockDim.x) {
         const float v = kv_a_raw[i];
         local += v * v;
     }
     const float ssq = block_reduce_ordered(local, smem);
-    __syncthreads();
     const float inv = rsqrtf(ssq / kv_lora + eps);
 
     for (int i = threadIdx.x; i < kv_lora; i += blockDim.x) {
-        row_out[i] = kv_a_raw[i] * inv * __bfloat162float(kv_a_norm_w[i]);
+        row_lds[i] = kv_a_raw[i] * inv * __bfloat162float(kv_a_norm_w[i]);
     }
     for (int i = threadIdx.x; i < qk_rope; i += blockDim.x) {
-        row_out[kv_lora + i] = kv_a_raw[kv_lora + i];
+        row_lds[kv_lora + i] = kv_a_raw[kv_lora + i];
     }
     __syncthreads();
+    apply_rope_interleaved(row_lds + kv_lora, cos, sin, qk_rope);
 
-    apply_rope_interleaved(row_out + kv_lora, cos, sin, qk_rope,
-                           threadIdx.x, blockDim.x);
-    __syncthreads();
-
-    if (write_cache) {
-        for (int i = threadIdx.x; i < kv_lora + qk_rope; i += blockDim.x) {
-            cache_row[i] = __float2bfloat16(row_out[i]);
-        }
+    for (int i = threadIdx.x; i < kv_lora + qk_rope; i += blockDim.x) {
+        const __hip_bfloat16 b = __float2bfloat16(row_lds[i]);
+        row_lds[i] = __bfloat162float(b);
+        if (write_cache) cache_row[i] = b;
     }
+    __syncthreads();
 }
 
-// Prologue step 2: absorb W_UK into the query.
+// Prologue step 2: absorb W_UK into the query, and RoPE the rope half.
 //   q_c[h] = q_nope[h] @ W_UK[h],  W_UK[h] = kv_b_proj rows [h*256, h*256+128)
 // This is a [128] x [128, 512] product per head — 131 KB of weights, read once
-// per task. With 4 KV chunks it is read 4x, 0.5 MB per layer, 0.3% of traffic.
+// per task. Consecutive threads read consecutive j, so the column walk over
+// W_UK is coalesced.
 __device__ inline void q_absorb(
-        const float* __restrict__ q_nope, const __hip_bfloat16* __restrict__ kv_b,
-        float* __restrict__ q_c, int head, int qk_nope, int v_head, int kv_lora) {
+        const float* __restrict__ q_head, const __hip_bfloat16* __restrict__ kv_b,
+        const float* __restrict__ cos, const float* __restrict__ sin,
+        float* __restrict__ q_c_lds, float* __restrict__ q_pe_lds,
+        int head, int qk_nope, int qk_rope, int v_head, int kv_lora) {
     const int row_stride = qk_nope + v_head;               // 256
     const __hip_bfloat16* w_uk = kv_b + (int64_t)head * row_stride * kv_lora;
 
     for (int j = threadIdx.x; j < kv_lora; j += blockDim.x) {
         float acc = 0.f;
         for (int i = 0; i < qk_nope; ++i) {
-            acc += q_nope[i] * __bfloat162float(w_uk[(int64_t)i * kv_lora + j]);
+            acc += q_head[i] * __bfloat162float(w_uk[(int64_t)i * kv_lora + j]);
         }
-        q_c[j] = acc;
+        q_c_lds[j] = acc;
+    }
+    for (int i = threadIdx.x; i < qk_rope; i += blockDim.x) {
+        q_pe_lds[i] = q_head[qk_nope + i];
     }
     __syncthreads();
+    apply_rope_interleaved(q_pe_lds, cos, sin, qk_rope);   // reference_decode.py:205
 }
 
 // Main body: flash-decoding over this task's slice of the cache.
@@ -118,57 +121,99 @@ __device__ inline void q_absorb(
 //   s[t] = scale * (q_c . c[t] + q_pe . k_pe[t])
 //   online softmax over t, accumulating acc += p[t] * c[t]
 //
-// The cache is read as bf16 and widened in registers; each XCD pulls the
-// layer's 1.2 MB once and the second head on the same XCD hits L2.
+// One wave per position: lane l holds c[8l..8l+8) of the row (64 lanes x 8 =
+// 512 = kv_lora) and lanes 0..7 additionally hold k_pe[8l..8l+8) (64 = qk_rope),
+// so a position is one 16-byte load per lane plus one more for eight lanes,
+// a shuffle reduction for the score, and eight FMAs into a register
+// accumulator. The four waves keep private (m, l, acc) and are merged in a
+// fixed order at the end. The lane mapping assumes kv_lora == 512 and
+// qk_rope == 64; the host refuses other shapes.
 __device__ inline void attention_chunk(
         const __hip_bfloat16* __restrict__ cache, const float* __restrict__ q_c,
-        const float* __restrict__ q_pe, float scale,
-        int seq_len, int kv_lora, int qk_rope, int row,
-        int chunk, int n_chunks, float* __restrict__ out, float* smem) {
+        const float* __restrict__ q_pe, const float* __restrict__ row_new,
+        float scale, int seq_len, int row_elems, int chunk, int n_chunks,
+        float* __restrict__ out, float* __restrict__ part_lds) {
     const int per_chunk = (seq_len + n_chunks - 1) / n_chunks;
     const int t_begin = chunk * per_chunk;
     const int t_end = min(seq_len, t_begin + per_chunk);
+    const int t_new = seq_len - 1;
 
-    float* acc = partial_acc(out, kv_lora);
-    for (int j = threadIdx.x; j < kv_lora; j += blockDim.x) acc[j] = 0.f;
-    __syncthreads();
+    const int wave = threadIdx.x / kWaveLanes;
+    const int lane = threadIdx.x % kWaveLanes;
+    const bool rope_lane = lane < kMaxQkRope / 8;
 
-    __shared__ float run_m, run_l;
-    if (threadIdx.x == 0) { run_m = -INFINITY; run_l = 0.f; }
-    __syncthreads();
-
-    for (int t = t_begin; t < t_end; ++t) {
-        const __hip_bfloat16* r = cache + (int64_t)t * row;
-
-        // score: both halves of the row in one pass
-        float part = 0.f;
-        for (int j = threadIdx.x; j < kv_lora; j += blockDim.x) {
-            part += q_c[j] * __bfloat162float(r[j]);
-        }
-        for (int j = threadIdx.x; j < qk_rope; j += blockDim.x) {
-            part += q_pe[j] * __bfloat162float(r[kv_lora + j]);
-        }
-        const float s = block_reduce_ordered(part, smem) * scale;
-        __syncthreads();
-
-        // online softmax rescale
-        __shared__ float p, rescale;
-        if (threadIdx.x == 0) {
-            const float new_m = fmaxf(run_m, s);
-            rescale = __expf(run_m - new_m);
-            p = __expf(s - new_m);
-            run_l = run_l * rescale + p;
-            run_m = new_m;
-        }
-        __syncthreads();
-
-        for (int j = threadIdx.x; j < kv_lora; j += blockDim.x) {
-            acc[j] = acc[j] * rescale + p * __bfloat162float(r[j]);
-        }
-        __syncthreads();
+    float qc[8], qp[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        qc[j] = q_c[8 * lane + j];
+        qp[j] = rope_lane ? q_pe[8 * lane + j] : 0.f;
     }
 
-    if (threadIdx.x == 0) { out[0] = run_m; out[1] = run_l; }
+    float acc[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) acc[j] = 0.f;
+    float m = -INFINITY, l = 0.f;
+
+    const uint4* cache4 = reinterpret_cast<const uint4*>(cache);
+    const int row4 = row_elems / 8;   // 72 uint4 per position
+
+    for (int t = t_begin + wave; t < t_end; t += kWaves) {
+        float c[8], kp[8];
+        if (t == t_new) {   // uniform per wave: this token's row, from LDS
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                c[j] = row_new[8 * lane + j];
+                kp[j] = rope_lane ? row_new[kMaxKvLora + 8 * lane + j] : 0.f;
+            }
+        } else {
+            const uint4 v = cache4[(int64_t)t * row4 + lane];
+            unpack_bf16x2(v.x, c[0], c[1]); unpack_bf16x2(v.y, c[2], c[3]);
+            unpack_bf16x2(v.z, c[4], c[5]); unpack_bf16x2(v.w, c[6], c[7]);
+            if (rope_lane) {
+                const uint4 r = cache4[(int64_t)t * row4 + kMaxKvLora / 8 + lane];
+                unpack_bf16x2(r.x, kp[0], kp[1]); unpack_bf16x2(r.y, kp[2], kp[3]);
+                unpack_bf16x2(r.z, kp[4], kp[5]); unpack_bf16x2(r.w, kp[6], kp[7]);
+            } else {
+#pragma unroll
+                for (int j = 0; j < 8; ++j) kp[j] = 0.f;
+            }
+        }
+
+        float part = 0.f;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) part += qc[j] * c[j] + qp[j] * kp[j];
+        const float s = wave_sum(part) * scale;
+
+        const float m_new = fmaxf(m, s);
+        const float rescale = __expf(m - m_new);   // exp(-inf) = 0 on the first step
+        const float p = __expf(s - m_new);
+        l = l * rescale + p;
+        m = m_new;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) acc[j] = acc[j] * rescale + p * c[j];
+    }
+
+    // Publish the wave partials, then merge them in wave order.
+    float* mine = part_lds + wave * kPartialStride;
+    if (lane == 0) { mine[0] = m; mine[1] = l; }
+#pragma unroll
+    for (int j = 0; j < 8; ++j) mine[2 + 8 * lane + j] = acc[j];
+    __syncthreads();
+
+    float gm = -INFINITY;
+    for (int w = 0; w < kWaves; ++w) gm = fmaxf(gm, part_lds[w * kPartialStride]);
+    float gl = 0.f, scale_w[kWaves];
+    for (int w = 0; w < kWaves; ++w) {
+        const float mw = part_lds[w * kPartialStride];
+        scale_w[w] = (mw == -INFINITY) ? 0.f : __expf(mw - gm);   // empty wave
+        gl += part_lds[w * kPartialStride + 1] * scale_w[w];
+    }
+    if (threadIdx.x == 0) { out[0] = gm; out[1] = gl; }
+    for (int j = threadIdx.x; j < kMaxKvLora; j += blockDim.x) {
+        float v = 0.f;
+        for (int w = 0; w < kWaves; ++w) v += part_lds[w * kPartialStride + 2 + j] * scale_w[w];
+        out[2 + j] = v;
+    }
     __syncthreads();
 }
 
@@ -179,43 +224,33 @@ __device__ inline void attention_chunk(
 __device__ inline void merge_and_uv(
         const float* __restrict__ partials, const __hip_bfloat16* __restrict__ kv_b,
         float* __restrict__ o, int head, int n_chunks, int kv_lora,
-        int qk_nope, int v_head, int partial_stride, float* scratch) {
+        int qk_nope, int v_head, float* __restrict__ o_c_lds) {
     // Global max across chunks, then a rescaled sum. Fixed chunk order keeps
-    // this bitwise reproducible.
-    __shared__ float gmax, gsum;
-    if (threadIdx.x == 0) {
-        float m = -INFINITY;
-        for (int c = 0; c < n_chunks; ++c) m = fmaxf(m, partials[c * partial_stride]);
-        float l = 0.f;
-        for (int c = 0; c < n_chunks; ++c) {
-            l += partials[c * partial_stride + 1] *
-                 __expf(partials[c * partial_stride] - m);
-        }
-        gmax = m; gsum = l;
+    // this bitwise reproducible. Every thread derives the same scalars.
+    float gm = -INFINITY;
+    for (int c = 0; c < n_chunks; ++c) gm = fmaxf(gm, partials[c * kPartialStride]);
+    float gl = 0.f;
+    for (int c = 0; c < n_chunks; ++c) {
+        gl += partials[c * kPartialStride + 1] * __expf(partials[c * kPartialStride] - gm);
     }
-    __syncthreads();
+    const float inv_l = 1.f / gl;
 
     for (int j = threadIdx.x; j < kv_lora; j += blockDim.x) {
         float v = 0.f;
         for (int c = 0; c < n_chunks; ++c) {
-            const float* p = partials + c * partial_stride;
-            v += p[2 + j] * __expf(p[0] - gmax);
+            const float* p = partials + c * kPartialStride;
+            v += p[2 + j] * __expf(p[0] - gm);
         }
-        scratch[j] = v / gsum;
+        o_c_lds[j] = v * inv_l;
     }
     __syncthreads();
 
+    // W_UV[h] is [v_head, kv_lora] row-major: a plain row GEMV from LDS.
     const int row_stride = qk_nope + v_head;
     const __hip_bfloat16* w_uv =
         kv_b + (int64_t)head * row_stride * kv_lora + (int64_t)qk_nope * kv_lora;
-
-    for (int i = threadIdx.x; i < v_head; i += blockDim.x) {
-        float acc = 0.f;
-        for (int j = 0; j < kv_lora; ++j) {
-            acc += __bfloat162float(w_uv[(int64_t)i * kv_lora + j]) * scratch[j];
-        }
-        o[head * v_head + i] = acc;
-    }
+    gemv_rows(w_uv, kv_lora, o_c_lds, o + head * v_head, nullptr, EPI_NONE, 1.f,
+              v_head, kv_lora, /*xcd=*/0, /*n_xcds=*/1, /*worker=*/0, /*n_workers=*/1);
 }
 
 }  // namespace fleet

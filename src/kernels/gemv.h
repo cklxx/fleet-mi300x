@@ -2,32 +2,38 @@
 //
 // docs/design.md §3 maps q_proj‖kv_a, o_proj, the experts and lm_head onto
 // Chiplet-tasks: the N dimension is split across the 8 XCDs, then across the 37
-// workers of each XCD, K is chunked, and accumulation is fp32. At batch 1 there
-// is no L2 reuse to win — m_tiles is 1 — so the gain is dispatch-count
-// reduction and, above all, keeping enough loads in flight.
+// workers of each XCD, and accumulation is fp32. At batch 1 there is no L2
+// reuse to win — m_tiles is 1 — so the gain is dispatch-count reduction and,
+// above all, keeping enough loads in flight.
+//
+// Structure: one *wave* owns a row pair. Its 64 lanes stride the row in
+// 16-byte pieces (8 bf16 each), issue kStreamDepth loads per row before
+// consuming any, and reduce with a fixed-order shuffle tree. Nothing in the
+// row loop touches LDS or a workgroup barrier, so the four waves of a
+// workgroup stream four independent row pairs and the CU keeps
+// 4 waves x 2 rows x kStreamDepth x 1 KB = 32 KB in flight — above the 18 KB
+// Little's-law target in §12. (The previous version put all 256 threads on
+// one row: with K = 2048 that is exactly one load per lane and a full block
+// reduction per row, which never reaches streaming depth at all.)
 //
 // §12: weights go HBM -> VGPR directly with global_load_dwordx4; gfx942's LDS
 // DMA moves only 4 B/lane, so staging through LDS would need 4x the load
-// instructions for the same bytes. Little's law sets the target depth:
-//
-//     18 GB/s per CU (5.3 TB/s / 296 workers) x ~1 us load-to-use ~= 18 KB
-//
-// which is why kStreamDepth defaults to 8 dwordx4 per wave with 4 waves; D1
-// microbenchmark (c) measures where the knee actually is and this constant
-// follows the measurement rather than the estimate.
+// instructions for the same bytes.
 #pragma once
 
 #include <hip/hip_runtime.h>
+#include <hip/hip_bf16.h>
 #include <stdint.h>
 
 namespace fleet {
 
-// Loads in flight per wave before the first s_waitcnt. Overridden by the
-// measured optimum from bench/microbench.hip (c).
+// Loads in flight per row per lane before the first s_waitcnt. Overridden by
+// the measured optimum from bench/microbench.hip (c).
 #ifndef FLEET_STREAM_DEPTH
-#define FLEET_STREAM_DEPTH 8
+#define FLEET_STREAM_DEPTH 4
 #endif
 constexpr int kStreamDepth = FLEET_STREAM_DEPTH;
+constexpr int kWaveLanes = 64;
 
 // bf16 pairs arrive as uint32; unpacking in registers costs no memory traffic.
 __device__ __forceinline__ void unpack_bf16x2(uint32_t p, float& lo, float& hi) {
@@ -35,115 +41,174 @@ __device__ __forceinline__ void unpack_bf16x2(uint32_t p, float& lo, float& hi) 
     hi = __uint_as_float(p & 0xFFFF0000u);
 }
 
-// One row of a bf16 [N, K] matrix times an fp32 [K] vector, fp32 accumulate.
-// K is a multiple of 8 for every tensor in this model (smallest is 512).
-__device__ __forceinline__ float dot_row_bf16(
-        const __hip_bfloat16* __restrict__ row, const float* __restrict__ x,
-        int K, int lane, int lanes) {
-    const uint4* __restrict__ r4 = reinterpret_cast<const uint4*>(row);
-    const int n4 = K / 8;              // 8 bf16 per uint4
-    float acc = 0.f;
-
-    int i = lane;
-    uint4 buf[kStreamDepth];
-    while (i + (kStreamDepth - 1) * lanes < n4) {
-#pragma unroll
-        for (int d = 0; d < kStreamDepth; ++d) buf[d] = r4[i + d * lanes];  // issue
-#pragma unroll
-        for (int d = 0; d < kStreamDepth; ++d) {                            // consume
-            const int base = (i + d * lanes) * 8;
-            float a, b;
-            unpack_bf16x2(buf[d].x, a, b); acc += a * x[base + 0] + b * x[base + 1];
-            unpack_bf16x2(buf[d].y, a, b); acc += a * x[base + 2] + b * x[base + 3];
-            unpack_bf16x2(buf[d].z, a, b); acc += a * x[base + 4] + b * x[base + 5];
-            unpack_bf16x2(buf[d].w, a, b); acc += a * x[base + 6] + b * x[base + 7];
-        }
-        i += kStreamDepth * lanes;
-    }
-    for (; i < n4; i += lanes) {
-        const uint4 v = r4[i];
-        const int base = i * 8;
-        float a, b;
-        unpack_bf16x2(v.x, a, b); acc += a * x[base + 0] + b * x[base + 1];
-        unpack_bf16x2(v.y, a, b); acc += a * x[base + 2] + b * x[base + 3];
-        unpack_bf16x2(v.z, a, b); acc += a * x[base + 4] + b * x[base + 5];
-        unpack_bf16x2(v.w, a, b); acc += a * x[base + 6] + b * x[base + 7];
-    }
-    return acc;
+__device__ __forceinline__ float bf16_round(float v) {
+    return __bfloat162float(__float2bfloat16(v));
 }
 
-// Reduce one row's partial sums across the workgroup in a fixed order.
-// Fixed order matters: §4 forbids float atomics so that the whole decode is
-// bitwise reproducible, which is what makes the determinism check in §6 real.
+__device__ __forceinline__ float silu(float g) {
+    return g / (1.f + __expf(-g));
+}
+
+// Fixed-order butterfly: the same tree every time, so the sum is bitwise
+// reproducible (§4 forbids float atomics for exactly this reason).
+__device__ __forceinline__ float wave_sum(float v) {
+#pragma unroll
+    for (int off = kWaveLanes / 2; off; off >>= 1) v += __shfl_xor(v, off, kWaveLanes);
+    return v;
+}
+
+__device__ __forceinline__ void fma8(const uint4& v, const float* __restrict__ x8,
+                                     float& acc) {
+    float a, b;
+    unpack_bf16x2(v.x, a, b); acc += a * x8[0] + b * x8[1];
+    unpack_bf16x2(v.y, a, b); acc += a * x8[2] + b * x8[3];
+    unpack_bf16x2(v.z, a, b); acc += a * x8[4] + b * x8[5];
+    unpack_bf16x2(v.w, a, b); acc += a * x8[6] + b * x8[7];
+}
+
+// R rows (1 or 2) of a bf16 [*, K] matrix times an fp32 [K] vector, one wave,
+// fp32 accumulate; every lane returns the full sums. K is a multiple of 8 for
+// every tensor in this model (smallest is 512).
+template <int R>
+__device__ __forceinline__ void wave_dot(const __hip_bfloat16* const* rows,
+                                         const float* __restrict__ x, int K,
+                                         float* sums) {
+    const int lane = threadIdx.x & (kWaveLanes - 1);
+    const int n4 = K / 8;
+    const uint4* r4[R];
+    float acc[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        r4[r] = reinterpret_cast<const uint4*>(rows[r]);
+        acc[r] = 0.f;
+    }
+
+    int i = lane;
+    uint4 buf[R][kStreamDepth];
+    while (i + (kStreamDepth - 1) * kWaveLanes < n4) {
+#pragma unroll
+        for (int d = 0; d < kStreamDepth; ++d) {           // issue everything
+#pragma unroll
+            for (int r = 0; r < R; ++r) buf[r][d] = r4[r][i + d * kWaveLanes];
+        }
+#pragma unroll
+        for (int d = 0; d < kStreamDepth; ++d) {           // then consume
+            const float* x8 = x + (i + d * kWaveLanes) * 8;
+#pragma unroll
+            for (int r = 0; r < R; ++r) fma8(buf[r][d], x8, acc[r]);
+        }
+        i += kStreamDepth * kWaveLanes;
+    }
+    for (; i < n4; i += kWaveLanes) {                      // tail, < depth
+        const float* x8 = x + i * 8;
+#pragma unroll
+        for (int r = 0; r < R; ++r) fma8(r4[r][i], x8, acc[r]);
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) sums[r] = wave_sum(acc[r]);
+}
+
+// Reduce one value across the workgroup in a fixed order. Used by the
+// prologues (RMSNorm, kv-norm), never inside a GEMV row loop.
 __device__ __forceinline__ float block_reduce_ordered(float v, float* smem) {
     smem[threadIdx.x] = v;
     __syncthreads();
-    for (int s = blockDim.x >> 1; s; s >>= 1) {
-        if (threadIdx.x < s) smem[threadIdx.x] += smem[threadIdx.x + s];
+    for (int s = (int)blockDim.x >> 1; s; s >>= 1) {
+        if ((int)threadIdx.x < s) smem[threadIdx.x] += smem[threadIdx.x + s];
         __syncthreads();
     }
-    return smem[0];
+    const float out = smem[0];
+    __syncthreads();   // everyone has read smem[0] before it is reused
+    return out;
 }
 
-// Chiplet-task GEMV: y[n_begin..n_end) = W[n_begin..n_end, :] @ x
+// Copy a vector into LDS so the row loop reads its operand from LDS instead
+// of re-fetching it from L2 for every row.
+__device__ __forceinline__ void stage_vector(const float* __restrict__ src,
+                                             float* __restrict__ dst, int n) {
+    for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = src[i];
+    __syncthreads();
+}
+
+// ---------------------------------------------------------------- row ranges
 //
-// The N range is this XCD's slice; workers stride over rows inside it, one row
-// per workgroup pass, all 256 threads cooperating on that row's K.
-__device__ inline void gemv_chiplet(
-        const __hip_bfloat16* __restrict__ w, const float* __restrict__ x,
-        float* __restrict__ y, int N, int K,
-        int xcd, int n_xcds, int worker, int n_workers, float* smem) {
-    const int per_xcd = (N + n_xcds - 1) / n_xcds;
-    const int n_begin = xcd * per_xcd;
-    const int n_end = min(N, n_begin + per_xcd);
+// A Chiplet-task's rows [0, N) are split evenly over the XCDs, then over the
+// workers of each XCD by interleaving (worker w owns n_begin + w, + w +
+// n_workers, ...), and each wave of the worker takes every kWaves-th row
+// pair. The split is a pure function of (xcd, worker, wave), so the host
+// graph never has to carry row ranges.
 
-    for (int n = n_begin + worker; n < n_end; n += n_workers) {
-        const float part = dot_row_bf16(w + (int64_t)n * K, x, K,
-                                        threadIdx.x, blockDim.x);
-        const float sum = block_reduce_ordered(part, smem);
-        if (threadIdx.x == 0) y[n] = sum;
-        __syncthreads();
-    }
+struct RowSlice {
+    int begin, end;   // this XCD's [begin, end) of N
+};
+
+__device__ __forceinline__ RowSlice xcd_rows(int N, int xcd, int n_xcds) {
+    const int per = (N + n_xcds - 1) / n_xcds;
+    RowSlice s;
+    s.begin = xcd * per;
+    s.end = min(N, s.begin + per);
+    return s;
 }
 
-// Same, but with a fused epilogue. Used for:
-//   * q_proj‖kv_a — RMSNorm recomputed in the prologue (§3 fusion 1)
-//   * o_proj      — residual add folded in, saving a pass over x
-//   * gate_up     — SiLU(gate) * up folded in (§3, wavefront-task fusion)
-enum GemvEpilogue { EPI_NONE = 0, EPI_RESIDUAL = 1, EPI_SILU_MUL = 2 };
+enum GemvEpilogue { EPI_NONE = 0, EPI_RESIDUAL = 1 };
 
-__device__ inline void gemv_chiplet_epi(
-        const __hip_bfloat16* __restrict__ w, const float* __restrict__ x,
-        float* __restrict__ y, const float* __restrict__ residual,
-        int N, int K, int xcd, int n_xcds, int worker, int n_workers,
-        GemvEpilogue epi, float* smem) {
-    const int per_xcd = (N + n_xcds - 1) / n_xcds;
-    const int n_begin = xcd * per_xcd;
-    const int n_end = min(N, n_begin + per_xcd);
+// y[n] = W[n, :] . x  for this (xcd, worker)'s rows of [0, N), with x already
+// wherever the caller wants it read from (LDS for the ≤ 2048-wide operands).
+// EPI_RESIDUAL: y[n] = bf16(residual[n] + sum), rounding through bf16 at the
+// residual point so the hidden state matches the reference's bf16 state (§5).
+__device__ inline void gemv_rows(
+        const __hip_bfloat16* __restrict__ w, int ld,
+        const float* __restrict__ x, float* __restrict__ y,
+        const float* __restrict__ residual, GemvEpilogue epi, float scale,
+        int N, int K, int xcd, int n_xcds, int worker, int n_workers) {
+    const RowSlice s = xcd_rows(N, xcd, n_xcds);
+    const int first = s.begin + worker;
+    if (first >= s.end) return;
+    const int cnt = (s.end - first + n_workers - 1) / n_workers;   // rows owned
+    const int wave = threadIdx.x / kWaveLanes;
+    const int lane = threadIdx.x % kWaveLanes;
 
-    for (int n = n_begin + worker; n < n_end; n += n_workers) {
-        const float part = dot_row_bf16(w + (int64_t)n * K, x, K,
-                                        threadIdx.x, blockDim.x);
-        const float sum = block_reduce_ordered(part, smem);
-        if (threadIdx.x == 0) {
-            switch (epi) {
-                case EPI_RESIDUAL:
-                    // Round through bf16 at the residual point so the hidden
-                    // state matches the reference's bf16 state exactly (§5).
-                    y[n] = __bfloat162float(__float2bfloat16(residual[n] + sum));
-                    break;
-                case EPI_SILU_MUL: {
-                    // gate_up is laid out [gate; up] interleaved by row (§12),
-                    // so the paired row is N/2 away and already in cache.
-                    const float g = sum;
-                    y[n] = g / (1.f + __expf(-g));   // up multiplied by caller
-                    break;
-                }
-                default:
-                    y[n] = sum;
+    for (int k = 2 * wave; k < cnt; k += 2 * kWaves) {
+        const int r0 = first + k * n_workers;
+        const bool two = (k + 1) < cnt;
+        const int r1 = two ? r0 + n_workers : r0;
+        const __hip_bfloat16* rows[2] = {w + (int64_t)r0 * ld, w + (int64_t)r1 * ld};
+        float sums[2];
+        if (two) wave_dot<2>(rows, x, K, sums);
+        else     wave_dot<1>(rows, x, K, sums);
+        if (lane == 0) {
+            const int nr = two ? 2 : 1;
+            for (int r = 0; r < nr; ++r) {
+                const int n = r ? r1 : r0;
+                const float v = sums[r] * scale;
+                y[n] = (epi == EPI_RESIDUAL) ? bf16_round(residual[n] + v) : v;
             }
         }
-        __syncthreads();
+    }
+}
+
+// h[n] = SiLU(gate[n] . x) * (up[n] . x) for this worker's n in [0, inter).
+// gate/up rows are interleaved offline (§12): row 2n is gate_n, row 2n+1 is
+// up_n, so the pair is exactly what one wave streams together and the product
+// is formed in registers with no shuffle or LDS round trip.
+__device__ inline void gemv_gate_up_rows(
+        const __hip_bfloat16* __restrict__ gate_up, const float* __restrict__ x,
+        float* __restrict__ h, int inter, int K, int xcd, int n_xcds,
+        int worker, int n_workers) {
+    const RowSlice s = xcd_rows(inter, xcd, n_xcds);
+    const int first = s.begin + worker;
+    if (first >= s.end) return;
+    const int cnt = (s.end - first + n_workers - 1) / n_workers;
+    const int wave = threadIdx.x / kWaveLanes;
+    const int lane = threadIdx.x % kWaveLanes;
+
+    for (int k = wave; k < cnt; k += kWaves) {
+        const int n = first + k * n_workers;
+        const __hip_bfloat16* rows[2] = {gate_up + (int64_t)(2 * n) * K,
+                                         gate_up + (int64_t)(2 * n + 1) * K};
+        float sums[2];
+        wave_dot<2>(rows, x, K, sums);
+        if (lane == 0) h[n] = silu(sums[0]) * sums[1];
     }
 }
 

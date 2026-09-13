@@ -1,6 +1,6 @@
 # Fleet-style Batch-1 Decode for DeepSeek-Coder-V2-Lite-Base on MI300X — Technical Design
 
-Author: Kailun Chen · Status: v0.8 (pre-GPU) · Target: single MI300X (gfx942), BF16, bs=1, 1024-token context, 32 greedy tokens
+Author: Kailun Chen · Status: v0.9 (pre-GPU; v0.8 is the submitted proposal, kept verbatim in `docs/task/`) · Target: single MI300X (gfx942), BF16, bs=1, 1024-token context, 32 greedy tokens
 
 ---
 
@@ -90,7 +90,9 @@ flowchart LR
   RD --> NX[next layer]
 ```
 
-Task/event budget: **114 tasks (66 before split-KV), 6 global events + 2 XCD-local events per MoE layer**; ≈3,090 tasks and ≈166 global events per token for the full model (27 layers, layer 0's dense gate_up→down needs the full h[10944] and is one extra global event, + embed + lm_head 8 Chiplet-tasks with final norm in prologue + argmax). Compare paper: 543 tasks/layer for dense Qwen3-8B.
+Task/event budget: **114 tasks (66 before split-KV), 6 global events + 24 XCD-local events per MoE layer** (16 attention→merge counters, 8 gate_up→down counters); 1,791 tasks (3,087 with split-KV) and 165 global events per token for the full model (27 layers, layer 0's dense gate_up→down needs the full h[10944] and is one extra global event, + embed + lm_head 8 Chiplet-tasks with final norm in prologue + argmax). Compare paper: 543 tasks/layer for dense Qwen3-8B.
+
+Implementation note (v0.9): a Chiplet-task is *executed* as one descriptor per worker of the XCD, 37 per XCD, each carrying its worker id; the row split is a pure function of (xcd, worker, wave) and the event it signals has 8 × 37 = 296 producers. Nothing on the device broadcasts a task. The 66/114 figures above count Chiplet-tasks once per XCD; `taskgraph.py --report` prints both that count and the descriptor count (1,218 per MoE layer, 33,183 per token).
 
 Solid arrows are global events, dashed are XCD-local. Four changes remove 4 global events per layer versus the unfused graph (10 → 6):
 
@@ -134,7 +136,9 @@ Four synchronization scopes from Fleet §5.2; the launch policy is MPK's AOT mod
 
 Residency: the kernel is launched with `hipLaunchCooperativeKernel` so all 304 workgroups are guaranteed co-resident (or the launch fails), which removes the scheduler-waits-for-absent-worker deadlock by construction. Scheduler waves run at `s_setprio 3`; polling loops insert `s_sleep 1` between reads to keep fabric traffic down.
 
-XCD identity: every workgroup reads `HW_REG_XCC_ID` via `s_getreg_b32` (gfx942) to find its XCD's queue and flags; MI300X dispatches workgroups round-robin across 8 XCDs, so grid = 304 WGs (1 per CU) → 8 schedulers + 296 workers (37/XCD).
+XCD identity: every workgroup reads `HW_REG_XCC_ID` via `s_getreg_b32` (gfx942) to find its XCD's queue and flags; MI300X dispatches workgroups round-robin across 8 XCDs, so grid = 304 WGs (1 per CU) → 8 schedulers + 296 workers (37/XCD). Which workgroup is the scheduler is decided by an XCD-local arrival ticket, not by `blockIdx` — nothing guarantees `blockIdx` 0..7 land one per XCD — and a grid barrier checks that every XCD received exactly 38 workgroups, aborting with a reason code if not.
+
+Memory model (v0.9, what the code actually does): MI300X L2 is per XCD and not coherent across XCDs for ordinary device memory, so every handshake follows the LLVM AMDGPU memory model for gfx942 rather than cache folklore — producers release with an agent-scope fence (`buffer_wbl2 sc1`), counters are agent-scope atomics, pollers use agent-scope atomic loads, consumers acquire with an agent-scope fence (`buffer_inv sc1`). XCD-local events use the same fences today; the fence-free L2-resident variant in item 3 above, and the L2-resident mirror in item 2, are optimisations D1 (b) has to justify with a measurement before they replace it. Waits carry a spin limit: a wait that never completes ends the launch with the event id instead of hanging the GPU.
 
 Cache modifiers (paper §4.1): weights `sc1=1 nt=1` (streaming, no residency in L2 or Infinity Cache); activation stores `nt=1` (or `sc1` under event scheme ii); event polling non-temporal; intra-XCD counters volatile through L2. The 256 MB Infinity Cache then holds the 33 MB KV cache, router weights (7 MB across layers) and activations across the whole 32-token run instead of being churned by the 4.9 GB/token weight stream.
 
@@ -195,7 +199,7 @@ Every completed boundary ships with a `tests/test_<boundary>.py` that prints the
 
 ## 8. Runtime choice
 
-Own runtime (~1k lines HIP). The public `ROCm/fleet-chiplet-megakernel` is the Mirage Persistent Kernel compiler with Fleet's scheduling added (`include/mirage`, `deps/rocblas`, kernel emitted by the Mirage Python pipeline into `permanent_output_dir`); its only demo is Qwen3-8B and it lists gfx950 / ROCm 7.0+ as the hardware requirement. Expressing MoE routing and absorbed MLA there would mean extending the Mirage graph compiler, not writing tasks. The own runtime implements §4 verbatim — per-XCD queues, XCD-local counters, last-worker `buffer_wbl2` + global counter, exactly the protocol the repo README documents — behind a 3-function interface (`fetch_task`, `signal_event`, `xcd_barrier`), so task code is runtime-agnostic. The repo serves as the reference for protocol semantics and for calibration (§9), not as a build dependency.
+Own runtime (~1k lines HIP). The public `ROCm/fleet-chiplet-megakernel` is the Mirage Persistent Kernel compiler with Fleet's scheduling added (`include/mirage`, `deps/rocblas`, kernel emitted by the Mirage Python pipeline into `permanent_output_dir`); its only demo is Qwen3-8B and it lists gfx950 / ROCm 7.0+ as the hardware requirement. Expressing MoE routing and absorbed MLA there would mean extending the Mirage graph compiler, not writing tasks. The own runtime implements §4 verbatim — per-XCD queues, XCD-local counters, last-worker `buffer_wbl2` + global counter, exactly the protocol the repo README documents — behind a 3-function interface (`fetch_task`, `wait_event`, `signal_event`), so task code is runtime-agnostic. The repo serves as the reference for protocol semantics and for calibration (§9), not as a build dependency.
 
 ---
 
@@ -267,7 +271,7 @@ The D5 report presents these as follows; no estimate from §9 survives into it u
 | Tile-granular producer/consumer inside expert tasks | Each gate_up worker increments an XCD-local counter per finished N-tile; down workers accumulate over each completed K-chunk of `h[2816]` as it lands, polling the counter through L2 (no fence) | Removes the tail of the ~23 µs gate_up phase before down can start; est. ≤10 µs/layer |
 | Interleaved gate/up weight layout | Offline repack expert `[gate;up]` rows so each lane holds adjacent gate/up pairs; SiLU⊙up computed in registers, result written directly as bf16 `h` | No cross-lane shuffle, no LDS round-trip in the epilogue |
 | Register-streamed GEMV (no LDS staging) | Weights go HBM → VGPR directly with `global_load_dwordx4` (1 KB per wave-instruction; gfx942 LDS DMA is only 4 B/lane, 256 B per instruction). Little's law: 18 GB/s per CU (5.3 TB/s ÷ 296 workers) × ~1 µs HBM load-to-use (Infinity Cache hit alone is ~218 ns) = 18 KB in flight per CU → 4 waves × 5 outstanding dwordx4, 2× margin planned; `vmcnt` limit 63, register file 512 KB/CU. Chunk k+1 loads are issued before chunk k's FMAs; `s_waitcnt vmcnt(N)` retires exactly one chunk | Prerequisite for ≥75% of HBM peak on 17 MB per-XCD streams; 4× fewer load instructions than LDS staging |
-| Monotonic event epochs | Global event counters never reset; wait condition `G[e] ≥ epoch × 8`; enables the in-kernel 32-token loop (v2) with a single launch | Removes per-token counter reset and launch |
+| Monotonic event epochs (implemented in v1) | Event counters never reset; wait condition `G[e] ≥ epoch × producers`, with `producers` carried on the waiting descriptor; enables the in-kernel 32-token loop (v2) with a single launch | Removes per-token counter reset; v2 removes the launch |
 | Cross-task prefetch (next task's first chunk) | With AOT queues a worker knows its next task before the current one ends; for every task except routed experts the weight address is static, so the worker issues the next task's first K-chunk loads (≤ 18 KB, §12 row 3) while draining the current task's FMAs and waits on the next event only when the loads are already in flight. Routed-expert tasks prefetch nothing (expert id unknown until the router event). | The event wait overlaps with HBM latency instead of preceding it; this is the mechanism behind the 78–80% results on NVIDIA megakernels. D3 for attention/o_proj/shared-expert tasks |
 
 Implementation order: register-streamed GEMV + fused prologues + AOT queues with event mirroring (D2) → interleaved gate/up + tile-granular counters + cross-task prefetch (D3) → split-KV, epochs + in-kernel loop (D4, if e2e reached).

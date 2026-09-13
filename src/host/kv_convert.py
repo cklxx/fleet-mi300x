@@ -24,10 +24,13 @@ kv_b_proj and compares against HF's own cache: max abs err <= 1e-2.
 from __future__ import annotations
 
 import argparse
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))   # for `reference.`
 
 
 @dataclass
@@ -93,23 +96,44 @@ def build_fleet_cache(model, raw, layout: CacheLayout):
 
     L, S, _ = raw.shape
     cache = torch.zeros(L, S, layout.row, dtype=torch.float32)
-    pos_ids = torch.arange(S)[None, :]
 
-    for i, layer in enumerate(model.model.layers):
-        attn = layer.self_attn
-        c_part = raw[i, :, : layout.kv_lora_rank]
-        k_pe = raw[i, :, layout.kv_lora_rank:]
+    with torch.no_grad():
+        for i, layer in enumerate(model.model.layers):
+            attn = layer.self_attn
+            dev = attn.kv_a_layernorm.weight.device     # wherever the model lives
+            c_part = raw[i, :, : layout.kv_lora_rank].to(dev)
+            k_pe = raw[i, :, layout.kv_lora_rank:].to(dev)
+            pos_ids = torch.arange(S, device=dev)[None, :]
 
-        c_norm = attn.kv_a_layernorm(c_part.to(attn.kv_a_layernorm.weight.dtype))
+            c_norm = attn.kv_a_layernorm(c_part.to(attn.kv_a_layernorm.weight.dtype))
 
-        # HF's own rotary module supplies cos/sin, so YaRN lives in one place.
-        cos, sin = attn.rotary_emb(k_pe[None, None], seq_len=S)
-        k_pe_4d = k_pe[None, None]                       # [1,1,S,64]
-        _, k_rot = apply_rotary_pos_emb(k_pe_4d, k_pe_4d, cos, sin, pos_ids)
+            # HF's own rotary module supplies cos/sin, so YaRN lives in one place.
+            cos, sin = attn.rotary_emb(k_pe[None, None], seq_len=S)
+            k_pe_4d = k_pe[None, None]                       # [1,1,S,64]
+            _, k_rot = apply_rotary_pos_emb(k_pe_4d, k_pe_4d, cos, sin, pos_ids)
 
-        cache[i, :, : layout.kv_lora_rank] = c_norm.float()
-        cache[i, :, layout.kv_lora_rank:] = k_rot[0, 0].float()
+            cache[i, :, : layout.kv_lora_rank] = c_norm.float().cpu()
+            cache[i, :, layout.kv_lora_rank:] = k_rot[0, 0].float().cpu()
     return cache
+
+
+def write_fleet_cache_bin(cache, layout: CacheLayout, path: Path) -> None:
+    """Write the cache as raw bf16 [layers][max_pos][row], the exact bytes the
+    launcher uploads; decode positions past the prefill are zero and the
+    kernel appends them one per step.
+    """
+    import torch
+
+    L, S, R = cache.shape
+    assert (L, R) == (layout.layers, layout.row), (cache.shape, layout.shape)
+    assert S <= layout.max_pos, f"prefill {S} exceeds max_pos {layout.max_pos}"
+    full = torch.zeros(layout.shape, dtype=torch.float32)
+    full[:, :S] = cache
+    raw = full.to(torch.bfloat16).view(torch.int16).numpy()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(raw.tobytes(order="C"))
+    assert path.stat().st_size == layout.nbytes()
+    print(f"wrote {path}  {layout.describe()}")
 
 
 def verify(model, cache, hf_past, layout: CacheLayout, tol: float = 1e-2) -> bool:
@@ -144,7 +168,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", type=Path, help="local model dir")
     ap.add_argument("--tokens", type=int, default=1024)
-    ap.add_argument("--out", type=Path, default=Path("build/fleet_cache.npy"))
+    ap.add_argument("--out", type=Path, default=Path("build/fleet_cache_check.npy"))
     ap.add_argument("--verify", action="store_true")
     ap.add_argument("--describe", action="store_true",
                     help="print the layout without loading the model")
@@ -159,6 +183,9 @@ def main() -> None:
     import torch
     from transformers import AutoModelForCausalLM
 
+    # This standalone mode exists for the reconstruction check on a random
+    # prompt. The cache the launcher decodes from is written by
+    # reference_run.py, from the same prefill that produced the golden tokens.
     model = AutoModelForCausalLM.from_pretrained(
         a.model, torch_dtype=torch.bfloat16, trust_remote_code=True).eval()
     ids = torch.randint(0, 100, (1, a.tokens))
