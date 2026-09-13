@@ -105,9 +105,15 @@ def main() -> None:
         top2 = torch.topk(lg, 2).values
         return tok, float(top2[0] - top2[1])
 
+    # HF's eager DeepseekV2 attention asserts on a missing attention_mask, so
+    # an explicit all-ones mask is passed for the prefill and for every decode
+    # step (length = tokens so far + 1).
+    def mask(n):
+        return torch.ones(1, n, dtype=torch.long, device=a.device)
+
     print("prefill")
     with torch.no_grad():
-        out = model(ids, use_cache=True)
+        out = model(ids, attention_mask=mask(ids.shape[1]), use_cache=True)
     # The kv hooks have captured the prefill rows; the layer hooks captured
     # the last *prompt* position, which is not what the decode step sees.
     for h in handles:
@@ -131,7 +137,8 @@ def main() -> None:
 
     with torch.no_grad():
         for step in range(a.decode):
-            o = model(next_id, past_key_values=past, use_cache=True)
+            o = model(next_id, attention_mask=mask(ids.shape[1] + step + 1),
+                      past_key_values=past, use_cache=True)
             if step == 0:
                 # Per-layer hidden states of the first decode step: the
                 # golden for layer-boundary checks of Fleet's step 0.
