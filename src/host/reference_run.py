@@ -145,9 +145,9 @@ def main() -> None:
                 for h in handles:
                     h.remove()
             past = o.past_key_values
-            tok, m = pick(o.logits[0, -1])
-            next_id = torch.tensor([[tok]], device=a.device)
-            gen_ids.append(tok)
+            t_id, m = pick(o.logits[0, -1])
+            next_id = torch.tensor([[t_id]], device=a.device)
+            gen_ids.append(t_id)
             margins.append(m)
 
     print("  " + repr(tok.decode(gen_ids))[:160])
