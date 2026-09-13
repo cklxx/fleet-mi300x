@@ -9,6 +9,10 @@ resident and coordinate through an on-device task graph, instead of launching
   performance, risks.
 - **Current state:** [docs/STATUS.md](docs/STATUS.md) — what is verified, what
   is untested, and what is known to be broken. Read this before the numbers.
+- **Originals:** [docs/task/](docs/task) — the assignment as given
+  (`CandidateTaskAMD.pdf`) and the design proposal this implements
+  (`fleet_dsv2lite_mi300x_design.pdf`), kept verbatim so everything above can be
+  checked against what was actually asked for.
 
 Target: single MI300X (gfx942), bf16, batch 1, 1,024-token context, 32 greedy
 tokens. No tensor parallelism, no continuous batching, no speculative decoding.
