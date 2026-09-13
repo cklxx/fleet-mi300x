@@ -1,6 +1,7 @@
 .venv/
 build/
-results/
+results/*.bin
+results/*.log
 __pycache__/
 *.pyc
 *.npz
