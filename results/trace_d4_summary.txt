@@ -1,0 +1,17 @@
+trace of token 1: 6.408 ms from first wait to last signal
+  kind             tasks   busy-sum   wait-sum   avg-busy
+  QKV_FUSED         7992   134.15 ms    72.31 ms     16.8 us
+  ATTENTION         1728   105.06 ms     5.03 ms     60.8 us
+  MERGE_UV           432    10.18 ms    27.77 ms     23.6 us
+  O_PROJ            7992    87.22 ms   571.78 ms     10.9 us
+  NORM_ROUTER         27     0.85 ms     0.08 ms     31.4 us
+  EXPERT_GATE_UP    7696   284.47 ms   277.50 ms     37.0 us
+  EXPERT_DOWN       7696   180.17 ms    16.10 ms     23.4 us
+  REDUCE              26     0.12 ms     0.09 ms      4.7 us
+  DENSE_GATE_UP      296    10.93 ms     2.96 ms     36.9 us
+  DENSE_DOWN         296     7.11 ms     1.57 ms     24.0 us
+  EMBED                1     0.01 ms     0.00 ms      5.4 us
+  LM_HEAD            296    42.45 ms     2.84 ms    143.4 us
+  ARGMAX               1     0.12 ms     0.01 ms    124.0 us
+  per-layer span (first task ready -> last task signalled): L0 203 us  L1 227 us  L2 228 us  L26 226 us  ... sum 6.11 ms
+wrote results/trace_d4.bin (34479 descriptors x 4 uint64: wait-start, ready, done, xcd; 10 ns ticks)

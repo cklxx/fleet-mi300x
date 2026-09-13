@@ -92,25 +92,55 @@ __device__ inline void kv_post(
 // Prologue step 2: absorb W_UK into the query, and RoPE the rope half.
 //   q_c[h] = q_nope[h] @ W_UK[h],  W_UK[h] = kv_b_proj rows [h*256, h*256+128)
 // This is a [128] x [128, 512] product per head — 131 KB of weights, read once
-// per task. Consecutive threads read consecutive j, so the column walk over
-// W_UK is coalesced.
+// per task. Streamed by rows: each wave takes 32 of the 128 rows, a lane
+// holds columns [8l, 8l+8) of a row (one 16-byte load), scales by the scalar
+// q_nope[i] and accumulates eight partials; the four waves' partials are
+// summed through LDS in wave order. (The first version walked the 128 rows
+// per output column with one dependent global load each; that prologue,
+// not the position loop, was the 296 us measured per attention task.)
+// `part_lds` must hold kWaves * kMaxKvLora floats.
 __device__ inline void q_absorb(
         const float* __restrict__ q_head, const __hip_bfloat16* __restrict__ kv_b,
         const float* __restrict__ cos, const float* __restrict__ sin,
         float* __restrict__ q_c_lds, float* __restrict__ q_pe_lds,
+        float* __restrict__ part_lds,
         int head, int qk_nope, int qk_rope, int v_head, int kv_lora) {
     const int row_stride = qk_nope + v_head;               // 256
-    const __hip_bfloat16* w_uk = kv_b + (int64_t)head * row_stride * kv_lora;
+    const uint4* w_uk4 = reinterpret_cast<const uint4*>(
+        kv_b + (int64_t)head * row_stride * kv_lora);      // [qk_nope][kv_lora/8]
+    const int wave = threadIdx.x / kWaveLanes;
+    const int lane = threadIdx.x % kWaveLanes;
+    const int row4 = kv_lora / 8;                          // 64: one uint4 per lane
 
-    for (int j = threadIdx.x; j < kv_lora; j += blockDim.x) {
-        float acc = 0.f;
-        for (int i = 0; i < qk_nope; ++i) {
-            acc += q_head[i] * __bfloat162float(w_uk[(int64_t)i * kv_lora + j]);
+    float acc[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) acc[j] = 0.f;
+
+    constexpr int kRowBatch = 8;
+    for (int i0 = wave * kRowBatch; i0 < qk_nope; i0 += kWaves * kRowBatch) {
+        uint4 v[kRowBatch];
+#pragma unroll
+        for (int k = 0; k < kRowBatch; ++k) v[k] = w_uk4[(int64_t)(i0 + k) * row4 + lane];
+#pragma unroll
+        for (int k = 0; k < kRowBatch; ++k) {
+            const float q = q_head[i0 + k];
+            float a, b;
+            unpack_bf16x2(v[k].x, a, b); acc[0] += q * a; acc[1] += q * b;
+            unpack_bf16x2(v[k].y, a, b); acc[2] += q * a; acc[3] += q * b;
+            unpack_bf16x2(v[k].z, a, b); acc[4] += q * a; acc[5] += q * b;
+            unpack_bf16x2(v[k].w, a, b); acc[6] += q * a; acc[7] += q * b;
         }
-        q_c_lds[j] = acc;
     }
+#pragma unroll
+    for (int j = 0; j < 8; ++j) part_lds[wave * kMaxKvLora + 8 * lane + j] = acc[j];
     for (int i = threadIdx.x; i < qk_rope; i += blockDim.x) {
         q_pe_lds[i] = q_head[qk_nope + i];
+    }
+    __syncthreads();
+    for (int j = threadIdx.x; j < kv_lora; j += blockDim.x) {
+        float v = 0.f;
+        for (int w = 0; w < kWaves; ++w) v += part_lds[w * kMaxKvLora + j];   // fixed order
+        q_c_lds[j] = v;
     }
     __syncthreads();
     apply_rope_interleaved(q_pe_lds, cos, sin, qk_rope);   // reference_decode.py:205
@@ -121,13 +151,13 @@ __device__ inline void q_absorb(
 //   s[t] = scale * (q_c . c[t] + q_pe . k_pe[t])
 //   online softmax over t, accumulating acc += p[t] * c[t]
 //
-// One wave per position: lane l holds c[8l..8l+8) of the row (64 lanes x 8 =
-// 512 = kv_lora) and lanes 0..7 additionally hold k_pe[8l..8l+8) (64 = qk_rope),
-// so a position is one 16-byte load per lane plus one more for eight lanes,
-// a shuffle reduction for the score, and eight FMAs into a register
-// accumulator. The four waves keep private (m, l, acc) and are merged in a
-// fixed order at the end. The lane mapping assumes kv_lora == 512 and
-// qk_rope == 64; the host refuses other shapes.
+// One wave per position, eight positions in flight: lane l holds c[8l..8l+8)
+// of the row (64 lanes x 8 = 512 = kv_lora) and lanes 0..7 additionally hold
+// k_pe[8l..8l+8) (64 = qk_rope), so a position is one 16-byte load per lane
+// plus one more for eight lanes, a shuffle reduction for the score, and eight
+// FMAs into a register accumulator. The four waves keep private (m, l, acc)
+// and are merged in a fixed order at the end. The lane mapping assumes
+// kv_lora == 512 and qk_rope == 64; the host refuses other shapes.
 __device__ inline void attention_chunk(
         const __hip_bfloat16* __restrict__ cache, const float* __restrict__ q_c,
         const float* __restrict__ q_pe, const float* __restrict__ row_new,
@@ -157,33 +187,12 @@ __device__ inline void attention_chunk(
     const uint4* cache4 = reinterpret_cast<const uint4*>(cache);
     const int row4 = row_elems / 8;   // 72 uint4 per position
 
-    for (int t = t_begin + wave; t < t_end; t += kWaves) {
-        float c[8], kp[8];
-        if (t == t_new) {   // uniform per wave: this token's row, from LDS
-#pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                c[j] = row_new[8 * lane + j];
-                kp[j] = rope_lane ? row_new[kMaxKvLora + 8 * lane + j] : 0.f;
-            }
-        } else {
-            const uint4 v = cache4[(int64_t)t * row4 + lane];
-            unpack_bf16x2(v.x, c[0], c[1]); unpack_bf16x2(v.y, c[2], c[3]);
-            unpack_bf16x2(v.z, c[4], c[5]); unpack_bf16x2(v.w, c[6], c[7]);
-            if (rope_lane) {
-                const uint4 r = cache4[(int64_t)t * row4 + kMaxKvLora / 8 + lane];
-                unpack_bf16x2(r.x, kp[0], kp[1]); unpack_bf16x2(r.y, kp[2], kp[3]);
-                unpack_bf16x2(r.z, kp[4], kp[5]); unpack_bf16x2(r.w, kp[6], kp[7]);
-            } else {
-#pragma unroll
-                for (int j = 0; j < 8; ++j) kp[j] = 0.f;
-            }
-        }
-
+    // One position's contribution to this wave's running (m, l, acc).
+    auto update = [&](const float* c, const float* kp) {
         float part = 0.f;
 #pragma unroll
         for (int j = 0; j < 8; ++j) part += qc[j] * c[j] + qp[j] * kp[j];
         const float s = wave_sum(part) * scale;
-
         const float m_new = fmaxf(m, s);
         const float rescale = __expf(m - m_new);   // exp(-inf) = 0 on the first step
         const float p = __expf(s - m_new);
@@ -191,6 +200,52 @@ __device__ inline void attention_chunk(
         m = m_new;
 #pragma unroll
         for (int j = 0; j < 8; ++j) acc[j] = acc[j] * rescale + p * c[j];
+    };
+
+    // Cached positions in batches of kAttnBatch per wave: all loads of the
+    // batch are issued before any is consumed, so the loop pays one memory
+    // round trip per batch rather than per position (measured: the
+    // one-position loop cost ~1 us per position, 296 us per task).
+    constexpr int kAttnBatch = 8;
+    const int t_cached = min(t_end, t_new);        // rows that live in the cache
+    for (int base = t_begin + wave * kAttnBatch; base < t_cached;
+         base += kWaves * kAttnBatch) {
+        uint4 vc[kAttnBatch], vr[kAttnBatch];
+#pragma unroll
+        for (int k = 0; k < kAttnBatch; ++k) {
+            const int t = base + k;
+            if (t < t_cached) {                     // wave-uniform
+                vc[k] = cache4[(int64_t)t * row4 + lane];
+                if (rope_lane) vr[k] = cache4[(int64_t)t * row4 + kMaxKvLora / 8 + lane];
+            }
+        }
+#pragma unroll
+        for (int k = 0; k < kAttnBatch; ++k) {
+            if (base + k >= t_cached) break;        // wave-uniform
+            float c[8], kp[8];
+            unpack_bf16x2(vc[k].x, c[0], c[1]); unpack_bf16x2(vc[k].y, c[2], c[3]);
+            unpack_bf16x2(vc[k].z, c[4], c[5]); unpack_bf16x2(vc[k].w, c[6], c[7]);
+            if (rope_lane) {
+                unpack_bf16x2(vr[k].x, kp[0], kp[1]); unpack_bf16x2(vr[k].y, kp[2], kp[3]);
+                unpack_bf16x2(vr[k].z, kp[4], kp[5]); unpack_bf16x2(vr[k].w, kp[6], kp[7]);
+            } else {
+#pragma unroll
+                for (int j = 0; j < 8; ++j) kp[j] = 0.f;
+            }
+            update(c, kp);
+        }
+    }
+
+    // This token's row, from LDS, once, by wave 0 (the per-wave partials are
+    // merged below, so which wave takes it does not matter).
+    if (wave == 0 && t_new >= t_begin && t_new < t_end) {
+        float c[8], kp[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            c[j] = row_new[8 * lane + j];
+            kp[j] = rope_lane ? row_new[kMaxKvLora + 8 * lane + j] : 0.f;
+        }
+        update(c, kp);
     }
 
     // Publish the wave partials, then merge them in wave order.

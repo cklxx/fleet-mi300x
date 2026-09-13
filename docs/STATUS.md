@@ -24,22 +24,34 @@ Raw numbers: [`results/`](../results/).
 |---|---|
 | Tokens matching HF greedy, free-running / teacher-forced | 32/32 and 32/32 |
 | Layers inside the §6 gate on step 0 | 27 of 27 |
-| Per-token latency, median / p95 (1 launch per token) | 22.05 ms / 22.16 ms (45 tok/s) |
+| Per-token latency, median / p95 (1 launch per token), split-KV graph | **6.50 ms / 6.56 ms (146 tok/s)**; first version of the day was 22.05 ms |
 | Protocol only (`--smoke`, all 805 events, no task bodies) | 1.17 ms per token |
 | Cross-XCD event, idle / under a 1.46 TB/s stream | 1.44 µs / 6.0 µs (§9 was 2–4 µs) |
 | Cross-XCD payload visibility (4 waves store, thread 0 releases) | 0 stale words in 16.4 M |
 | Streamed read bandwidth, best depth | 4.25 TB/s at depth 8 (80% of peak) |
-| Kernel resources | 244 VGPRs, 0 AGPRs, 24 KB LDS, 2 waves/SIMD, 387 SGPR spills, 132 B/lane scratch |
+| Kernel resources | 249 VGPRs, 0 AGPRs, 24 KB LDS, 2 waves/SIMD, 185 SGPR spills, 144 B/lane scratch |
 | KV-cache conversion vs HF's own cache | K_nope, K_rope, V all exactly 0 error, 27 layers |
 
-**Where the 22 ms goes** (per-task trace of token 1, `results/trace_d2_summary.txt`):
-each MoE layer's critical path is ~810 µs, of which attention is ~300 µs
-(16 tasks in parallel, 296 µs each: the position loop issues one load and
-waits on it, ~1 µs per position) and the router task is 371 µs (its top-k
-scan keeps a `bool taken[64]` in scratch memory and thread 0 does ~380
-serial scratch loads). Those two are the next fixes; the rest of the layer
-is ~150 µs. The byte floor is 1.2 ms and the protocol costs 1.2 ms, so the
-target after fixing them is ~5 ms per token, then §12's optimisations.
+**From 22 ms to 6.5 ms in four steps, each attributed by the per-task trace**
+(`results/trace_d2_summary.txt` before, `results/trace_d4_summary.txt` after):
+
+| Step | Per token | What the trace said and what changed |
+|---|---|---|
+| first run | 22.05 ms | MoE layer critical path ~810 µs: attention 296 µs/task, router 371 µs |
+| router top-k mask in registers | 13.7 ms | `bool taken[64]` was in scratch memory and thread 0 paid a memory round trip per element; a 64-bit mask made it 68 µs |
+| q-absorb streamed by rows; GEMV depth 8 | 11.6 ms | the attention prologue walked 128 rows per output column with one dependent load each; streaming W_UK rows made attention 203 µs. Depth 8 changed nothing: with a dozen rows per worker the GEMV tasks are latency-bound, not bandwidth-bound |
+| split-KV graph (4 chunks/head, 64 tasks/layer) | 7.65 ms | attention 61 µs/task; the `taskgraph_d4.bin` from D0, no kernel change |
+| prologues unrolled; router softmax/top-k as wave reductions | **6.50 ms** | `stage_vector` / RMSNorm loads all in flight; router 31 µs; MoE layer critical path now ~227 µs |
+
+Where the remaining 6.5 ms goes (per MoE layer, 227 µs): attention 61,
+gate_up 37, router 31, merge 24, down 23, q/kv_a 17, o_proj 11, reduce 5, and
+~6 global events at ~6 µs each. The GEMV tasks are 2–4× above their byte
+time because each worker owns only 7–55 rows and pays a few serial round
+trips; the levers are §12's cross-task prefetch (issue the next task's first
+loads before waiting on its event) and fusing merge into attention when
+kv_chunks == 1 is not used. The byte floor is 1.2 ms and the protocol alone
+is 1.2 ms, so the design's 2.5–3.5 ms target is still plausible but not
+reached.
 
 ## Review pass before GPU time (2026-09-13)
 

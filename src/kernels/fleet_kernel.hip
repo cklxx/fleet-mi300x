@@ -61,15 +61,20 @@ __device__ inline void rms_norm_to_lds(const ModelDims& d,
                                        const __hip_bfloat16* __restrict__ gamma,
                                        const float* __restrict__ in,
                                        float* __restrict__ out, float* smem) {
+    // Pull the vector into LDS with all loads in flight, then reduce; the
+    // second pass reads LDS, not global memory again.
+    stage_vector(in, out, d.hidden);
     float local = 0.f;
-    for (int i = threadIdx.x; i < d.hidden; i += blockDim.x) {
-        const float v = in[i];
+#pragma unroll 8
+    for (int i = threadIdx.x; i < d.hidden; i += kBlockThreads) {
+        const float v = out[i];
         local += v * v;
     }
     const float ssq = block_reduce_ordered(local, smem);
     const float inv = rsqrtf(ssq / d.hidden + d.rms_eps);
-    for (int i = threadIdx.x; i < d.hidden; i += blockDim.x) {
-        out[i] = bf16_round(bf16_round(in[i] * inv) * __bfloat162float(gamma[i]));
+#pragma unroll 8
+    for (int i = threadIdx.x; i < d.hidden; i += kBlockThreads) {
+        out[i] = bf16_round(bf16_round(out[i] * inv) * __bfloat162float(gamma[i]));
     }
     __syncthreads();
 }
@@ -89,26 +94,38 @@ __device__ void task_norm_router(const ModelDims& d, const Weights& w,
               1.f, d.n_routed, d.hidden, 0, 1, 0, 1);
     __syncthreads();
 
-    if (threadIdx.x == 0) {
-        float mx = s.logits[0];
-        for (int e = 1; e < d.n_routed; ++e) mx = fmaxf(mx, s.logits[e]);
-        float sum = 0.f;
-        for (int e = 0; e < d.n_routed; ++e) { s.logits[e] = __expf(s.logits[e] - mx); sum += s.logits[e]; }
-        const float inv = 1.f / sum;
-        for (int e = 0; e < d.n_routed; ++e) s.logits[e] *= inv;
+    // Softmax and top-k on wave 0, one expert per lane: the max, the sum and
+    // each of the k argmax picks are shuffle reductions instead of a serial
+    // scan by one thread over LDS (that scan was 371 us with a scratch-
+    // resident bool[64], and still ~70 us as a register mask).
+    if (threadIdx.x < kWaveLanes) {
+        const int lane = threadIdx.x;
+        const bool valid = lane < d.n_routed;
+        float v = valid ? s.logits[lane] : -INFINITY;
+        float mx = v;
+#pragma unroll
+        for (int off = kWaveLanes / 2; off; off >>= 1) mx = fmaxf(mx, __shfl_xor(mx, off, kWaveLanes));
+        float p = valid ? __expf(v - mx) : 0.f;
+        const float inv = 1.f / wave_sum(p);
+        p *= inv;
 
-        // top-k by selection: k is 6, so a scan beats a sort. Ties go to the
-        // lower index, matching torch.topk's stable order on equal scores.
-        bool taken[kMaxRouted] = {false};
+        // top-k by selection: k is 6. Ties go to the lower index, matching
+        // torch.topk's stable order on equal scores: the reduction carries
+        // (score, -index) and takes the larger pair.
         for (int k = 0; k < d.top_k; ++k) {
-            int best = -1;
-            float bv = -1.f;
-            for (int e = 0; e < d.n_routed; ++e) {
-                if (!taken[e] && s.logits[e] > bv) { bv = s.logits[e]; best = e; }
+            float bv = p;
+            int bi = valid ? lane : 0x7fffffff;
+#pragma unroll
+            for (int off = kWaveLanes / 2; off; off >>= 1) {
+                const float ov = __shfl_xor(bv, off, kWaveLanes);
+                const int oi = __shfl_xor(bi, off, kWaveLanes);
+                if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
             }
-            taken[best] = true;
-            act.topk_ids[k] = best;
-            act.topk_w[k] = bv;          // unnormalised; scaling applied in resolve_unit
+            if (lane == 0) {
+                act.topk_ids[k] = bi;
+                act.topk_w[k] = bv;      // unnormalised; scaling applied in resolve_unit
+            }
+            if (lane == bi) p = -INFINITY;   // taken
         }
     }
 }
@@ -205,7 +222,7 @@ __device__ void run_task(const TaskDescriptor& t, const ModelDims& d,
                     /*write_cache=*/t.head == 0 && t.kv_chunk == 0,
                     cache_layer + (int64_t)(d.seq_len - 1) * kv.row);
             q_absorb(act.q + (int64_t)t.head * d.q_head_dim, w.layer_kv_b[L],
-                     act.cos, act.sin, s.q_c, s.q_pe, t.head,
+                     act.cos, act.sin, s.q_c, s.q_pe, s.part, t.head,
                      d.qk_nope, d.qk_rope, d.v_head, d.kv_lora);
             attention_chunk(cache_layer, s.q_c, s.q_pe, s.row, d.softmax_scale,
                             d.seq_len, kv.row, t.kv_chunk, chunks,

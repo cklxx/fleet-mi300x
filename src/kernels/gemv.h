@@ -27,10 +27,11 @@
 
 namespace fleet {
 
-// Loads in flight per row per lane before the first s_waitcnt. Overridden by
-// the measured optimum from bench/microbench.hip (c).
+// Loads in flight per row per lane before the first s_waitcnt. Set from
+// bench/microbench.hip (c) on the MI300X: depth 4 streamed 3.76 TB/s, depth 8
+// 4.25 TB/s (80% of peak), depth 12 and 16 fell off again.
 #ifndef FLEET_STREAM_DEPTH
-#define FLEET_STREAM_DEPTH 4
+#define FLEET_STREAM_DEPTH 8
 #endif
 constexpr int kStreamDepth = FLEET_STREAM_DEPTH;
 constexpr int kWaveLanes = 64;
@@ -123,10 +124,15 @@ __device__ __forceinline__ float block_reduce_ordered(float v, float* smem) {
 }
 
 // Copy a vector into LDS so the row loop reads its operand from LDS instead
-// of re-fetching it from L2 for every row.
+// of re-fetching it from L2 for every row. The stride is the compile-time
+// block size and the loop is unrolled so the (up to 8) loads per thread are
+// all in flight together instead of paying one round trip each.
+constexpr int kBlockThreads = 256;
+
 __device__ __forceinline__ void stage_vector(const float* __restrict__ src,
                                              float* __restrict__ dst, int n) {
-    for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = src[i];
+#pragma unroll 8
+    for (int i = threadIdx.x; i < n; i += kBlockThreads) dst[i] = src[i];
     __syncthreads();
 }
 
