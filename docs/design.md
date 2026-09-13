@@ -230,7 +230,7 @@ Dominant risk to the target: expert GEMV efficiency at N-tile granularity (17.3 
 |---|---|
 | Correctness error | `tests/*.py` (§6); on device `fleet_decode --teacher-force` (per-step token check) and free-running decode vs `golden_tokens.txt` |
 | Fleet-native ops / fallbacks | `taskgraph.py --report` prints per-op {fleet, torch-fallback} |
-| Consecutive layers | *planned:* per-layer hidden-state dump from the launcher against `golden.npz` (first-decode-step states are already captured) |
+| Consecutive layers | on token 0 the kernel copies every layer's output to `layer_dump`; the launcher compares each against HF's first-decode-step states (`golden_hidden.bin`) and prints max rel, cosine and the number of consecutive layers inside the gate; `--dump-layers` writes the states for offline analysis |
 | GPU launches | `rocprofv3 --kernel-trace -o trace -- ./build/fleet_decode` → count per token |
 | Median / P95 latency | `fleet_decode --json` records `hipEvent` time per token; `--smoke` isolates the synchronisation cost |
 | Per-XCD timeline | *planned:* every task writes start/end `s_memrealtime` + XCD id to a trace buffer; a `bench/gantt.py` renders 8 XCD lanes per token, exposing bubbles, imbalance and tails |
@@ -242,7 +242,7 @@ The D5 report presents these as follows; no estimate from §9 survives into it u
 
 | Section | Content | Source |
 |---|---|---|
-| Milestone | exact consecutive-layer count; e2e reached or not; per-op list of Fleet-native vs torch-fallback | `taskgraph.py --report`, the planned per-layer dump |
+| Milestone | exact consecutive-layer count; e2e reached or not; per-op list of Fleet-native vs torch-fallback | `taskgraph.py --report`, the launcher's per-layer comparison |
 | Correctness | §6 table with measured values at every completed boundary; drift curve over layers; first divergent token and its logit margin if any | `tests/*.py` |
 | Per-layer XCD Gantt | 8 lanes per layer, one figure per layer type (dense, MoE, lm_head); every idle interval classified as (a) global-event wait — worker idle between its XCD's signal and the next dispatch, (b) tile tail — inside a Chiplet-task, workers idle after their tile while the last tile finishes, (c) XCD imbalance — an XCD's Chiplet-task ends before the slowest XCD's. Reported as % of layer time and aggregated per token | *planned:* per-task and per-event `s_memrealtime` trace; classifier in a `bench/attribution.py` |
 | Achieved bandwidth by phase | bytes ÷ phase time for q/kv_a, o_proj, expert, lm_head GEMV phases, the attention phase and the small-op phase, each against the 4.0 TB/s ceiling; the phase farthest from the ceiling is named with its cause (tile size, in-flight depth, or sync) | bytes per phase from the §1 accounting (static), phase time from the trace timestamps; `rocprofv3 --pmc FETCH_SIZE` validates the per-token total only — hardware counters aggregate per dispatch and cannot be split inside one persistent kernel |

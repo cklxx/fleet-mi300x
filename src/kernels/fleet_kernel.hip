@@ -157,12 +157,24 @@ __device__ void task_argmax(const ModelDims& d, Activations& act) {
 
 // ---------------------------------------------------------------- dispatch
 
+// Layer-boundary capture (§6): x at the entry of layer L's QKV task is the
+// output of layer L-1, and x at lm_head's entry is the last layer's. One
+// worker copies it out; every other worker only reads x here, so the copy
+// races with nothing. Enabled by the launcher for the first token only,
+// which is the step the golden per-layer states were captured for.
+__device__ __forceinline__ void dump_layer_output(const ModelDims& d, const Activations& act,
+                                                  int layer_done) {
+    float* dst = act.layer_dump + (int64_t)layer_done * d.hidden;
+    for (int i = threadIdx.x; i < d.hidden; i += blockDim.x) dst[i] = act.x[i];
+}
+
 __device__ void run_task(const TaskDescriptor& t, const ModelDims& d,
                          const Weights& w, Activations& act, KVCache& kv,
-                         Scratch& s, int token, int xcd, int worker) {
+                         Scratch& s, int token, int xcd, int worker, int dump) {
     const int L = t.layer;
     const int nw = kWorkersPerXCD;
     const int chunks = max(1, (int)t.n_split);
+    const bool dumper = dump && xcd == 0 && worker == 0;
 
     switch (t.kind) {
         case TASK_EMBED:       task_embed(d, w, act, token); break;
@@ -175,6 +187,7 @@ __device__ void run_task(const TaskDescriptor& t, const ModelDims& d,
         // evenly over 8 XCDs (456 each = 2 heads' worth plus kv_a). RMSNorm is
         // recomputed per worker in the prologue rather than costing an event.
         case TASK_QKV_FUSED: {
+            if (dumper && L > 0) dump_layer_output(d, act, L - 1);
             rms_norm_to_lds(d, w.layer_norm_in[L], act.x, s.vec, s.smem);
             const int N = d.heads * d.q_head_dim + d.kv_lora + d.qk_rope;
             gemv_rows(w.layer_qkv[L], d.hidden, s.vec, act.q, nullptr, EPI_BF16,
@@ -253,6 +266,7 @@ __device__ void run_task(const TaskDescriptor& t, const ModelDims& d,
             break;
 
         case TASK_LM_HEAD:
+            if (dumper) dump_layer_output(d, act, d.layers - 1);
             rms_norm_to_lds(d, w.final_norm, act.x, s.vec, s.smem);
             gemv_rows(w.lm_head, d.hidden, s.vec, act.logits, nullptr, EPI_BF16,
                       1.f, d.vocab, d.hidden, xcd, kXCDs, worker, nw);
@@ -297,7 +311,7 @@ void fleet_decode_step(RuntimeState rt, ModelDims d, Weights w,
         __syncthreads();
         if (!ok_smem) break;          // abort raised somewhere: drain, exit
 
-        if (!rt.smoke) run_task(*t, d, w, act, kv, s, token, xcd, worker);
+        if (!rt.smoke) run_task(*t, d, w, act, kv, s, token, xcd, worker, rt.dump_layers);
         __syncthreads();
 
         if (threadIdx.x == 0) {

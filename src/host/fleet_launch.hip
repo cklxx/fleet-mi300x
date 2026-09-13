@@ -19,6 +19,9 @@
 //   --weights  build/weights.bin           pack_weights.py (+ .manifest)
 //   --cache    build/fleet_cache.bin       reference_run.py (bf16 [L][max_pos][576])
 //   --golden   build/golden_tokens.txt     reference_run.py (HF greedy tokens)
+//   --hidden   build/golden_hidden.bin     reference_run.py (fp32 [layers][hidden],
+//              each layer's output on the first decode step; compared layer by
+//              layer against the kernel's own outputs on token 0, §6)
 //
 // Modes:
 //   --smoke    run the protocol only: every task body is skipped, so this
@@ -313,7 +316,8 @@ int main(int argc, char** argv) {
     std::string weights_path = "build/weights.bin";
     std::string cache_path = "build/fleet_cache.bin";
     std::string golden_path = "build/golden_tokens.txt";
-    std::string json_path;
+    std::string hidden_path = "build/golden_hidden.bin";
+    std::string json_path, dump_path;
     int tokens = 32, context = 1024, first_token = -1;
     bool smoke = false, teacher = false;
     uint32_t spin_limit = 1u << 22;
@@ -324,6 +328,8 @@ int main(int argc, char** argv) {
         else if (a == "--weights") weights_path = next();
         else if (a == "--cache") cache_path = next();
         else if (a == "--golden") golden_path = next();
+        else if (a == "--hidden") hidden_path = next();
+        else if (a == "--dump-layers") dump_path = next();   // write our [layers][hidden] fp32
         else if (a == "--json") json_path = next();
         else if (a == "--tokens") tokens = std::atoi(next().c_str());
         else if (a == "--context") context = std::atoi(next().c_str());
@@ -405,6 +411,7 @@ int main(int argc, char** argv) {
     rt.done_event = done_event;
     rt.use_uncached_counters = uncached ? 1 : 0;
     rt.smoke = smoke ? 1 : 0;
+    rt.dump_layers = 0;   // set for token 0 below
     rt.spin_limit = spin_limit;
     rt.epoch = 0;   // set per token below; a zero epoch makes every wait trivially true
     std::printf("event counters: %s\n",
@@ -508,6 +515,7 @@ int main(int argc, char** argv) {
         act.topk_ids = dev_alloc<int32_t>(kMaxTopK);
         act.topk_w = dev_alloc<float>(kMaxTopK);
         act.next_token = dev_alloc<int32_t>(1);
+        act.layer_dump = dev_alloc<float>((size_t)d.layers * d.hidden);
 
         std::vector<float> cos_h, sin_h;
         yarn_tables(rp, max_pos, cos_h, sin_h);
@@ -527,6 +535,26 @@ int main(int argc, char** argv) {
         golden = load_tokens(golden_path);
         if (golden.empty() && first_token < 0) die("no golden tokens at " + golden_path + " and no --first-token");
         if (first_token < 0) first_token = golden[0];
+    }
+
+    // Golden per-layer states (optional): compared after token 0.
+    std::vector<float> golden_hidden;
+    if (!smoke) {
+        std::ifstream f(hidden_path, std::ios::binary | std::ios::ate);
+        if (f) {
+            const size_t bytes = (size_t)f.tellg();
+            if (bytes == (size_t)d.layers * d.hidden * sizeof(float)) {
+                golden_hidden.resize((size_t)d.layers * d.hidden);
+                f.seekg(0);
+                f.read((char*)golden_hidden.data(), bytes);
+            } else {
+                std::printf("note: %s is %zu bytes, expected %zu; skipping the per-layer check\n",
+                            hidden_path.c_str(), bytes, (size_t)d.layers * d.hidden * sizeof(float));
+            }
+        } else {
+            std::printf("note: no %s; per-layer check skipped (reference_run.py writes it)\n",
+                        hidden_path.c_str());
+        }
     }
 
     // ---- residency check before anything expensive happens
@@ -575,9 +603,11 @@ int main(int argc, char** argv) {
                 smoke ? "smoke run (protocol only)" : (teacher ? "teacher-forced decode" : "free-running decode"),
                 tokens, context, teacher ? " (HF token fed each step)" : "");
 
+    int layers_ok = -1;   // consecutive layers within the §6 gate, from layer 0
     for (int i = 0; i < tokens; ++i) {
         rt.epoch = (uint32_t)(i + 1);       // never reset; targets are epoch x producers
         d.seq_len = context + i + 1;        // rows valid after this step
+        rt.dump_layers = (!smoke && i == 0) ? 1 : 0;
         if (!smoke) {
             act.cos = d_cos + (size_t)(context + i) * d.qk_rope;
             act.sin = d_sin + (size_t)(context + i) * d.qk_rope;
@@ -613,6 +643,42 @@ int main(int argc, char** argv) {
         }
         std::printf("token %2d: %8.3f ms  in %6d -> out %6d  %s\n", i, ms[i], token, next, verdict.c_str());
         token = (teacher && have_ref) ? golden[i + 1] : next;
+
+        // ---- per-layer comparison on the first step (design.md §6): the
+        // drift curve of Fleet output feeding Fleet, layer by layer, against
+        // HF's states for the same step. Gate: max rel <= 2e-2, cosine >= 0.999.
+        if (i == 0 && (!golden_hidden.empty() || !dump_path.empty())) {
+            std::vector<float> ours((size_t)d.layers * d.hidden);
+            HIP_CHECK(hipMemcpy(ours.data(), act.layer_dump, ours.size() * sizeof(float),
+                                hipMemcpyDeviceToHost));
+            if (!dump_path.empty()) {
+                std::ofstream o(dump_path, std::ios::binary);
+                o.write((const char*)ours.data(), ours.size() * sizeof(float));
+                std::printf("wrote %s (fp32 [%d][%d])\n", dump_path.c_str(), d.layers, d.hidden);
+            }
+            if (!golden_hidden.empty()) {
+                std::printf("\nper-layer output vs HF, first decode step (gate: max rel <= 2e-2, cosine >= 0.999)\n");
+                layers_ok = 0;
+                bool chain = true;
+                for (int L = 0; L < d.layers; ++L) {
+                    const float* a = ours.data() + (size_t)L * d.hidden;
+                    const float* b = golden_hidden.data() + (size_t)L * d.hidden;
+                    double dot = 0, na = 0, nb = 0, max_abs = 0, max_ref = 0;
+                    for (int j = 0; j < d.hidden; ++j) {
+                        dot += (double)a[j] * b[j]; na += (double)a[j] * a[j]; nb += (double)b[j] * b[j];
+                        max_abs = std::max(max_abs, (double)std::fabs(a[j] - b[j]));
+                        max_ref = std::max(max_ref, (double)std::fabs(b[j]));
+                    }
+                    const double rel = max_abs / std::max(max_ref, 1e-12);
+                    const double cos = dot / (std::sqrt(na) * std::sqrt(nb) + 1e-30);
+                    const bool ok = rel <= 2e-2 && cos >= 0.999;
+                    if (chain && ok) ++layers_ok; else chain = false;
+                    std::printf("  layer %2d %s: max rel %9.2e  cosine %.6f  [%s]\n", L,
+                                L < d.first_k_dense ? "dense" : "moe  ", rel, cos, ok ? "ok" : "FAIL");
+                }
+                std::printf("  consecutive layers within the gate: %d of %d\n\n", layers_ok, d.layers);
+            }
+        }
     }
 
     // ---- summary
@@ -639,7 +705,8 @@ int main(int argc, char** argv) {
         j << "{\n  \"mode\": \"" << (smoke ? "smoke" : (teacher ? "teacher" : "free")) << "\",\n"
           << "  \"tokens\": " << tokens << ", \"context\": " << context << ",\n"
           << "  \"median_ms\": " << median << ", \"p95_ms\": " << p95 << ",\n"
-          << "  \"matched\": " << matched << ", \"compared\": " << compared << ",\n  \"ms\": [";
+          << "  \"matched\": " << matched << ", \"compared\": " << compared << ",\n"
+          << "  \"layers_within_gate\": " << layers_ok << ", \"layers\": " << d.layers << ",\n  \"ms\": [";
         for (int i = 0; i < tokens; ++i) j << (i ? ", " : "") << ms[i];
         j << "],\n  \"produced\": [";
         for (int i = 0; i < tokens; ++i) j << (i ? ", " : "") << produced[i];

@@ -113,6 +113,7 @@ struct RuntimeState {
     int32_t  done_event;   // the graph's final event: schedulers stop at epoch
     int32_t  use_uncached_counters;  // event scheme (ii) from §4, set by D1 (a)
     int32_t  smoke;        // 1 = run the protocol only, skip every task body
+    int32_t  dump_layers;  // 1 = copy every layer's output x to act.layer_dump
     uint32_t spin_limit;   // polls before a wait declares a deadlock
 };
 

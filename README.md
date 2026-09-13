@@ -79,6 +79,14 @@ python3 src/host/kv_convert.py --model ~/models/dsv2-lite-base --verify
 ./build/fleet_decode --graph build/taskgraph_d2.bin --json results/decode_d2.json
 ```
 
+Every non-smoke run also prints, for the first decode step, each layer's
+output against HF's (max rel, cosine) and how many consecutive layers sit
+inside the §6 gate — the evidence for the "one MoE layer through the Fleet
+path" milestone, independent of whether the 32 tokens all match.
+
+```bash
+```
+
 Order matters. `setup_env.sh` ends with `fleet_decode --smoke`, which runs the
 whole per-token protocol — cooperative launch at grid 304, XCD role discovery,
 all 805 events — with every task body skipped, so the synchronisation cost is

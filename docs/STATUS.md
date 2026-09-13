@@ -150,7 +150,9 @@ happening to be zero; the routing weight is multiplied by
 3. HF reference run → golden tokens and the converted cache.
 4. `fleet_decode --teacher-force` — every step fed HF's token, so a mismatch
    is isolated to the step it appears in; then free-running decode.
-5. If tokens diverge: per-layer hidden-state comparison against the
-   first-decode-step states in `golden.npz` (captured; the per-layer dump path
-   in the launcher is the next thing to write). **The required milestone is one
-   MoE layer (index ≥ 1) matching HF through the Fleet path.**
+5. The per-layer comparison runs on every non-smoke decode automatically: on
+   token 0 the kernel copies each layer's output out, and the launcher prints
+   max rel and cosine per layer against HF's first-decode-step states plus
+   the count of consecutive layers inside the §6 gate. **The required
+   milestone is one MoE layer (index ≥ 1) matching HF through the Fleet
+   path** — that count is the evidence, with the token comparison on top.

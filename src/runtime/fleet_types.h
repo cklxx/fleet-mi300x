@@ -71,6 +71,9 @@ struct Activations {
     int32_t* __restrict__ next_token;
     const float* __restrict__ cos;     // [qk_rope] for this position; YaRN is
     const float* __restrict__ sin;     // position-only, so the host computes it
+    float* __restrict__ layer_dump;    // [layers][hidden]: each layer's output x,
+                                       // written when RuntimeState.dump_layers
+                                       // is set (the golden-state comparison, §6)
 };
 
 // Absorbed-MLA cache: one compressed row per position, shared by all heads.

@@ -172,6 +172,11 @@ def main() -> None:
     (a.out.parent / "golden_tokens.txt").write_text(
         "".join(f"{t}\n" for t in gen_ids))
     print(f"wrote {a.out.parent / 'golden_tokens.txt'} ({len(gen_ids)} tokens)")
+    # Per-layer outputs of the first decode step, fp32 [layers][hidden]: the
+    # launcher compares its own layer outputs against these (design.md §6).
+    hid = np.stack([hidden[i] for i in range(n_layers)]).astype(np.float32)
+    (a.out.parent / "golden_hidden.bin").write_bytes(hid.tobytes(order="C"))
+    print(f"wrote {a.out.parent / 'golden_hidden.bin'} {hid.shape}")
     print(f"  smallest top-2 margin over the run: {min(margins):.4f} "
           f"(a small margin here is where bf16 drift would flip a token)")
 
