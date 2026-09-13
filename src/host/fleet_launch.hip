@@ -367,11 +367,14 @@ int main(int argc, char** argv) {
     const int done_event = tasks.back().signal_event;
     if (n_events > kMaxEvents) die("n_events " + std::to_string(n_events) + " exceeds kMaxEvents");
     if (tasks.back().kind != TASK_ARGMAX) die("last descriptor is not ARGMAX; done_event would be wrong");
+    if (done_event < 0 || done_event >= (int)is_global.size() || !is_global[done_event]) {
+        die("final event " + std::to_string(done_event) + " is not a global-scope event; "
+            "the schedulers would never see it and never stop");
+    }
     std::printf("graph: %zu descriptors across %d workers, %d events (%zu global, mirrored), "
                 "kv_chunks %d, final event %d (%s)\n", tasks.size(), kXCDs * kWorkersPerXCD,
                 n_events, global_ids.size(), kv_chunks, done_event,
                 labels.count(done_event) ? labels[done_event].c_str() : "?");
-    if (!is_global.empty() && !is_global[done_event]) die("final event is not global-scope");
 
     // ---- runtime state
     const bool uncached = std::getenv("FLEET_UNCACHED_EVENTS") != nullptr;

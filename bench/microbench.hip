@@ -195,28 +195,46 @@ __global__ __launch_bounds__(kBlock) void payload_visibility(
 // Blocks 0/1 ping-pong exactly as in (a); every other block streams a large
 // buffer into registers until the producer raises `stop`. That is the
 // bandwidth environment a real event lives in.
+// Launched cooperatively: the streaming blocks spin until the ping-pong pair
+// is done, so all kGrid blocks must be resident or the pair may never run.
+// out_cycles[iters], [iters+1] receive the pair's XCC_IDs; trips[wg] counts
+// each streaming block's 4-load trips so the host can report the achieved
+// load bandwidth, i.e. prove the load was real.
 __global__ __launch_bounds__(kBlock) void event_pingpong_loaded(
     unsigned* __restrict__ ping, unsigned* __restrict__ pong,
     unsigned long long* __restrict__ out_cycles, int iters,
     const float4* __restrict__ w, long long n_float4, float* __restrict__ sink,
-    unsigned* __restrict__ stop) {
+    unsigned* __restrict__ stop, unsigned long long* __restrict__ trips) {
   const int wg = blockIdx.x;
   if (wg >= 2) {
     const long long stride = (long long)(gridDim.x - 2) * blockDim.x;
     long long i = (long long)(wg - 2) * blockDim.x + threadIdx.x;
     float acc = 0.f;
-    while (!poll(stop)) {
-      float4 buf[4];
+    unsigned long long n = 0;
+    __shared__ int go;
+    if (threadIdx.x == 0) go = 1;
+    __syncthreads();
+    while (go) {
+      // 32 trips (128 loads, 2 KB per lane) between stop polls: the poll
+      // is one agent-scope read by one thread, negligible next to the stream.
+      for (int k = 0; k < 32; ++k) {
+        float4 buf[4];
 #pragma unroll
-      for (int d = 0; d < 4; ++d) buf[d] = w[(i + d * stride) % n_float4];
+        for (int d = 0; d < 4; ++d) buf[d] = w[(i + d * stride) % n_float4];
 #pragma unroll
-      for (int d = 0; d < 4; ++d) acc += buf[d].x + buf[d].y + buf[d].z + buf[d].w;
-      i = (i + 4 * stride) % n_float4;
+        for (int d = 0; d < 4; ++d) acc += buf[d].x + buf[d].y + buf[d].z + buf[d].w;
+        i = (i + 4 * stride) % n_float4;
+      }
+      n += 32;
+      if (threadIdx.x == 0 && poll(stop)) go = 0;
+      __syncthreads();
     }
+    if (threadIdx.x == 0) trips[wg] = n;
     if (acc == 1234.5678f) sink[wg] = acc;
     return;
   }
   const bool is_producer = (wg == 0);
+  if (threadIdx.x == 0) out_cycles[iters + (is_producer ? 0 : 1)] = xcc_id();
   __shared__ unsigned long long t0;
   for (int i = 1; i <= iters; ++i) {
     if (is_producer) {
@@ -388,25 +406,50 @@ static unsigned run_payload(int iters, bool* cross_xcd) {
   return bad;
 }
 
-// (e): (a) with the other 302 workgroups streaming `bytes` of HBM.
-static Stats run_event_loaded(int iters, double ns, size_t bytes) {
+// (e): (a) with the other 302 workgroups streaming `bytes` of HBM. Cooperative
+// launch so all blocks are resident (the streamers spin until the pair is
+// done). Reports the achieved load bandwidth and whether the pair spanned XCDs.
+static Stats run_event_loaded(int iters, double ns, size_t bytes, double* load_tbs,
+                              bool* cross_xcd) {
   unsigned *ping, *pong, *stop;
-  unsigned long long* cyc;
+  unsigned long long *cyc, *trips;
   float4* w; float* sink;
   HIP_CHECK(hipMalloc(&ping, 64)); HIP_CHECK(hipMalloc(&pong, 64));
   HIP_CHECK(hipMalloc(&stop, 64));
-  HIP_CHECK(hipMalloc(&cyc, iters * sizeof(unsigned long long)));
+  HIP_CHECK(hipMalloc(&cyc, (iters + 2) * sizeof(unsigned long long)));
+  HIP_CHECK(hipMalloc(&trips, kGrid * sizeof(unsigned long long)));
   HIP_CHECK(hipMalloc(&w, bytes)); HIP_CHECK(hipMalloc(&sink, kGrid * sizeof(float)));
   HIP_CHECK(hipMemset(ping, 0, 64)); HIP_CHECK(hipMemset(pong, 0, 64));
   HIP_CHECK(hipMemset(stop, 0, 64)); HIP_CHECK(hipMemset(w, 1, bytes));
-  hipLaunchKernelGGL(event_pingpong_loaded, dim3(kGrid), dim3(kBlock), 0, 0,
-                     ping, pong, cyc, iters, w, (long long)(bytes / sizeof(float4)),
-                     sink, stop);
-  HIP_CHECK(hipDeviceSynchronize());
-  std::vector<unsigned long long> h(iters);
-  HIP_CHECK(hipMemcpy(h.data(), cyc, iters * sizeof(h[0]), hipMemcpyDeviceToHost));
+  HIP_CHECK(hipMemset(trips, 0, kGrid * sizeof(unsigned long long)));
+
+  int per_cu = 0;
+  HIP_CHECK(hipOccupancyMaxActiveBlocksPerMultiprocessor(
+      &per_cu, (const void*)event_pingpong_loaded, kBlock, 0));
+  if (per_cu < 1) { std::fprintf(stderr, "(e): kernel does not fit one block per CU\n"); std::exit(1); }
+  long long n4 = (long long)(bytes / sizeof(float4));
+  void* args[] = {&ping, &pong, &cyc, (void*)&iters, &w, &n4, &sink, &stop, &trips};
+  hipEvent_t a, b;
+  HIP_CHECK(hipEventCreate(&a)); HIP_CHECK(hipEventCreate(&b));
+  HIP_CHECK(hipEventRecord(a));
+  HIP_CHECK(hipLaunchCooperativeKernel((const void*)event_pingpong_loaded, dim3(kGrid),
+                                       dim3(kBlock), args, 0, nullptr));
+  HIP_CHECK(hipEventRecord(b));
+  HIP_CHECK(hipEventSynchronize(b));
+  float ms = 0; HIP_CHECK(hipEventElapsedTime(&ms, a, b));
+
+  std::vector<unsigned long long> h(iters + 2), tr(kGrid);
+  HIP_CHECK(hipMemcpy(h.data(), cyc, h.size() * sizeof(h[0]), hipMemcpyDeviceToHost));
+  HIP_CHECK(hipMemcpy(tr.data(), trips, tr.size() * sizeof(tr[0]), hipMemcpyDeviceToHost));
+  *cross_xcd = h[iters] != h[iters + 1];
+  double loads = 0;
+  for (auto t : tr) loads += (double)t * 4 * kBlock;              // float4 loads
+  *load_tbs = loads * sizeof(float4) / (ms * 1e-3) / 1e12;
+  h.resize(iters);
+  HIP_CHECK(hipEventDestroy(a)); HIP_CHECK(hipEventDestroy(b));
   HIP_CHECK(hipFree(ping)); HIP_CHECK(hipFree(pong)); HIP_CHECK(hipFree(stop));
-  HIP_CHECK(hipFree(cyc)); HIP_CHECK(hipFree(w)); HIP_CHECK(hipFree(sink));
+  HIP_CHECK(hipFree(cyc)); HIP_CHECK(hipFree(trips)); HIP_CHECK(hipFree(w));
+  HIP_CHECK(hipFree(sink));
   return summarise(std::move(h), ns);
 }
 
@@ -468,9 +511,10 @@ int main(int argc, char** argv) {
               "thread 0 acquires on another XCD, every word checked, %d rounds\n", iters);
   bool cross_d = false;
   const unsigned stale = run_payload(iters, &cross_d);
+  const bool payload_ok = !stale && cross_d;
   std::printf("    stale words: %u of %llu  [%s]%s\n\n", stale,
-              (unsigned long long)iters * kPayloadWords, stale ? "FAIL" : "PASS",
-              cross_d ? "" : "   !! producer and consumer were on the SAME XCD");
+              (unsigned long long)iters * kPayloadWords, payload_ok ? "PASS" : "FAIL",
+              cross_d ? "" : "   !! producer and consumer were on the SAME XCD: not a cross-XCD result");
   if (stale) {
     std::printf("    the release/acquire protocol does not publish the workgroup's stores; "
                 "stop here — every number below is meaningless until this passes\n");
@@ -502,9 +546,12 @@ int main(int argc, char** argv) {
 
   const size_t bytes = 2ull << 30;  // 2 GiB, larger than the 256 MB LLC
   std::printf("(e) cross-XCD event round-trip while 302 workgroups stream HBM (us)\n");
-  Stats loaded = run_event_loaded(iters, ns, bytes);
-  std::printf("    median %6.2f  p95 %6.2f   (idle: %.2f)  <- the value for design.md §9\n\n",
-              loaded.median / 1e3, loaded.p95 / 1e3, wbl2.median / 1e3);
+  double load_tbs = 0; bool cross_e = false;
+  Stats loaded = run_event_loaded(iters, ns, bytes, &load_tbs, &cross_e);
+  std::printf("    median %6.2f  p95 %6.2f   (idle: %.2f)  under %.2f TB/s of streaming load"
+              "  <- the value for design.md §9%s\n\n",
+              loaded.median / 1e3, loaded.p95 / 1e3, wbl2.median / 1e3, load_tbs,
+              cross_e ? "" : "\n    !! the pair was on the SAME XCD");
 
   std::printf("(c) register-streamed read bandwidth by in-flight depth\n");
   double bw[6] = {};
@@ -525,18 +572,18 @@ int main(int argc, char** argv) {
         "  \"payload_stale_words\": %u, \"payload_cross_xcd\": %s,\n"
         "  \"event_cached_us\": {\"median\": %.3f, \"p95\": %.3f},\n"
         "  \"event_uncached_us\": {\"median\": %.3f, \"p95\": %.3f},\n"
-        "  \"event_loaded_us\": {\"median\": %.3f, \"p95\": %.3f},\n"
+        "  \"event_loaded_us\": {\"median\": %.3f, \"p95\": %.3f, \"load_tbs\": %.3f, \"cross_xcd\": %s},\n"
         "  \"xcd_local_us\": {\"median\": %.4f, \"p95\": %.4f},\n"
         "  \"gemv_tbs\": [%.3f, %.3f, %.3f, %.3f, %.3f, %.3f],\n"
         "  \"gemv_best_tbs\": %.3f\n}\n",
         prop.name, prop.gcnArchName, prop.multiProcessorCount,
         stale, cross_d ? "true" : "false",
         wbl2.median / 1e3, wbl2.p95 / 1e3, wt.median / 1e3, wt.p95 / 1e3,
-        loaded.median / 1e3, loaded.p95 / 1e3,
+        loaded.median / 1e3, loaded.p95 / 1e3, load_tbs, cross_e ? "true" : "false",
         loc.median / 1e3, loc.p95 / 1e3,
         bw[0], bw[1], bw[2], bw[3], bw[4], bw[5], best);
     std::fclose(f);
     std::printf("\nwrote %s\n", json_path);
   }
-  return stale ? 1 : 0;
+  return payload_ok ? 0 : 1;
 }
