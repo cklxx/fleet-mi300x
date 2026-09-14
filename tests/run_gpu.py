@@ -30,6 +30,8 @@ from __future__ import annotations
 
 import argparse
 import filecmp
+import shutil
+import struct
 import re
 import subprocess
 import sys
@@ -88,15 +90,20 @@ def main() -> int:
     # 1. the memory model, measured rather than asserted
     if (BUILD / "microbench").exists():
         rc, out = run([BUILD / "microbench"], timeout=1800)
-        verdicts = re.findall(r"\((d'*)\)[^\n]*\n\s+stale words: ([^\[]+)\[(\w+)\]", out)
+        verdicts = re.findall(r"\((d'*)\)[^\n]*\n\s+stale words: ([^\[]+)\[([^\]]+)\]", out)
         seen = {v[0]: (v[1].strip(), v[2]) for v in verdicts}
         for tag, must in (("d", True), ("d'", True), ("d'''", True), ("d''", False)):
             if tag not in seen:
-                add(f"microbench ({tag})", "not reported", not must)
+                add(f"microbench ({tag})", "not reported", not must,
+                    None if must else "INFO")
                 continue
             words, verdict = seen[tag]
+            # the uncached variant is expected to fail on this VM: MTYPE-UC
+            # memory is not fence-free here, which is why --coherent-acts
+            # uses agent-scope atomics. Report it, do not score it green.
             add(f"microbench ({tag})", f"{words} [{verdict}]",
-                (verdict == "PASS") if must else True)
+                verdict.startswith("PASS") if must else True,
+                None if must else "INFO")
     else:
         add("microbench", "build/microbench missing", False)
 
@@ -155,22 +162,50 @@ def main() -> int:
     add("bitwise determinism", "two runs, layer dumps identical" if same
         else "layer dumps differ or missing", same)
 
-    # 8. a wait that cannot be satisfied must abort, not hang
-    # the wait loop only evaluates the limit every 1024 polls, so a limit
-    # below that can never fire
-    rc, out = run([NT, "--graph", DEFAULT_GRAPH, "--tokens", 2, "--spin-limit", 2048],
-                  timeout=300)
-    aborted = "abort" in out.lower()
-    add("abort path (tiny spin limit)", "reported" if aborted else "no abort reported",
-        aborted and rc != 0)
+    # 8. a wait that can never be satisfied must end the launch with a
+    #    reason code instead of hanging the GPU. Lowering the spin limit does
+    #    not create a stuck wait, it only lowers the threshold for declaring
+    #    one, and the loop evaluates that threshold every 1024 polls. So the
+    #    graph itself is broken here: one descriptor is given a wait count
+    #    that no number of producers can ever reach.
+    sys.path.insert(0, str(ROOT / "src" / "host"))
+    from taskgraph import PACK_FIELDS, PACK_FORMAT   # noqa: E402
+
+    blob = bytearray(DEFAULT_GRAPH.read_bytes())
+    broken_event = None
+    for i in range(len(blob) // 64):
+        f = dict(zip(PACK_FIELDS, struct.unpack_from(PACK_FORMAT, blob, 64 * i)))
+        if f["wait_event"] >= 0 and f["kind"] != 10:      # 10 = EMBED
+            f["wait_count"] = 9999
+            struct.pack_into(PACK_FORMAT, blob, 64 * i, *[f[k] for k in PACK_FIELDS])
+            broken_event = f["wait_event"]
+            break
+    if broken_event is None:
+        add("abort on an unsatisfiable wait", "no waiting descriptor found", False)
+    else:
+        bg = BUILD / "taskgraph_broken.bin"
+        bg.write_bytes(bytes(blob))
+        side = Path(str(DEFAULT_GRAPH) + ".events.txt")
+        if side.exists():
+            shutil.copy(side, str(bg) + ".events.txt")
+        rc, out = run([NT, "--graph", bg, "--tokens", 1, "--spin-limit", 1 << 18],
+                      timeout=600)
+        line = next((l.strip() for l in out.splitlines()
+                     if l.lower().startswith("abort")), "no abort line")
+        add("abort on an unsatisfiable wait", f"event {broken_event}: {line[:50]}",
+            rc != 0 and "abort" in out.lower())
 
     good = sum(1 for r in rows if r[2] == "PASS")
     bad = [n for n, _, st in rows if st == "FAIL"]
     skipped = [n for n, _, st in rows if st == "SKIP"]
-    print(f"\n{good}/{len(rows)} GPU gates passed"
+    info = sum(1 for r in rows if r[2] == "INFO")
+    # an informational row is neither a pass nor a failure: counting it in the
+    # denominator made a clean run read as 18/19 and exit non-zero
+    print(f"\n{good}/{len(rows) - info} GPU gates passed"
+          + (f", {info} informational" if info else "")
           + (f" — failed: {', '.join(bad)}" if bad else "")
           + (f" — skipped for missing inputs: {', '.join(skipped)}" if skipped else ""))
-    return 0 if good == len(rows) else 1
+    return 0 if not bad and not skipped else 1
 
 
 if __name__ == "__main__":
