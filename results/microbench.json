@@ -6,9 +6,9 @@
   "payload_uncached_stale_words": 12281856, "payload_uncached_cross_xcd": true,
   "payload_atomic_stale_words": 0, "payload_atomic_cross_xcd": true,
   "event_cached_us": {"median": 1.360, "p95": 1.560},
-  "event_uncached_us": {"median": 1.360, "p95": 1.440},
-  "event_loaded_us": {"median": 6.360, "p95": 7.520, "load_tbs": 1.675, "cross_xcd": true},
+  "event_uncached_us": {"median": 1.640, "p95": 1.800},
+  "event_loaded_us": {"median": 5.960, "p95": 7.160, "load_tbs": 1.654, "cross_xcd": true},
   "xcd_local_us": {"median": 1.3200, "p95": 1.4800},
-  "gemv_tbs": [2.667, 3.407, 3.777, 4.283, 4.194, 3.804],
-  "gemv_best_tbs": 4.283
+  "gemv_tbs": [2.644, 3.414, 3.768, 4.275, 4.188, 3.807],
+  "gemv_best_tbs": 4.275
 }

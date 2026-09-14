@@ -246,7 +246,10 @@ __device__ __forceinline__ void epi_st(float* p, float v, bool coh) {
             break;                                                              \
         case EPI_RESIDUAL: epi_st(y + (N), bf16_round(epi_ld(residual + (N), coh) + bf16_round(V)), coh); break; \
         case EPI_ACC:      y[N] += (V); break;                                  \
-        case EPI_BF16_ACC: epi_st(y + (N), bf16_round(scale * bf16_round(residual[N] + (V))), coh); break; \
+        case EPI_BF16_ACC:                                                      \
+            if (y16 != nullptr) y16[N] = __float2bfloat16(bf16_round(scale * bf16_round(residual[N] + (V)))); \
+            else epi_st(y + (N), bf16_round(scale * bf16_round(residual[N] + (V))), coh); \
+            break;                                                              \
         default:           epi_st(y + (N), (V), coh);                           \
     }
 

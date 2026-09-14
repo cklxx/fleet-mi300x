@@ -156,7 +156,9 @@ def main() -> int:
         else "layer dumps differ or missing", same)
 
     # 8. a wait that cannot be satisfied must abort, not hang
-    rc, out = run([NT, "--graph", DEFAULT_GRAPH, "--tokens", 2, "--spin-limit", 64],
+    # the wait loop only evaluates the limit every 1024 polls, so a limit
+    # below that can never fire
+    rc, out = run([NT, "--graph", DEFAULT_GRAPH, "--tokens", 2, "--spin-limit", 2048],
                   timeout=300)
     aborted = "abort" in out.lower()
     add("abort path (tiny spin limit)", "reported" if aborted else "no abort reported",
