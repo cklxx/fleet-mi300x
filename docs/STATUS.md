@@ -77,6 +77,36 @@ the decode kernel is written before the crash; both tools agree
 | **v0.16** — three more candidates, all measured, all rejected: publish the top-k once per XCD instead of per task; prefetch the next task's first rows across its event wait; re-test `--coherent-acts` on an equal graph | 3.661–3.665 ms, i.e. unchanged | the publication trades 4 µs of gate_up prologue for 6 µs of serialised router tail — the same shape as the v0.11 one-writer fold; the prefetch's 8 held loads cost 4%; the coherent protocol is within noise of the fenced one. The kernel keeps all three behind flags and ships none |
 | **v0.17** — the expert partials stored as bf16 | **3.643 ms** vs 3.652–3.659 over three alternating pairs, about 0.4% | the fold reads 72 KB per worker in 4.8 µs, which is 15 GB/s against a 14.2 GB/s per-worker ceiling: bandwidth-bound, and that is why vectorising it to float4 earlier changed nothing. The partials are bf16-valued already (EPI_BF16), so storing them narrower is bit-exact — 32/32 tokens and 27/27 layers unchanged. Predicted 1.5%, measured 0.4%; the rest of the fold's cost is not bytes |
 
+### One probe, two optimisations closed
+
+`microbench (g)` streams a single buffer from 1, 37, 148 and 296 workgroups
+at once, over four working sets. It costs nothing to run and it answered two
+open questions that would otherwise have cost a kernel rewrite each.
+
+| working set | 1 | 37 | 148 | 296 | concurrent workgroups |
+|---|---|---|---|---|---|
+| 128 KB | 50.3 | 48.5 | 48.2 | 47.1 | per-worker GB/s |
+| 1 MB | 49.1 | 49.6 | 49.4 | 48.3 | |
+| 8 MB | 27.8 | 28.2 | 27.6 | 25.9 | |
+| 64 MB | 27.4 | 28.0 | 27.6 | 25.8 | |
+
+Every row is flat: going from one reader to 296 readers of the same bytes
+costs at most 6%. **Sharing is free, so merging two attention heads into one
+task cannot pay.** That idea only earns anything if an XCD's L2 is the
+bottleneck under concurrency, and it is not; it would also cost per-lane
+registers on a kernel already at one wave per SIMD.
+
+Every column falls once, between 1 MB and 8 MB, and then stops falling. That
+is the per-XCD L2 capacity boundary (4 MB), not paging: a TLB effect would
+keep degrading from 8 MB to 64 MB and it does not. **So the page-size A/B
+has nothing to measure**, and the expert GEMV's 77% of the per-worker ceiling
+is a capacity and locality effect rather than a paging one.
+
+Note what the probe does not say: at 296 readers of 64 MB the aggregate is
+7.6 TB/s, above the 4.2 TB/s HBM ceiling, so even the largest working set
+here is being served by the Infinity Cache. This measures cache bandwidth,
+not HBM.
+
 Tried and rejected by measurement: two workgroups per CU (6.5 ms: the
 kernel's 256 VGPRs leave no room for a second wave per SIMD); workers polling
 the global counters directly instead of the scheduler mirror (slower);
