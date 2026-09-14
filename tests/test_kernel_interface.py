@@ -154,8 +154,12 @@ def main() -> int:
                          "fence_release()" in sig and "__hip_atomic_fetch_add" in sig))
     results.append(check("wait_event acquires on both scopes",
                          "fence_acquire_local()" in wait and "fence_acquire()" in wait))
+    # inside the function, not anywhere in the file: the comment above it
+    # names the instruction too, and a check the comment can satisfy is not
+    # a check on the code
+    loc = body(r, "void fence_acquire_local")
     results.append(check("the XCD-local acquire is the L1-only one",
-                         "buffer_inv sc0" in r))
+                         "buffer_inv sc0" in loc and "buffer_inv sc1" not in loc))
     # measured: dropping the producer-side writeback made 10 of 18 launches
     # produce wrong tokens even though the fence-free bench passes (STATUS.md)
     results.append(check("the producer writeback is unconditional",

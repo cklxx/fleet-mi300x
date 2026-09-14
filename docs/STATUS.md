@@ -197,7 +197,7 @@ happening to be zero; the routing weight is multiplied by
 |---|---|---|
 | `src/host/model_analysis.py` | Per-token HBM byte accounting from `config.json` | Reproduces design.md §1 exactly: attention 27.53 MB/layer, one routed expert 17.30 MB, MoE layer 166.20 MB, lm_head 419.43 MB, **4.935 GB/token**, 31.41 GB resident, floor 0.93 ms @ 5.3 TB/s |
 | `src/host/taskgraph.py` | Builds + validates the Fleet task DAG, fans Chiplet-tasks out to per-worker descriptors, emits them with an event-label sidecar | v0.13 graph (`--kv-chunks 16`): 552 logical tasks / 1,992 descriptors per MoE layer, 2 global + 48 XCD-local events per layer; 14,914 logical / 54,082 descriptors and 1,346 events (58 global) per token; `--report` prints the counts and the validator's verdict |
-| `tests/test_queue_simulation.py` | Executes the emitted queues under the kernel's protocol: 296 queues in order, monotonic counters, targets `epoch × wait_count`, XCD-local visibility, per-wave chunk arrivals, 3 epochs, forward/reverse/random worker order | 15/15 over three graphs; the sabotage cases (old signal-side count, missing last-arrival rule) are reported |
+| `tests/test_queue_simulation.py` | Executes the emitted queues under the kernel's protocol: 296 queues in order, monotonic counters, targets `epoch × wait_count`, XCD-local visibility, per-wave chunk arrivals, 3 epochs, forward/reverse/random worker order | 30/30 over five graph variants; the sabotage cases (old signal-side count, missing last-arrival rule) are reported |
 | `src/host/reference_decode.py` | NumPy absorbed-MLA decode: the arithmetic each HIP task must reproduce | Boundary tests below |
 | `src/host/kv_convert.py`, `reference_run.py` | prefill → decode cache `[27][1056][576]` bf16 (32.8 MB) and greedy tokens, written from the *same* HF prefill the launcher is compared against | Layout arithmetic matches §5; reconstruction check needs the model |
 | `tests/test_absorbed_equivalence.py` | Absorbed MLA ≡ materialised K/V; RoPE interleave; softmax scale | 4/4 pass, max rel 4.6e-7 |
@@ -209,6 +209,54 @@ happening to be zero; the routing weight is multiplied by
 | `src/host/pack_weights.py` | Flat bf16 blob, 256-B aligned, fused q‖kv_a, interleaved gate/up, `.manifest` the launcher parses | Syntax and CLI only; needs the checkpoint |
 | `scripts/hotaisle_bootstrap.sh` (`setup_env.sh` is the generic form) | Fresh Ubuntu + ROCm box to results, unattended: venv, torch/transformers, model download, the seven local tests, both binaries, graphs, microbench, smoke, reference run, packing, the headline decodes, the variants, a best-effort rocprof byte count | Run from scratch on every new VM (three times) |
 | `tests/test_expert_addressing.py` | Builds the packer's byte layout, resolves the 8 units as `expert.h` does, runs the kernel's arithmetic with HF's rounding points against `reference_decode.moe` | 7/7: routing exact, phase output within 4.1e-3 of the reference (bf16-ulp level), and the pre-review offsets produce a 37% error that the test reports |
+
+### The test suite, and what an audit of it found
+
+`python3 tests/run_all.py` is the single entry point: the unit tests (found
+by glob, so a new file is picked up without editing a list), the graph
+validator on all seven flag combinations the builder supports, and the HIP
+parse of the three translation units in both passes and in the non-temporal
+build. `--mutate` adds the gate below. Eighteen gates, all green.
+
+The suite was then audited by injecting realistic regressions into the code
+each test covers and re-running it. Two suites caught nothing at all:
+`test_row_partition` and `test_expert_addressing` re-implemented the
+production formula in Python and compared the mirror with itself, so no
+mutation was detectable. Both are now pinned to their sources: the row split
+reads the constants out of the headers and asserts that `xcd_rows` and the
+interleaved worker stride still read the way the mirror models them, and the
+expert layout asserts the four addresses in `expert.h` that the first review
+got wrong once already.
+
+The highest-risk gap was the memory model. Deleting the producer-side
+release or the XCD-local acquire passed every test and the parse gate, on
+the one mechanism the design rests on. `test_kernel_interface` now asserts
+both fences, that the XCD-local acquire is the L1-only `buffer_inv sc0`
+inside `fence_acquire_local` rather than anywhere in the file, and that the
+producer writeback is unconditional, which is the invariant measured above.
+
+`taskgraph.validate()` was 130 lines that no test ever called.
+`test_validator` builds all six graph variants and sabotages each the way a
+real edit would. Writing it exposed a hole in the validator itself: it kept
+one per-XCD share per (event, XCD), so a single wrong descriptor was
+overwritten by the 36 that followed it and never reported.
+
+| file | what it is | count |
+|---|---|---|
+| `tests/run_all.py` | every gate that runs without a GPU, one exit code | 18 gates |
+| `tests/mutate.py` | breaks the code on purpose, requires the suite to notice | 12 mutations |
+| `tests/test_queue_simulation.py` | the event protocol executed on the CPU over five graph variants | 30 |
+| `tests/test_kernel_interface.py` | kernel, runtime header and launcher cross-checks, including the fences | 19 |
+| `tests/test_validator.py` | the graph validator against nine sabotages | 16 |
+| `tests/test_row_partition.py` | every GEMV row owned once, pinned to the headers | 17 |
+| `tests/test_expert_addressing.py` | packed expert layout and slot resolution, pinned to `expert.h` | 11 |
+| `tests/test_reference_vs_hf.py` | the NumPy reference against HuggingFace | 8 boundaries |
+| `tests/test_descriptor_layout.py` | host packer and device struct, byte for byte | 6 |
+| `tests/test_absorbed_equivalence.py` | absorbed MLA equals the materialised path | 4 |
+
+Two mutation rows are marked redundant on purpose: the validator carries two
+overlapping XCD-locality checks, and deleting either alone is invisible
+while deleting both is caught. That is recorded rather than papered over.
 
 ## Decisions the design text did not make, made here
 

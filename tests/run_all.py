@@ -16,6 +16,7 @@ hotaisle_bootstrap.sh call before any machine time is bought.
 
     python3 tests/run_all.py            # everything
     python3 tests/run_all.py --quick    # unit tests + graphs, skip the parse
+    python3 tests/run_all.py --mutate   # everything + the mutation gate
 """
 from __future__ import annotations
 
@@ -50,6 +51,9 @@ def run(cmd: list[str], cwd: Path = ROOT) -> tuple[int, str]:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--quick", action="store_true", help="skip the HIP parse")
+    ap.add_argument("--mutate", action="store_true",
+                    help="also break the code on purpose and require the suite to notice "
+                         "(tests/mutate.py, about a minute)")
     a = ap.parse_args()
 
     rows: list[tuple[str, str, str, bool]] = []
@@ -87,6 +91,11 @@ def main() -> int:
             errs = sum(1 for l in out.splitlines() if "error:" in l)
             rows.append((label, f"{ok}/6 translation units clean, {errs} errors",
                          "", p.returncode == 0 and errs == 0))
+
+    if a.mutate:
+        rc, out = run([PY, str(ROOT / "tests" / "mutate.py")])
+        tail = [l for l in out.splitlines() if "behaved as expected" in l]
+        rows.append(("mutation gate", tail[-1].strip() if tail else "no verdict", "", rc == 0))
 
     width = max(len(r[0]) for r in rows)
     print()
