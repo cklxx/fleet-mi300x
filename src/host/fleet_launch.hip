@@ -321,7 +321,7 @@ static void report_trace(const std::vector<TaskDescriptor>& tasks,
                          const std::vector<uint64_t>& tr, int token,
                          const std::string& path) {
     uint64_t t0 = ~0ull, t1 = 0;
-    struct Agg { double busy = 0, wait = 0; int n = 0; };
+    struct Agg { double busy = 0, wait = 0, pro = 0; int n = 0; };
     std::map<int, Agg> by_kind;
     std::map<int, std::pair<uint64_t, uint64_t>> by_layer;
     for (size_t i = 0; i < tasks.size(); ++i) {
@@ -331,6 +331,7 @@ static void report_trace(const std::vector<TaskDescriptor>& tasks,
         Agg& a = by_kind[t.kind];
         a.busy += (double)(tr[4 * i + 2] - tr[4 * i + 1]);
         a.wait += (double)(tr[4 * i + 1] - tr[4 * i]);
+        a.pro += (double)(tr[4 * i + 3] >> 8);
         ++a.n;
         auto& L = by_layer[t.layer];
         if (L.first == 0) L = {tr[4 * i + 1], tr[4 * i + 2]};
@@ -339,10 +340,10 @@ static void report_trace(const std::vector<TaskDescriptor>& tasks,
     if (t1 == 0) { std::printf("trace: empty\n"); return; }
     const double us = 0.01;   // 100 MHz ticks -> us
     std::printf("\ntrace of token %d: %.3f ms from first wait to last signal\n", token, (t1 - t0) * us / 1e3);
-    std::printf("  %-15s %6s %10s %10s %10s\n", "kind", "tasks", "busy-sum", "wait-sum", "avg-busy");
+    std::printf("  %-15s %6s %10s %10s %10s %12s\n", "kind", "tasks", "busy-sum", "wait-sum", "avg-busy", "avg-prologue");
     for (auto& [k, a] : by_kind) {
-        std::printf("  %-15s %6d %8.2f ms %8.2f ms %8.1f us\n", kKindNames[k], a.n,
-                    a.busy * us / 1e3, a.wait * us / 1e3, a.busy * us / a.n);
+        std::printf("  %-15s %6d %8.2f ms %8.2f ms %8.1f us %10.1f us\n", kKindNames[k], a.n,
+                    a.busy * us / 1e3, a.wait * us / 1e3, a.busy * us / a.n, a.pro * us / a.n);
     }
     std::printf("  per-layer span (first task ready -> last task signalled): ");
     double sum_layers = 0;
@@ -414,6 +415,7 @@ int main(int argc, char** argv) {
     for (const auto& t : tasks) {
         max_event = std::max(max_event, (int)t.signal_event);
         if (t.kind == TASK_ATTENTION) kv_chunks = std::max(kv_chunks, (int)t.n_split);
+        if (kv_chunks > kMaxKvChunks) die("graph kv_chunks exceeds kMaxKvChunks (fleet_types.h)");
         if (t.signal_event >= 0 && t.signal_scope == SCOPE_GLOBAL) {
             if ((int)is_global.size() <= t.signal_event) is_global.resize(t.signal_event + 1, 0);
             is_global[t.signal_event] = 1;
@@ -565,7 +567,8 @@ int main(int argc, char** argv) {
         // activations (§5)
         // cross-XCD activations (x, the fold partials, the logits) go uncached
         // with --uncached-acts; everything XCD-local stays in that XCD's L2
-        act.x = dev_alloc_uc<float>(d.hidden, uncached_acts);
+        act.x[0] = dev_alloc_uc<float>(d.hidden, uncached_acts);
+        act.x[1] = dev_alloc_uc<float>(d.hidden, uncached_acts);
         act.x_norm = dev_alloc<float>((size_t)kNumXCDs * d.hidden);
         act.q = dev_alloc<float>((size_t)d.heads * d.q_head_dim);
         act.kv_a = dev_alloc<float>((size_t)kNumXCDs * (d.kv_lora + d.qk_rope));
@@ -573,7 +576,10 @@ int main(int argc, char** argv) {
         act.o = dev_alloc<float>((size_t)d.heads * d.v_head);
         act.expert_h = dev_alloc<float>(std::max((size_t)kNumXCDs * d.moe_inter, (size_t)d.dense_inter));
         act.expert_out = dev_alloc_uc<float>((size_t)kNumXCDs * d.hidden, uncached_acts);
+        act.oproj_partial = dev_alloc_uc<float>((size_t)kNumXCDs * d.hidden, uncached_acts);
         act.logits = dev_alloc_uc<float>(d.vocab, uncached_acts);
+        act.argmax_val = dev_alloc_uc<float>((size_t)kNumXCDs * kWorkersPerXCD, uncached_acts);
+        act.argmax_idx = dev_alloc_uc<int32_t>((size_t)kNumXCDs * kWorkersPerXCD, uncached_acts);
         act.router_logits = dev_alloc<float>((size_t)kNumXCDs * d.n_routed);
         act.layer_dump = dev_alloc<float>((size_t)d.layers * d.hidden);
 

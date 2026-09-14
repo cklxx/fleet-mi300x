@@ -1,0 +1,22 @@
+  consecutive layers within the gate: 27 of 27
+
+trace of token 1: 4.964 ms from first wait to last signal
+  kind             tasks   busy-sum   wait-sum   avg-busy
+  QKV_FUSED         7992   159.36 ms    98.19 ms     19.9 us
+  ATTENTION         3456    76.00 ms     2.62 ms     22.0 us
+  MERGE_UV          3456    29.78 ms    80.66 ms      8.6 us
+  O_PROJ            7992    88.16 ms    70.15 ms     11.0 us
+  NORM_ROUTER       7992    81.89 ms    59.19 ms     10.2 us
+  EXPERT_GATE_UP    7696   289.61 ms     6.17 ms     37.6 us
+  EXPERT_DOWN       7696   303.79 ms     6.33 ms     39.5 us
+  DENSE_GATE_UP      296     9.58 ms     0.24 ms     32.3 us
+  DENSE_DOWN         296     6.29 ms     1.17 ms     21.2 us
+  EMBED                1     0.01 ms     0.13 ms      5.6 us
+  LM_HEAD            296    39.96 ms     2.15 ms    135.0 us
+  ARGMAX               1     0.12 ms     0.00 ms    121.1 us
+  per-layer span (first task ready -> last task signalled): L0 145 us  L1 172 us  L2 171 us  L26 170 us  ... sum 4.54 ms
+wrote results/trace_v11_base.bin (47170 descriptors x 4 uint64: wait-start, ready, done, xcd; 10 ns ticks)
+
+per-token latency (embed -> argmax on device): median 4.808 ms  p95 4.828 ms  mean 4.810 ms  (207.9 tok/s)
+wall time of the launches: 167.798 ms for 32 tokens = 5.244 ms/token (190.7 tok/s), 1 launch(es)
+tokens: 32/32 match HF greedy

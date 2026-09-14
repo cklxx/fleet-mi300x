@@ -167,7 +167,11 @@ __device__ __forceinline__ unsigned mix(unsigned i, unsigned idx) {
 // uncached_acts): the payload is in MTYPE-UC memory, the producer only
 // drains its stores (s_waitcnt) before the relaxed atomic, the consumer only
 // polls — no L2 writeback, no L2 invalidate anywhere.
-template <bool FENCED>
+// MODE 0: the fenced protocol. MODE 1: plain loads/stores, no fences (only
+// sound if the memory is truly uncached). MODE 2: no fences, every payload
+// access is an agent-scope relaxed atomic (global_load/store sc1: bypasses
+// the non-coherent L2 by the memory model, on ordinary cached memory).
+template <int MODE>
 __global__ __launch_bounds__(kBlock) void payload_visibility(
     unsigned* __restrict__ payload, unsigned* __restrict__ flag_a,
     unsigned* __restrict__ flag_b, unsigned* __restrict__ errors,
@@ -181,11 +185,13 @@ __global__ __launch_bounds__(kBlock) void payload_visibility(
   for (int i = 1; i <= iters; ++i) {
     if (is_producer) {
       for (int k = threadIdx.x; k < kPayloadWords; k += blockDim.x) {
-        payload[k] = mix((unsigned)i, (unsigned)k);   // all four waves store
+        if (MODE == 2) __hip_atomic_store(payload + k, mix((unsigned)i, (unsigned)k),
+                                          __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        else payload[k] = mix((unsigned)i, (unsigned)k);   // all four waves store
       }
       __syncthreads();                                // the kernel's barrier
       if (threadIdx.x == 0) {
-        if (FENCED) {
+        if (MODE == 0) {
           signal(flag_a);                             // release + atomic, thread 0 only
           wait_for(flag_b, (unsigned)i);
         } else {
@@ -197,18 +203,21 @@ __global__ __launch_bounds__(kBlock) void payload_visibility(
       __syncthreads();
     } else {
       if (threadIdx.x == 0) {                         // poll (+ acquire), thread 0 only
-        if (FENCED) wait_for(flag_a, (unsigned)i);
-        else        while (poll(flag_a) < (unsigned)i) { __builtin_amdgcn_s_sleep(1); }
+        if (MODE == 0) wait_for(flag_a, (unsigned)i);
+        else           while (poll(flag_a) < (unsigned)i) { __builtin_amdgcn_s_sleep(1); }
       }
       __syncthreads();
       unsigned bad = 0;
       for (int k = threadIdx.x; k < kPayloadWords; k += blockDim.x) {
-        bad += payload[k] != mix((unsigned)i, (unsigned)k);
+        const unsigned v = (MODE == 2)
+            ? __hip_atomic_load(payload + k, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT)
+            : payload[k];
+        bad += v != mix((unsigned)i, (unsigned)k);
       }
       if (bad) atomicAdd(errors, bad);
       __syncthreads();
       if (threadIdx.x == 0) {
-        if (FENCED) signal(flag_b);
+        if (MODE == 0) signal(flag_b);
         else __hip_atomic_fetch_add(flag_b, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
       }
     }
@@ -593,11 +602,12 @@ static Stats run_event(int scheme, int iters, double ns, bool* cross_xcd) {
 }
 
 // (d): returns the number of stale words seen over all iterations.
-// uncached: payload and flags in MTYPE-UC memory, protocol without fences (d'').
-static unsigned run_payload(int iters, bool* cross_xcd, bool uncached = false) {
+// mode 1: payload and flags in MTYPE-UC memory, protocol without fences.
+// mode 2: ordinary memory, no fences, agent-scope atomic payload accesses.
+static unsigned run_payload(int iters, bool* cross_xcd, int mode = 0) {
   unsigned *payload, *flags, *errors;
   unsigned long long* ids;
-  if (uncached) {
+  if (mode == 1) {
     HIP_CHECK(hipExtMallocWithFlags((void**)&payload, kPayloadWords * sizeof(unsigned),
                                     hipDeviceMallocUncached));
     HIP_CHECK(hipExtMallocWithFlags((void**)&flags, 256, hipDeviceMallocUncached));
@@ -610,11 +620,14 @@ static unsigned run_payload(int iters, bool* cross_xcd, bool uncached = false) {
   HIP_CHECK(hipMemset(payload, 0, kPayloadWords * sizeof(unsigned)));
   HIP_CHECK(hipMemset(flags, 0, 256));
   HIP_CHECK(hipMemset(errors, 0, sizeof(unsigned)));
-  if (uncached) {
-    hipLaunchKernelGGL(payload_visibility<false>, dim3(kGrid), dim3(kBlock), 0, 0,
+  if (mode == 1) {
+    hipLaunchKernelGGL(payload_visibility<1>, dim3(kGrid), dim3(kBlock), 0, 0,
+                       payload, flags, flags + 16, errors, ids, iters);
+  } else if (mode == 2) {
+    hipLaunchKernelGGL(payload_visibility<2>, dim3(kGrid), dim3(kBlock), 0, 0,
                        payload, flags, flags + 16, errors, ids, iters);
   } else {
-    hipLaunchKernelGGL(payload_visibility<true>, dim3(kGrid), dim3(kBlock), 0, 0,
+    hipLaunchKernelGGL(payload_visibility<0>, dim3(kGrid), dim3(kBlock), 0, 0,
                        payload, flags, flags + 16, errors, ids, iters);
   }
   HIP_CHECK(hipDeviceSynchronize());
@@ -745,11 +758,20 @@ int main(int argc, char** argv) {
   std::printf("(d'') the same payload in uncached (MTYPE UC) memory with NO fences: producer drains "
               "stores + relaxed atomic, consumer polls, %d rounds (the --uncached-acts protocol)\n", iters);
   bool cross_uc = false;
-  const unsigned stale_uc = run_payload(iters, &cross_uc, /*uncached=*/true);
+  const unsigned stale_uc = run_payload(iters, &cross_uc, /*mode=*/1);
   const bool payload_uc_ok = !stale_uc && cross_uc;
   std::printf("    stale words: %u of %llu  [%s]%s\n\n", stale_uc,
-              (unsigned long long)iters * kPayloadWords, payload_uc_ok ? "PASS" : "FAIL",
+              (unsigned long long)iters * kPayloadWords, payload_uc_ok ? "PASS" : "INFO: not usable here",
               cross_uc ? "" : "   !! same XCD: not a cross-XCD result");
+
+  std::printf("(d''') ordinary memory, NO fences, every payload access an agent-scope relaxed atomic "
+              "(global_load/store sc1 - the memory model's L2 bypass), %d rounds\n", iters);
+  bool cross_at = false;
+  const unsigned stale_at = run_payload(iters, &cross_at, /*mode=*/2);
+  const bool payload_atomic_ok = !stale_at && cross_at;
+  std::printf("    stale words: %u of %llu  [%s]%s\n\n", stale_at,
+              (unsigned long long)iters * kPayloadWords, payload_atomic_ok ? "PASS" : "FAIL",
+              cross_at ? "" : "   !! same XCD: not a cross-XCD result");
 
   std::printf("(d') %d producers on one XCD, drained stores, ONE last-arriver flush; a same-XCD consumer "
               "(L1-only acquire) and a cross-XCD consumer (L1+L2 acquire) verify every word, %d rounds\n",
@@ -821,6 +843,7 @@ int main(int argc, char** argv) {
         "{\n  \"device\": \"%s\",\n  \"arch\": \"%s\",\n  \"cus\": %d,\n"
         "  \"payload_stale_words\": %u, \"payload_cross_xcd\": %s,\n"
         "  \"payload_uncached_stale_words\": %u, \"payload_uncached_cross_xcd\": %s,\n"
+        "  \"payload_atomic_stale_words\": %u, \"payload_atomic_cross_xcd\": %s,\n"
         "  \"event_cached_us\": {\"median\": %.3f, \"p95\": %.3f},\n"
         "  \"event_uncached_us\": {\"median\": %.3f, \"p95\": %.3f},\n"
         "  \"event_loaded_us\": {\"median\": %.3f, \"p95\": %.3f, \"load_tbs\": %.3f, \"cross_xcd\": %s},\n"
@@ -830,6 +853,7 @@ int main(int argc, char** argv) {
         prop.name, prop.gcnArchName, prop.multiProcessorCount,
         stale, cross_d ? "true" : "false",
         stale_uc, cross_uc ? "true" : "false",
+        stale_at, cross_at ? "true" : "false",
         wbl2.median / 1e3, wbl2.p95 / 1e3, wt.median / 1e3, wt.p95 / 1e3,
         loaded.median / 1e3, loaded.p95 / 1e3, load_tbs, cross_e ? "true" : "false",
         loc.median / 1e3, loc.p95 / 1e3,
@@ -837,5 +861,5 @@ int main(int argc, char** argv) {
     std::fclose(f);
     std::printf("\nwrote %s\n", json_path);
   }
-  return (payload_ok && lastflush_ok && payload_uc_ok) ? 0 : 1;
+  return (payload_ok && lastflush_ok && payload_atomic_ok) ? 0 : 1;
 }

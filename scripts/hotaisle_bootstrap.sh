@@ -13,7 +13,7 @@
 set -uo pipefail
 cd ~/fleet-mi300x
 MODEL=${MODEL_DIR:-$HOME/models/dsv2-lite-base}
-GRAPH=${GRAPH:-build/taskgraph_d8.bin}
+GRAPH=${GRAPH:-build/taskgraph_d16.bin}
 log() { printf '\n=== %s %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 
 log "python"
@@ -55,7 +55,7 @@ cp build/compile.log results/kernel_resource_usage.txt
 # second binary: non-temporal weight streams (§12 step 6), same everything else
 hipcc --offload-arch=gfx942 -O3 -std=c++17 -DFLEET_NT_WEIGHTS=1 -Isrc \
   src/host/fleet_launch.hip src/kernels/fleet_kernel.hip -o build/fleet_decode_nt 2>&1 | grep -E "error"
-for c in 8 4 1; do python3 src/host/taskgraph.py --kv-chunks $c --emit build/taskgraph_d$c.bin | tail -1; done
+for c in 16 8 4 1; do python3 src/host/taskgraph.py --kv-chunks $c --emit build/taskgraph_d$c.bin | tail -1; done
 python3 src/host/taskgraph.py --kv-chunks 8 --prefetch --emit build/taskgraph_d8_prefetch.bin | tail -1
 
 log "microbench"

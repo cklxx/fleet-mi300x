@@ -104,12 +104,10 @@ struct TaskDescriptor {
 static_assert(sizeof(TaskDescriptor) == 64, "descriptor must stay 64 B");
 
 enum TaskFlags : int16_t {
-    FLAG_FOLD_PARTIALS = 1,   // retired
+    FLAG_FOLD_PARTIALS = 1,   // prologue folds the 8 expert partials into the residual
     FLAG_SIGNAL_LAST = 2,     // signal signal_event only as the last of n_split
                               // arrivals on local_event (the merging KV chunk)
-    FLAG_FOLD_ON_LAST = 4,    // the globally last of n_split producers of
-                              // signal_event folds the expert partials into x,
-                              // publishes, and adds the event's final +1
+    FLAG_FOLD_ON_LAST = 4,    // retired (one-writer fold measured slower, STATUS.md)
     FLAG_CHUNK_SIGNAL = 8,    // gate_up: each wave bumps XCD-local counter
                               // local_event + c when its rows of K-chunk c are
                               // stored; kv_chunk = number of chunks

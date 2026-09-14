@@ -293,9 +293,9 @@ __device__ inline void merge_and_uv(
     // Global max across chunks, then a rescaled sum. Fixed chunk order keeps
     // this bitwise reproducible. Every thread derives the same scalars. The
     // chunk loops are unrolled to the compile-time maximum and predicated,
-    // so a thread's loads of the (up to) 8 partials are in flight together
-    // instead of one round trip each (measured: 12.7 us per merge task).
-    constexpr int kMaxChunks = 8;
+    // so a thread's loads of the (up to) kMaxKvChunks partials are in flight
+    // together instead of one round trip each (measured: 12.7 us per merge task).
+    constexpr int kMaxChunks = kMaxKvChunks;
     float m_c[kMaxChunks], l_c[kMaxChunks];
 #pragma unroll
     for (int c = 0; c < kMaxChunks; ++c) {

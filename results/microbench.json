@@ -3,10 +3,11 @@
   "arch": "gfx942:sramecc+:xnack-",
   "cus": 304,
   "payload_stale_words": 0, "payload_cross_xcd": true,
-  "event_cached_us": {"median": 1.600, "p95": 1.760},
-  "event_uncached_us": {"median": 1.440, "p95": 1.560},
-  "event_loaded_us": {"median": 5.880, "p95": 7.400, "load_tbs": 2.204, "cross_xcd": true},
-  "xcd_local_us": {"median": 1.6400, "p95": 1.8000},
-  "gemv_tbs": [2.591, 3.409, 3.757, 4.253, 4.172, 4.145],
-  "gemv_best_tbs": 4.253
+  "payload_uncached_stale_words": 12281856, "payload_uncached_cross_xcd": true,
+  "event_cached_us": {"median": 1.360, "p95": 1.480},
+  "event_uncached_us": {"median": 1.280, "p95": 1.400},
+  "event_loaded_us": {"median": 5.880, "p95": 7.080, "load_tbs": 1.590, "cross_xcd": true},
+  "xcd_local_us": {"median": 1.3600, "p95": 1.4800},
+  "gemv_tbs": [2.658, 3.434, 3.772, 4.355, 4.229, 3.811],
+  "gemv_best_tbs": 4.355
 }

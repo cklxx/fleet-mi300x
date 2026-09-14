@@ -40,7 +40,13 @@ struct Scratch {
     float logits[kMaxRouted];
     int   ids[kMaxTopK];                         // this XCD's routing choice
     float ws[kMaxTopK];
+    uint64_t stamp;                              // trace: end of the task's prologue
+    int   ids_blk[kBlock];                       // lm_head argmax candidate reduction
 };
+
+// Trace sub-phase: thread 0 stamps the end of a task's prologue (staging,
+// norm, routing) so the report can split busy time into prologue and body.
+#define FLEET_STAMP() do { if (tc.trace && threadIdx.x == 0) s.stamp = __builtin_amdgcn_s_memrealtime(); } while (0)
 
 // One token's loop variables, derived from the token index of the launch.
 struct TokenCtx {
@@ -64,7 +70,7 @@ __device__ void task_embed(const ModelDims& d, const Weights& w,
     const int token = act.token_in[tc.tok];
     const __hip_bfloat16* row = w.embed + (int64_t)token * d.hidden;
     for (int i = threadIdx.x; i < d.hidden; i += blockDim.x) {
-        act.x[i] = __bfloat162float(row[i]);
+        act.x[0][i] = __bfloat162float(row[i]);
     }
 }
 
@@ -86,37 +92,44 @@ __device__ inline void rms_norm_lds(const ModelDims& d,
     __syncthreads();
 }
 
-// The residual stream at the entry of layer `layer` (or of lm_head when
-// layer == d.layers), staged into LDS. x is already folded: the globally
-// last down worker of the previous MoE layer did that (fold_partials).
-__device__ inline void stage_x(const ModelDims& d, const Activations& act, int layer,
-                               int xcd, int worker, float* __restrict__ vec,
-                               const TokenCtx& tc) {
-    stage_vector(act.x, vec, d.hidden);
-    // Layer-boundary capture (§6): vec holds the output of layer-1.
-    if (tc.dump && xcd == 0 && worker == 0 && layer > 0) {
-        float* out = act.layer_dump + (int64_t)(layer - 1) * d.hidden;
-        for (int i = threadIdx.x; i < d.hidden; i += blockDim.x) out[i] = vec[i];
+// The residual stream into LDS: vec = src, or the fold vec = bf16(src +
+// bf16(sum of the 8 partials)) — HF's bf16 linear output and bf16 residual
+// add. Every consumer does this for itself (8 KB + 64 KB from L2, in
+// parallel with 295 others) and worker (0,0) publishes vec to dst, which is
+// never the buffer being read. The partials came from other XCDs: the
+// global wait that released this task acquired them.
+__device__ inline void stage_residual(const ModelDims& d, const float* __restrict__ src,
+                                      const float* __restrict__ partials,
+                                      float* __restrict__ dst, float* __restrict__ vec,
+                                      int xcd, int worker) {
+    if (partials == nullptr) {
+        stage_vector(src, vec, d.hidden);
+    } else {
+        // 36 independent loads per thread in flight (unroll 4 of 9 loads):
+        // two round trips under load, ~7 us. Fully unrolling the 72 loads
+        // to make it one round trip spilled 48 B/lane and cost 0.1 ms/token.
+#pragma unroll 4
+        for (int i = threadIdx.x; i < d.hidden; i += kBlockThreads) {
+            float acc = 0.f;
+#pragma unroll
+            for (int x = 0; x < kNumXCDs; ++x) acc += partials[x * d.hidden + i];
+            vec[i] = bf16_round(src[i] + bf16_round(acc));
+        }
+        __syncthreads();
+    }
+    if (dst != nullptr && xcd == 0 && worker == 0) {
+        for (int i = threadIdx.x; i < d.hidden; i += blockDim.x) dst[i] = vec[i];
     }
 }
 
-// The retired REDUCE task, done once per fold point (o_proj, expert down) by
-// the globally last worker while every other worker waits on the event:
-// x = bf16(x + bf16(sum of the 8 partials in expert_out)) — HF's bf16 linear
-// output and bf16 residual add.
-// The partials came from other XCDs: acquire first (their XCDs' last
-// arrivals flushed them before adding their shares).
-__device__ inline void fold_partials(const RuntimeState& rt, const ModelDims& d,
-                                     const Activations& act) {
-    if (threadIdx.x == 0 && !rt.uncached_acts) fence_acquire();
-    __syncthreads();
-#pragma unroll 8
-    for (int i = threadIdx.x; i < d.hidden; i += kBlockThreads) {
-        float acc = 0.f;
-        for (int x = 0; x < kNumXCDs; ++x) acc += act.expert_out[x * d.hidden + i];
-        act.x[i] = bf16_round(act.x[i] + bf16_round(acc));
+// Layer-boundary capture (§6): vec holds the output of layer `layer`.
+__device__ inline void dump_layer(const ModelDims& d, const Activations& act, int layer,
+                                  const float* __restrict__ vec, int xcd, int worker,
+                                  const TokenCtx& tc) {
+    if (tc.dump && xcd == 0 && worker == 0 && layer >= 0) {
+        float* out = act.layer_dump + (int64_t)layer * d.hidden;
+        for (int i = threadIdx.x; i < d.hidden; i += blockDim.x) out[i] = vec[i];
     }
-    __syncthreads();
 }
 
 // Touch [p, p + bytes) with 16-byte loads, 8 in flight per thread, results
@@ -146,9 +159,11 @@ __device__ inline void prefetch_bytes(const void* p, int64_t bytes, bool nt) {
 // the same x in the same order; worker 0 publishes it for the experts.
 __device__ void task_norm_router(const ModelDims& d, const Weights& w,
                                  Activations& act, Scratch& s, int layer,
-                                 int xcd, int worker, bool moe) {
-    stage_vector(act.x, s.vec, d.hidden);
+                                 int xcd, int worker, bool moe, const TokenCtx& tc) {
+    // x[1] = bf16(x[0] + bf16(o_proj)) from the 8 K-split partials
+    stage_residual(d, act.x[0], act.oproj_partial, act.x[1], s.vec, xcd, worker);
     rms_norm_lds(d, w.layer_norm_post[layer], s.vec, s.smem);
+    FLEET_STAMP();
     if (worker == 0) {
         float* x_norm = act.x_norm + (int64_t)xcd * d.hidden;
         for (int i = threadIdx.x; i < d.hidden; i += blockDim.x) x_norm[i] = s.vec[i];
@@ -195,15 +210,63 @@ __device__ inline void select_experts(const ModelDims& d, const float* __restric
 // Greedy pick over the bf16 logits (lm_head writes them bf16-rounded, as HF's
 // lm_head does); ties go to the lower index, as torch.argmax does. Feeds the
 // next token unless the host pre-filled token_in (teacher forcing).
+// lm_head epilogue: this worker's best logit (max, lowest index on ties —
+// torch.argmax's rule) over the rows it just wrote, from its own L2, so the
+// argmax task reduces 296 candidates instead of scanning 102400 logits on
+// one CU (measured 109 us for the scan: a dependent load per compare).
+__device__ void lm_head_candidate(const ModelDims& d, Activations& act, int xcd,
+                                  int worker, int n_workers, float* smem_val, int* smem_idx) {
+    const RowSlice sl = xcd_rows(d.vocab, xcd, kNumXCDs);
+    const int first = sl.begin + worker;
+    float bv = -INFINITY;
+    int bi = 0x7fffffff;
+    // rows first, first + n_workers, ...: independent loads, 8 per batch
+    for (int j0 = threadIdx.x; ; j0 += 8 * kBlockThreads) {
+        int n[8]; float v[8];
+        bool any = false;
+#pragma unroll
+        for (int u = 0; u < 8; ++u) {
+            n[u] = first + (j0 + u * kBlockThreads) * n_workers;
+            const bool ok = n[u] < sl.end;
+            any |= ok;
+            v[u] = ok ? act.logits[n[u]] : -INFINITY;
+        }
+#pragma unroll
+        for (int u = 0; u < 8; ++u) {
+            if (v[u] > bv || (v[u] == bv && n[u] < bi)) { bv = v[u]; bi = n[u]; }
+        }
+        if (!any) break;
+    }
+    smem_val[threadIdx.x] = bv;
+    smem_idx[threadIdx.x] = bi;
+    __syncthreads();
+    for (int st = kBlockThreads >> 1; st; st >>= 1) {
+        if ((int)threadIdx.x < st) {
+            const float ov = smem_val[threadIdx.x + st];
+            const int oi = smem_idx[threadIdx.x + st];
+            if (ov > smem_val[threadIdx.x] || (ov == smem_val[threadIdx.x] && oi < smem_idx[threadIdx.x])) {
+                smem_val[threadIdx.x] = ov; smem_idx[threadIdx.x] = oi;
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        act.argmax_val[xcd * n_workers + worker] = smem_val[0];
+        act.argmax_idx[xcd * n_workers + worker] = smem_idx[0];
+    }
+}
+
 __device__ void task_argmax(const ModelDims& d, Activations& act, const RuntimeState& rt,
                             const TokenCtx& tc) {
     __shared__ float best_val[kBlock];
     __shared__ int best_idx[kBlock];
-
+    const int n_cand = kNumXCDs * kWorkersPerXCD;
     float bv = -INFINITY;
-    int bi = 0;
-    for (int i = threadIdx.x; i < d.vocab; i += blockDim.x) {
-        if (act.logits[i] > bv) { bv = act.logits[i]; bi = i; }
+    int bi = 0x7fffffff;
+    for (int i = threadIdx.x; i < n_cand; i += blockDim.x) {
+        const float v = act.argmax_val[i];
+        const int ix = act.argmax_idx[i];
+        if (v > bv || (v == bv && ix < bi)) { bv = v; bi = ix; }
     }
     best_val[threadIdx.x] = bv;
     best_idx[threadIdx.x] = bi;
@@ -227,11 +290,6 @@ __device__ void task_argmax(const ModelDims& d, Activations& act, const RuntimeS
     }
 }
 
-// ---------------------------------------------------------------- dispatch
-//
-// Returns whether the task should signal its signal_event: always, except
-// for FLAG_SIGNAL_LAST tasks, where only the last arrival does.
-
 __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
                          const ModelDims& d, const Weights& w, Activations& act,
                          KVCache& kv, Scratch& s, const TokenCtx& tc, int xcd,
@@ -244,9 +302,9 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
     switch (t.kind) {
         case TASK_EMBED:       task_embed(d, w, act, tc); break;
         case TASK_NORM_ROUTER: task_norm_router(d, w, act, s, L, xcd, worker,
-                                                L >= d.first_k_dense); break;
+                                                L >= d.first_k_dense, tc); break;
         case TASK_ARGMAX:      task_argmax(d, act, rt, tc); break;
-        case TASK_REDUCE:      break;   // retired: FOLD_ON_LAST
+        case TASK_REDUCE:      break;   // retired: consumers fold in their prologue
 
         // Idle-worker prefetch (§12): stream a slice of the weights the
         // routing does not decide — this layer's shared expert and the next
@@ -299,8 +357,14 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
         // [3072 + 576, hidden] matrix. RMSNorm (and the fold of the previous
         // layer's expert partials) is recomputed per worker in the prologue.
         case TASK_QKV_FUSED: {
-            stage_x(d, act, L, xcd, worker, s.vec, tc);
+            // layer input: embed's x[0] for layer 0; else the previous layer's
+            // x[1] (+ its expert partials if it was MoE), published to x[0]
+            const float* src = (L == 0) ? act.x[0] : act.x[1];
+            const float* parts = (t.flags & FLAG_FOLD_PARTIALS) ? act.expert_out : nullptr;
+            stage_residual(d, src, parts, (L == 0) ? nullptr : act.x[0], s.vec, xcd, worker);
+            dump_layer(d, act, L - 1, s.vec, xcd, worker, tc);
             rms_norm_lds(d, w.layer_norm_in[L], s.vec, s.smem);
+            FLEET_STAMP();
             const int q_rows = heads_per_xcd * d.q_head_dim;                // 384
             const int q0 = xcd * q_rows;
             gemv_rows(w.layer_qkv[L] + (int64_t)q0 * d.hidden, d.hidden, s.vec,
@@ -333,6 +397,7 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
                      tc.cos, tc.sin, s.q_c, s.q_pe, s.part, t.head,
                      d.qk_nope, d.qk_rope, d.v_head, d.kv_lora);
             float* partials = act.attn_partial + (int64_t)t.head * chunks * kPartialStride;
+            FLEET_STAMP();
             attention_chunk(cache_layer, s.q_c, s.q_pe, s.row, d.softmax_scale,
                             tc.seq_len, kv.row, t.kv_chunk, chunks,
                             partials + (int64_t)t.kv_chunk * kPartialStride, s.part);
@@ -343,13 +408,13 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
         // global event; the residual add is folded into its epilogue.
         // K-split (§12): this XCD's heads' 256 columns of W_o against its own
         // o slice, all 2048 output rows over the 37 workers, fp32 partial into
-        // expert_out[xcd]; the globally last o_proj worker folds the 8
-        // partials into x (bf16(x + bf16(sum)) — HF's o_proj + residual).
+        // oproj_partial[xcd]; the router prologue folds the 8 partials.
         case TASK_O_PROJ: {
             const int kc = d.heads * d.v_head / kNumXCDs;
             stage_vector(act.o + (int64_t)xcd * kc, s.vec, kc);
+            FLEET_STAMP();
             gemv_rows(w.layer_o_proj[L] + (int64_t)xcd * kc, d.heads * d.v_head, s.vec,
-                      act.expert_out + (int64_t)xcd * d.hidden, nullptr, EPI_NONE, 1.f,
+                      act.oproj_partial + (int64_t)xcd * d.hidden, nullptr, EPI_NONE, 1.f,
                       d.hidden, kc, /*xcd=*/0, /*n_xcds=*/1, worker, nw);
             break;
         }
@@ -361,6 +426,7 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
                 s.ids, s.ws, d.routed_scaling, d.hidden, d.moe_inter, d.moe_inter * 2,
                 w.expert_stride);
             stage_vector(act.x_norm + (int64_t)xcd * d.hidden, s.vec, d.hidden);
+            FLEET_STAMP();
             uint32_t* chunk_counters = (t.flags & FLAG_CHUNK_SIGNAL)
                 ? rt.xcd_counters + (int64_t)xcd * kMaxEvents + t.local_event : nullptr;
             expert_gate_up(u, s.vec, act.expert_h + (int64_t)xcd * d.moe_inter,
@@ -394,6 +460,7 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
                     if (!chunk_ok) return false;
                 }
                 stage_vector(h + col0, s.vec, kc);
+                if (c == 0) FLEET_STAMP();
                 expert_down_chunk(u, s.vec, s.part, out, d.hidden, worker, nw,
                                   col0, kc, c == 0, c + 1 == n_chunks);
             }
@@ -409,16 +476,21 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
         // h is 10944 wide here: read from L2 rather than staged.
         case TASK_DENSE_DOWN:
             gemv_rows(w.layer_dense[L] + (int64_t)2 * d.dense_inter * d.hidden,
-                      d.dense_inter, act.expert_h, act.x, act.x,
+                      d.dense_inter, act.expert_h, act.x[1], act.x[1],
                       EPI_RESIDUAL, 1.f, d.hidden, d.dense_inter, xcd, kNumXCDs,
                       worker, nw);
             break;
 
         case TASK_LM_HEAD:
-            stage_x(d, act, d.layers, xcd, worker, s.vec, tc);
+            stage_residual(d, act.x[1], (t.flags & FLAG_FOLD_PARTIALS) ? act.expert_out : nullptr,
+                           nullptr, s.vec, xcd, worker);
+            dump_layer(d, act, d.layers - 1, s.vec, xcd, worker, tc);
             rms_norm_lds(d, w.final_norm, s.vec, s.smem);
+            FLEET_STAMP();
             gemv_rows(w.lm_head, d.hidden, s.vec, act.logits, nullptr, EPI_BF16,
                       1.f, d.vocab, d.hidden, xcd, kNumXCDs, worker, nw);
+            __syncthreads();   // every wave's logits are written (and in L2)
+            lm_head_candidate(d, act, xcd, worker, nw, s.smem, s.ids_blk);
             break;
 
         default:
@@ -486,6 +558,7 @@ void fleet_decode_step(RuntimeState rt, ModelDims d, Weights w,
             if (!ok_smem) { stop = true; break; }   // abort raised somewhere
 
             bool do_signal = true;
+            if (threadIdx.x == 0) s.stamp = 0;
             if (!rt.smoke) {
                 do_signal = run_task(*t, rt, d, w, act, kv, s, tc, xcd, worker);
             } else if (t->flags & FLAG_CHUNK_SIGNAL) {
@@ -508,26 +581,9 @@ void fleet_decode_step(RuntimeState rt, ModelDims d, Weights w,
             }
             __syncthreads();
 
-            __shared__ uint32_t total_smem;
-            if (threadIdx.x == 0) {
-                total_smem = 0;
-                if (do_signal) {
-                    total_smem = signal_event(rt, tc.epoch, t->signal_event,
-                                              (EventScope)t->signal_scope, xcd,
-                                              t->signal_xcd_count);
-                }
-            }
-            __syncthreads();
-            // FOLD_ON_LAST: this workgroup completed the epoch's producer count
-            // (all of them minus the fold's own +1): fold, publish, add the +1.
-            if ((t->flags & FLAG_FOLD_ON_LAST) &&
-                total_smem == tc.epoch * (uint32_t)t->n_split + (tc.epoch - 1)) {
-                if (!rt.smoke) fold_partials(rt, d, act);
-                if (threadIdx.x == 0) {
-                    if (!rt.uncached_acts) fence_release();
-                    __hip_atomic_fetch_add(&rt.global_events[t->signal_event], 1u,
-                                           __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-                }
+            if (threadIdx.x == 0 && do_signal) {
+                signal_event(rt, tc.epoch, t->signal_event, (EventScope)t->signal_scope,
+                             xcd, t->signal_xcd_count);
             }
             if (threadIdx.x == 0) {
                 if (tc.trace) {
@@ -535,7 +591,10 @@ void fleet_decode_step(RuntimeState rt, ModelDims d, Weights w,
                     tr[0] = t_start;                                  // began waiting
                     tr[1] = t_ready;                                  // wait satisfied
                     tr[2] = __builtin_amdgcn_s_memrealtime();         // signalled
-                    tr[3] = (uint64_t)xcd;
+                    // xcd in the low byte; prologue ticks (ready -> end of
+                    // prologue, 0 if the kind has none) above it
+                    const uint64_t pro = s.stamp ? (s.stamp - t_ready) : 0;
+                    tr[3] = (uint64_t)xcd | (pro << 8);
                 }
             }
         }

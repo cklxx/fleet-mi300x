@@ -17,13 +17,15 @@ namespace fleet {
 // launcher refuses to run a model whose dims exceed them (fleet_launch.hip),
 // so the kernel never has to check.
 constexpr int kMaxHidden = 2048;   // x / x_norm / o staged in LDS
-constexpr int kExpertKChunk = 512; // rows of h per gate_up→down tile (taskgraph EXPERT_K_CHUNK)
+constexpr int kExpertKChunk = 2048; // rows of h per gate_up→down tile (taskgraph EXPERT_K_CHUNK);
+                                    // >= moe_inter = one chunk: tiling measured no gain (STATUS.md)
 constexpr int kMaxKvLora = 512;    // q_c, cache row, merge scratch
 constexpr int kMaxQkRope = 64;     // q_pe, k_pe
 constexpr int kMaxMoeInter = 1408; // expert h staged in LDS for down
 constexpr int kMaxRouted = 64;     // router logits
 constexpr int kMaxTopK = 8;
 constexpr int kPartialStride = 2 + kMaxKvLora;   // attention partial: m, l, acc[512]
+constexpr int kMaxKvChunks = 16;   // split-KV factor the merge unrolls to (taskgraph --kv-chunks)
 constexpr int kNumXCDs = 8;        // per-XCD buffers below
 
 // Static model shape, read from build/weights.manifest by the host.
@@ -57,23 +59,28 @@ struct Weights {
 
 // Per-token activations, allocated once (docs/design.md §5).
 //
-// The residual stream x is one buffer: embed writes it, o_proj and the dense
-// down update it in place (each worker its own rows), and the globally last
-// down worker of a MoE layer folds the 8 expert partials into it while every
-// other worker is still waiting on the down event. Anything an XCD produces for its own consumption
+// The residual stream is two buffers: x[0] is the layer input, x[1] the
+// post-attention value. Every consumer folds the 8 partials it needs into
+// its own LDS copy (o_proj partials in the router prologue, expert partials
+// in the next q/kv_a prologue), and worker (0,0) publishes that copy to the
+// other buffer, so no reader and writer ever share one. The one-writer fold
+// by the last arriver was measured slower (STATUS.md). Anything an XCD produces for its own consumption
 // (kv_a, the normed vector, the routing choice) is per XCD, so those
 // handoffs are XCD-local events and identical values are never written to
 // the same line from two chiplets.
 struct Activations {
-    float* __restrict__ x;             // [hidden], bf16-valued
+    float* __restrict__ x[2];          // [hidden] each, bf16-valued: layer input, post-attention
     float* __restrict__ x_norm;        // [kNumXCDs][hidden] post-attention norm
     float* __restrict__ q;             // [heads * q_head_dim]; XCD k writes its heads'
     float* __restrict__ kv_a;          // [kNumXCDs][kv_lora + qk_rope] raw, pre-norm
     float* __restrict__ attn_partial;  // [heads][chunks][2 + kv_lora] m, l, acc
     float* __restrict__ o;             // [heads * v_head]
     float* __restrict__ expert_h;      // [kNumXCDs][moe_inter], or [dense_inter]
-    float* __restrict__ expert_out;    // [kNumXCDs][hidden] partials, folded later
+    float* __restrict__ expert_out;    // [kNumXCDs][hidden] expert partials, folded by the next q/kv_a
+    float* __restrict__ oproj_partial; // [kNumXCDs][hidden] o_proj K-split partials, folded by the router
     float* __restrict__ logits;        // [vocab]
+    float* __restrict__ argmax_val;    // [kNumXCDs * workers] per-worker best logit
+    int32_t* __restrict__ argmax_idx;  // [kNumXCDs * workers] ...and its index
     float* __restrict__ router_logits; // [kNumXCDs][n_routed], fp32; the expert
                                        // tasks derive top-k from it themselves
     const float* __restrict__ cos;     // [max_pos][qk_rope] YaRN tables; the kernel

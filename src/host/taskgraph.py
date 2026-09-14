@@ -8,8 +8,8 @@ synchronisation.
 
 Per MoE layer the graph (v0.11, two global events) is
 
-    QKV[x] ──xcd──▶ AT[x] ──xcd──▶ MG[x] ──xcd──▶ OP[x] (last one folds x) ──global──▶ RT[x]
-    RT[x] ──xcd──▶ GU[x] ──xcd, per K-chunk──▶ DN[x] (last one folds x) ──global──▶ next QKV
+    QKV[x] ──xcd──▶ AT[x] ──xcd──▶ MG[x] ──xcd──▶ OP[x] ──global──▶ RT[x] (folds the partials)
+    RT[x] ──xcd──▶ GU[x] ──xcd──▶ DN[x] ──global──▶ next layer's QKV (folds the partials)
 
 Compared with the v0.9 graph (six global events) the differences are:
   * q/kv_a is head-aligned: XCD k computes the q rows of heads 2k, 2k+1 and
@@ -19,12 +19,14 @@ Compared with the v0.9 graph (six global events) the differences are:
   * the router runs once per XCD as a Chiplet-task (256 KB of weights,
     replicated 8x, spread over 37 CUs), so the experts wait on an XCD-local
     event and pick the top-k themselves;
-  * there is no REDUCE task: the globally last down worker of the layer folds
-    the 8 expert partials into x once and publishes it (FOLD_ON_LAST), so x
-    needs no double buffering and no consumer re-reads the partials;
+  * there is no REDUCE task: every consumer folds the 8 partials it needs in
+    its prologue (FOLD_PARTIALS on the next q/kv_a and lm_head; the router
+    always folds the o_proj partials) and worker (0,0) publishes the result
+    to the other x buffer;
   * o_proj is K-split per XCD (its own heads' o slice x 256 columns of W_o),
-    so merge → o_proj is XCD-local and its 8 partials fold the same way;
-  * gate_up → down is tiled: one XCD-local event per 512-row K-chunk of h.
+    so merge → o_proj is XCD-local;
+  * gate_up → down can be tiled by K-chunk of h (--k-chunk); off by default,
+    measured no gain because down runs on the same workers as gate_up.
 
 Two granularities are reported. A *logical task* is a node of the graph above.
 A *descriptor* is what a worker dequeues: a CU-task is one descriptor, a
@@ -49,7 +51,8 @@ BLOCKS_PER_CU = 1     # must match FLEET_BLOCKS_PER_CU in fleet_runtime.h
 BLOCKS_PER_XCD = CUS_PER_XCD * BLOCKS_PER_CU
 WORKERS_PER_XCD = BLOCKS_PER_XCD - 1   # 1 scheduler + 37 workers
 WAVES = 4             # waves per workgroup, must match kWaves in gemv.h
-EXPERT_K_CHUNK = 512  # rows of h per gate_up→down tile, kExpertKChunk in fleet_types.h
+EXPERT_K_CHUNK = 2048  # rows of h per gate_up→down tile, kExpertKChunk in fleet_types.h;
+                       # >= moe_inter = one chunk (tiling measured no gain: same workers)
 DESCRIPTOR_BYTES = 64
 # Must match struct TaskDescriptor in src/runtime/fleet_runtime.h field for
 # field; tests/test_descriptor_layout.py checks that it does.
@@ -81,12 +84,11 @@ class TaskKind(IntEnum):
 class Flags(IntFlag):
     """Descriptor flags (TaskDescriptor.flags)."""
     NONE = 0
-    FOLD_PARTIALS = 1   # (retired: the fold is done once, by FOLD_ON_LAST)
+    FOLD_PARTIALS = 1   # prologue folds the 8 expert partials into the residual
     SIGNAL_LAST = 2     # signal signal_event only if this task is the last of
                         # n_split to bump local_event (XCD-local counter)
-    FOLD_ON_LAST = 4    # the globally last of n_split producers of signal_event
-                        # folds the 8 expert partials into x, then adds one more
-                        # to the event (its producer count includes that +1)
+    FOLD_ON_LAST = 4    # retired: one-writer fold by the last arriver (measured
+                        # slower than every consumer folding in parallel)
     CHUNK_SIGNAL = 8    # gate_up: every wave bumps local_event + c as soon as
                         # its rows of K-chunk c are stored (kv_chunk chunks)
     CHUNK_WAIT = 16     # down: waits local_event + c (c >= 1) inside the body,
@@ -196,14 +198,16 @@ def chiplet_producers(n_xcds: int = XCDS) -> int:
     return n_xcds * WORKERS_PER_XCD
 
 
-def build_qkv(g: Graph, layer: int, prev_event: int | None) -> list[int]:
+def build_qkv(g: Graph, layer: int, prev_event: int | None, fold: bool) -> list[int]:
     """Head-aligned q rows + this XCD's kv_a copy, one Chiplet-task per XCD,
-    each signalling its own XCD-local event. Returns the 8 events."""
+    each signalling its own XCD-local event. `fold`: the previous layer was
+    MoE, so the prologue folds its 8 expert partials. Returns the 8 events."""
     events = []
     for xcd in range(XCDS):
         e = g.new_event(Scope.XCD_LOCAL, WORKERS_PER_XCD, f"L{layer}.qkv.x{xcd}")
         g.chiplet_task(Task(TaskKind.QKV_FUSED, layer, xcd, prev_event, e,
-                            Scope.XCD_LOCAL), [xcd])
+                            Scope.XCD_LOCAL,
+                            flags=Flags.FOLD_PARTIALS if fold else Flags.NONE), [xcd])
         events.append(e)
     return events
 
@@ -267,22 +271,21 @@ def build_o_proj(g: Graph, layer: int, e_merge: list[int]) -> int:
     """o_proj K-split (§12): XCD k multiplies its own heads' 256 columns of
     W_o against its o slice — the same 1 MB per XCD as the row split, but
     waiting on an XCD-local event instead of the global merge. The 8 fp32
-    partials are folded into x by the globally last worker (FOLD_ON_LAST),
-    so the layer keeps one global event here instead of two."""
-    e_oproj = g.new_event(Scope.GLOBAL, chiplet_producers() + 1, f"L{layer}.o_proj")
+    partials are folded by every router worker in its prologue, so the
+    layer keeps one global event here instead of two."""
+    e_oproj = g.new_event(Scope.GLOBAL, chiplet_producers(), f"L{layer}.o_proj")
     for xcd in range(XCDS):
         g.chiplet_task(Task(TaskKind.O_PROJ, layer, xcd, e_merge[xcd], e_oproj,
-                            Scope.GLOBAL, n_split=chiplet_producers(),
-                            flags=Flags.FOLD_ON_LAST), [xcd])
+                            Scope.GLOBAL), [xcd])
     return e_oproj
 
 
 def build_moe_layer(g: Graph, layer: int, prev_event: int | None,
-                    cfg: dict) -> int:
+                    cfg: dict, fold: bool) -> int:
     """Emit one MoE layer; returns the event the next layer must wait on."""
     top_k = cfg["top_k"]
 
-    e_qkv = build_qkv(g, layer, prev_event)
+    e_qkv = build_qkv(g, layer, prev_event, fold)
     e_merge = build_attention(g, layer, e_qkv, cfg)
     if cfg.get("prefetch"):
         build_prefetch(g, layer, e_qkv)
@@ -307,17 +310,16 @@ def build_moe_layer(g: Graph, layer: int, prev_event: int | None,
     # about (c+1)/n of the phase and signals it then; down consumes chunk c
     # while gate_up is still streaming chunk c+1. Producers are counted per
     # wave (37 x 4), which is what lets a wave signal without a block barrier.
-    n_chunks = -(-cfg["moe_inter"] // EXPERT_K_CHUNK)
+    n_chunks = -(-cfg["moe_inter"] // cfg.get("k_chunk", EXPERT_K_CHUNK))
     e_chunk0 = []
     for xcd in range(XCDS):
         ids = [g.new_event(Scope.XCD_LOCAL, WORKERS_PER_XCD * WAVES,
                            f"L{layer}.gate_up.x{xcd}.k{c}") for c in range(n_chunks)]
         assert ids == list(range(ids[0], ids[0] + n_chunks))
         e_chunk0.append(ids[0])
-    # down: 296 producers plus one — the globally last down worker folds the
-    # 8 partials into x (the retired REDUCE, done once instead of by every
-    # consumer) and adds the +1 after publishing it.
-    e_down = g.new_event(Scope.GLOBAL, chiplet_producers() + 1, f"L{layer}.down")
+    # down: the 8 partials are folded by the next layer's q/kv_a workers (or
+    # lm_head's) in their prologue, FOLD_PARTIALS — no REDUCE task.
+    e_down = g.new_event(Scope.GLOBAL, chiplet_producers(), f"L{layer}.down")
     for xcd in range(XCDS):
         slot = xcd if xcd < top_k else -(xcd - top_k + 1)  # <0 marks shared half
         g.chiplet_task(Task(TaskKind.EXPERT_GATE_UP, layer, xcd, e_router[xcd],
@@ -329,17 +331,16 @@ def build_moe_layer(g: Graph, layer: int, prev_event: int | None,
         g.chiplet_task(Task(TaskKind.EXPERT_DOWN, layer, xcd, e_chunk0[xcd],
                             e_down, Scope.GLOBAL, expert_slot=slot,
                             local_event=e_chunk0[xcd], kv_chunk=n_chunks,
-                            n_split=chiplet_producers(),
-                            flags=Flags.FOLD_ON_LAST | Flags.CHUNK_WAIT), [xcd])
+                            flags=Flags.CHUNK_WAIT), [xcd])
     return e_down
 
 
 def build_dense_layer(g: Graph, layer: int, prev_event: int | None,
-                      cfg: dict) -> int:
+                      cfg: dict, fold: bool) -> int:
     """Layer 0: same attention path, dense MLP instead of experts. The dense
     gate_up → down boundary needs the full h[10944], so it is global; the
     residual add is done in place by dense_down, so nothing to fold after."""
-    e_qkv = build_qkv(g, layer, prev_event)
+    e_qkv = build_qkv(g, layer, prev_event, fold)
     e_merge = build_attention(g, layer, e_qkv, cfg)
     if cfg.get("prefetch"):
         build_prefetch(g, layer, e_qkv)
@@ -368,14 +369,18 @@ def build_graph(cfg: dict) -> Graph:
     e = g.new_event(Scope.GLOBAL, 1, "embed")
     g.cu_task(Task(TaskKind.EMBED, -1, 0, None, e, Scope.GLOBAL))
 
+    prev_moe = False
     for layer in range(cfg["layers"]):
         if layer < cfg["first_k_dense"]:
-            e = build_dense_layer(g, layer, e, cfg)
+            e = build_dense_layer(g, layer, e, cfg, fold=prev_moe)
+            prev_moe = False
         else:
-            e = build_moe_layer(g, layer, e, cfg)
+            e = build_moe_layer(g, layer, e, cfg, fold=prev_moe)
+            prev_moe = True
 
     e_lm = g.new_event(Scope.GLOBAL, chiplet_producers(), "lm_head")
-    g.chiplet_task(Task(TaskKind.LM_HEAD, -1, -1, e, e_lm, Scope.GLOBAL),
+    g.chiplet_task(Task(TaskKind.LM_HEAD, -1, -1, e, e_lm, Scope.GLOBAL,
+                        flags=Flags.FOLD_PARTIALS if prev_moe else Flags.NONE),
                    range(XCDS))
     e_arg = g.new_event(Scope.GLOBAL, 1, "argmax")
     g.cu_task(Task(TaskKind.ARGMAX, -1, 0, e_lm, e_arg, Scope.GLOBAL))
@@ -441,15 +446,6 @@ def validate(g: Graph) -> list[str]:
             signalled[t.local_event] = signalled.get(t.local_event, 0) + 1
         else:
             signalled[t.signal_event] = signalled.get(t.signal_event, 0) + 1
-    fold_events: set[int] = set()
-    for t in g.tasks:
-        if t.signal_event is not None and t.flags & Flags.FOLD_ON_LAST:
-            if t.n_split != g.events[t.signal_event]["producers"] - 1:
-                errors.append(f"task {t.index}: FOLD_ON_LAST n_split {t.n_split} != "
-                              f"producers - 1 of event {t.signal_event}")
-            fold_events.add(t.signal_event)
-    for e in fold_events:
-        signalled[e] = signalled.get(e, 0) + 1          # the fold's own +1
     for (sig, loc), members in last_groups.items():
         # the group counts as ONE producer of the global event, and its size
         # must equal the local counter's producer count and each member's n_split
@@ -477,7 +473,7 @@ def validate(g: Graph) -> list[str]:
         if t.signal_event is not None and t.signal_scope == Scope.GLOBAL:
             shares.setdefault(t.signal_event, {})[t.xcd] = t.signal_xcd_count
     for e, by_xcd in shares.items():
-        want = g.events[e]["producers"] - (1 if e in fold_events else 0)
+        want = g.events[e]["producers"]
         if sum(by_xcd.values()) != want:
             errors.append(f"event {e} ({g.events[e]['label']}): per-XCD shares "
                           f"{by_xcd} do not sum to {want}")
@@ -626,10 +622,12 @@ def report(g: Graph, cfg: dict) -> None:
         print(f"  ! {e}")
 
 
-def load_cfg(config: Path, kv_chunks: int, prefetch: bool = False) -> dict:
+def load_cfg(config: Path, kv_chunks: int, prefetch: bool = False,
+             k_chunk: int = EXPERT_K_CHUNK) -> dict:
     c = json.loads(config.read_text())
     return {
         "prefetch": prefetch,
+        "k_chunk": k_chunk,
         "layers": c["num_hidden_layers"],
         "heads": c["num_attention_heads"],
         "top_k": c["num_experts_per_tok"],
@@ -649,9 +647,12 @@ def main() -> None:
     ap.add_argument("--emit", type=Path, help="write packed descriptors here")
     ap.add_argument("--prefetch", action="store_true",
                     help="idle-worker weight prefetch tasks during attention (§12)")
+    ap.add_argument("--k-chunk", type=int, default=EXPERT_K_CHUNK,
+                    help="rows of h per gate_up->down tile; must match kExpertKChunk "
+                         "unless it is >= moe_inter (one chunk = no tiling)")
     a = ap.parse_args()
 
-    cfg = load_cfg(a.config, a.kv_chunks, a.prefetch)
+    cfg = load_cfg(a.config, a.kv_chunks, a.prefetch, a.k_chunk)
     g = build(cfg)
 
     if a.emit:

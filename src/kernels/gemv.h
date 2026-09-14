@@ -306,6 +306,83 @@ __device__ __forceinline__ void gemv_rows_pipelined(
 #undef FLEET_REDUCE_GROUP
 }
 
+// Short rows (K <= 256, 16-byte chunks <= 32: the K-split o_proj): a full
+// wave per row would leave half its lanes idle on every load, so each
+// half-wave takes its own row — 2 rows per load instruction, reduced within
+// the half (xor offsets below 32 never cross it). Same pipelining as above.
+__device__ __forceinline__ float half_wave_sum(float v) {
+#pragma unroll
+    for (int off = kWaveLanes / 4; off; off >>= 1) v += __shfl_xor(v, off, kWaveLanes);
+    return v;
+}
+
+template <int RPI>   // rows per wave per group (even); each half-wave takes RPI/2
+__device__ __forceinline__ void gemv_rows_pipelined_half(
+        const __hip_bfloat16* __restrict__ w, int ld,
+        const float* __restrict__ x, float* __restrict__ y,
+        const float* __restrict__ residual, GemvEpilogue epi, float scale,
+        int K, int first, int cnt, int n_workers) {
+    constexpr int H = RPI / 2;
+    const int wave = threadIdx.x / kWaveLanes;
+    const int lane = threadIdx.x % kWaveLanes;
+    const int half = lane >> 5, hl = lane & 31;
+    const int n4 = K / 8;
+    const bool valid = hl < n4;
+    const int idx = valid ? hl : 0;
+    const int stride = RPI * kWaves;
+    int k = RPI * wave;
+    if (k >= cnt) return;
+    uint4 bufA[H], bufB[H];
+#define FLEET_HROW(KK, J) (w + (int64_t)(first + min((KK) + 2 * (J) + half, cnt - 1) * n_workers) * ld)
+#define FLEET_HISSUE(BUF, KK)                                                   \
+    _Pragma("unroll")                                                           \
+    for (int j = 0; j < H; ++j) {                                               \
+        BUF[j] = load_weight(reinterpret_cast<const uint4*>(FLEET_HROW(KK, j)) + idx); \
+    }
+#define FLEET_HREDUCE(BUF, KK)                                                  \
+    {                                                                           \
+        float sums[H];                                                          \
+        _Pragma("unroll")                                                       \
+        for (int j = 0; j < H; ++j) {                                           \
+            float acc = 0.f;                                                    \
+            if (valid) fma8(BUF[j], x + idx * 8, acc);                          \
+            sums[j] = half_wave_sum(acc);                                       \
+        }                                                                       \
+        if (hl == 0) {                                                          \
+            _Pragma("unroll")                                                   \
+            for (int j = 0; j < H; ++j) {                                       \
+                const int r = (KK) + 2 * j + half;                              \
+                if (r < cnt) {                                                  \
+                    const int n = first + r * n_workers;                        \
+                    const float v = sums[j];                                    \
+                    switch (epi) {                                              \
+                        case EPI_BF16:     y[n] = bf16_round(scale * bf16_round(v)); break; \
+                        case EPI_RESIDUAL: y[n] = bf16_round(residual[n] + bf16_round(v)); break; \
+                        case EPI_ACC:      y[n] += v; break;                    \
+                        case EPI_BF16_ACC: y[n] = bf16_round(scale * bf16_round(residual[n] + v)); break; \
+                        default:           y[n] = v;                            \
+                    }                                                           \
+                }                                                               \
+            }                                                                   \
+        }                                                                       \
+    }
+    FLEET_HISSUE(bufA, k)
+    while (true) {
+        const int k2 = k + stride;
+        FLEET_HISSUE(bufB, k2)
+        FLEET_HREDUCE(bufA, k)
+        if (k2 >= cnt) break;
+        const int k3 = k2 + stride;
+        FLEET_HISSUE(bufA, k3)
+        FLEET_HREDUCE(bufB, k2)
+        if (k3 >= cnt) break;
+        k = k3;
+    }
+#undef FLEET_HROW
+#undef FLEET_HISSUE
+#undef FLEET_HREDUCE
+}
+
 // Unpipelined fallback for rows longer than one buffer (dense down, K = 10944).
 template <int RPI, int D>
 __device__ __forceinline__ void gemv_rows_impl(
@@ -358,7 +435,9 @@ __device__ inline void gemv_rows(
     // 256-VGPR cap and the buffers into scratch memory (measured: every GEMV
     // kind 1.5-3x slower), so the batch stays at 8 and the overlap does the
     // rest. The tasks own 7–350 rows each; they pay round trips, not bytes.
-    if (n4 <= kWaveLanes) {             // K <= 512:  8 rows x 1 chunk  (merge W_UV)
+    if (n4 <= kWaveLanes / 2) {         // K <= 256:  half-wave rows (K-split o_proj)
+        gemv_rows_pipelined_half<8>(w, ld, x, y, residual, epi, scale, K, first, cnt, n_workers);
+    } else if (n4 <= kWaveLanes) {      // K <= 512:  8 rows x 1 chunk  (merge W_UV)
         gemv_rows_pipelined<8, 1>(w, ld, x, y, residual, epi, scale, K, first, cnt, n_workers);
     } else if (n4 <= 2 * kWaveLanes) {  // K <= 1024: 4 rows x 2 chunks
         gemv_rows_pipelined<4, 2>(w, ld, x, y, residual, epi, scale, K, first, cnt, n_workers);

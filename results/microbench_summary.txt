@@ -1,28 +1,40 @@
 device: AMD Instinct MI300X VF  CUs 304  arch gfx942:sramecc+:xnack-
 grid: 304 workgroups x 256 threads   tick 10.00 ns
+
 (d) cross-XCD payload visibility: 4 waves store 32 KB, thread 0 releases, thread 0 acquires on another XCD, every word checked, 2000 rounds
     stale words: 0 of 16384000  [PASS]
+
+(d'') the same payload in uncached (MTYPE UC) memory with NO fences: producer drains stores + relaxed atomic, consumer polls, 2000 rounds (the --uncached-acts protocol)
+    stale words: 12281856 of 16384000  [FAIL]
+
 (d') 37 producers on one XCD, drained stores, ONE last-arriver flush; a same-XCD consumer (L1-only acquire) and a cross-XCD consumer (L1+L2 acquire) verify every word, 500 rounds
     stale words: same-XCD consumer 0, cross-XCD consumer 0, of 151552000 each  [PASS]
+
 (a) cross-XCD event round-trip (ping-pong, us; release+atomic+poll+acquire)
-    (i)  counters in device memory   median   1.44  p95   1.56
-    (ii) counters uncached           median   1.44  p95   1.56
-    -> design picks the cheaper: (i)  (FLEET_UNCACHED_EVENTS=1 selects ii)
+    (i)  counters in device memory   median   1.36  p95   1.48
+    (ii) counters uncached           median   1.28  p95   1.40
+    -> design picks the cheaper: (ii)  (FLEET_UNCACHED_EVENTS=1 selects ii)
+
 (b) same-XCD flag round-trip (us)
-    median  1.200  p95  1.320   (vs cross-XCD 1.44)
+    median  1.360  p95  1.480   (vs cross-XCD 1.28)
+
 (e) cross-XCD event round-trip while 302 workgroups stream HBM (us)
-    median   6.76  p95   8.72   (idle: 1.44)  under 1.64 TB/s of streaming load  <- the value for design.md §9
+    median   5.88  p95   7.08   (idle: 1.36)  under 1.59 TB/s of streaming load  <- the value for design.md §9
+
 (c) register-streamed read bandwidth by in-flight depth
-    depth  1:  2.59 TB/s
-    depth  2:  3.40 TB/s
-    depth  4:  3.74 TB/s
-    depth  8:  4.24 TB/s
-    depth 12:  4.17 TB/s
-    depth 16:  4.15 TB/s
-    -> best 4.24 TB/s = 80% of 5.3 peak (design assumes 4.0 achievable)
+    depth  1:  2.66 TB/s
+    depth  2:  3.43 TB/s
+    depth  4:  3.77 TB/s
+    depth  8:  4.36 TB/s
+    depth 12:  4.23 TB/s
+    depth 16:  3.81 TB/s
+    -> best 4.36 TB/s = 82% of 5.3 peak (design assumes 4.0 achievable)
+
 (f) the kernel's expert GEMVs in isolation (gemv.h, 8 x 17.3 MB units/layer, 27 layers)
-    gate_up only           no handshake           25.0 us/layer, 3.69 TB/s; per block: mean 24.0 us, slowest 30.8 us
-    gate_up + down         no handshake           38.6 us/layer, 3.58 TB/s; per block: mean 37.5 us, slowest 45.8 us
-    gate_up + down         per-worker release     46.1 us/layer, 3.00 TB/s; per block: mean 44.0 us, slowest 49.6 us
-    gate_up + down         last-worker release    39.0 us/layer, 3.55 TB/s; per block: mean 38.2 us, slowest 40.5 us
-    -> 87% of (c)'s ceiling for gate_up alone, 84% with down; with the kernel's per-worker handshake 71%, with the last-worker flush 84%
+    gate_up only           no handshake           24.3 us/layer, 3.79 TB/s; per block: mean 23.6 us, slowest 28.8 us
+    gate_up + down         no handshake           37.2 us/layer, 3.72 TB/s; per block: mean 35.7 us, slowest 42.4 us
+    gate_up + down         per-worker release     46.7 us/layer, 2.96 TB/s; per block: mean 46.0 us, slowest 51.5 us
+    gate_up + down         last-worker release    38.3 us/layer, 3.62 TB/s; per block: mean 37.4 us, slowest 40.3 us
+    -> 87% of (c)'s ceiling for gate_up alone, 86% with down; with the kernel's per-worker handshake 68%, with the last-worker flush 83%
+
+wrote results/microbench.json

@@ -1,0 +1,22 @@
+
+trace of token 1: 4.824 ms from first wait to last signal
+  kind             tasks   busy-sum   wait-sum   avg-busy
+  QKV_FUSED         7992   147.18 ms   104.69 ms     18.4 us
+  ATTENTION         3456    73.70 ms     2.57 ms     21.3 us
+  MERGE_UV          3456    30.12 ms    77.72 ms      8.7 us
+  O_PROJ            7992    84.70 ms    16.11 ms     10.6 us
+  NORM_ROUTER       7992    70.52 ms    77.67 ms      8.8 us
+  EXPERT_GATE_UP    7696   258.88 ms     5.48 ms     33.6 us
+  EXPERT_DOWN       7696   300.22 ms     6.10 ms     39.0 us
+  DENSE_GATE_UP      296     8.69 ms     0.23 ms     29.4 us
+  DENSE_DOWN         296     5.43 ms     0.74 ms     18.3 us
+  EMBED                1     0.01 ms     0.12 ms      5.6 us
+  LM_HEAD            296    38.11 ms     2.54 ms    128.8 us
+  ARGMAX               1     0.11 ms     0.00 ms    108.6 us
+  PREFETCH          4536    61.38 ms     3.24 ms     13.5 us
+  per-layer span (first task ready -> last task signalled): L0 134 us  L1 168 us  L2 168 us  L26 159 us  ... sum 4.44 ms
+wrote results/trace_v11_all.bin (51706 descriptors x 4 uint64: wait-start, ready, done, xcd; 10 ns ticks)
+
+per-token latency (embed -> argmax on device): median 4.679 ms  p95 4.706 ms  mean 4.684 ms  (213.5 tok/s)
+wall time of the launches: 163.818 ms for 32 tokens = 5.119 ms/token (195.3 tok/s), 1 launch(es)
+tokens: 2/32 match HF greedy, first divergence at step 2
