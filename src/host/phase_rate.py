@@ -217,7 +217,10 @@ def byte_model(cfg: dict, kva_shared: bool, fold_sites: set[str]) -> dict[str, d
                       "runs": layers},
         # W_UK is read by every chunk task of the head — the same 131 KB again
         # per chunk — so the first read is HBM and the other KV_CHUNKS-1 are L2
-        # hits. The shared cache row is one write and 16 head reads, all L2.
+        # hits. Every one of those tasks recomputes the same q_c for the same
+        # single query position, so the 16 reads collapse to one if a worker off
+        # the critical path publishes 1 KB. The shared cache row is one write
+        # and 16 head reads, all L2.
         "ATTENTION": {"hbm": heads * qk_nope * lora * BF16 * m,
                       "l2": (heads * SEQ_LEN * (lora + qk_rope) * BF16
                              + heads * (KV_CHUNKS - 1) * qk_nope * lora * BF16) * m,
