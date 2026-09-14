@@ -47,13 +47,7 @@ if torch.cuda.is_available():
 PY
 
 log "local checks that need no GPU (fail here = fix before spending GPU time)"
-python3 "$REPO_ROOT/tests/test_descriptor_layout.py"
-python3 "$REPO_ROOT/tests/test_kernel_interface.py"
-python3 "$REPO_ROOT/tests/test_queue_simulation.py"
-python3 "$REPO_ROOT/tests/test_row_partition.py"
-python3 "$REPO_ROOT/tests/test_expert_addressing.py"
-python3 "$REPO_ROOT/tests/test_absorbed_equivalence.py"
-python3 "$REPO_ROOT/tests/test_reference_vs_hf.py"
+python3 "$REPO_ROOT/tests/run_all.py"
 
 log "build HIP"
 mkdir -p "$REPO_ROOT/build" "$REPO_ROOT/results"

@@ -40,9 +40,7 @@ mkdir -p "$SP/flash_attn" && echo "# stub: satisfies transformers check_imports 
 python3 -c "import torch; print('torch', torch.__version__, torch.version.hip, torch.cuda.is_available())"
 
 log "local checks"
-for t in test_descriptor_layout test_kernel_interface test_queue_simulation test_row_partition test_expert_addressing test_absorbed_equivalence test_reference_vs_hf; do
-  python3 tests/$t.py > results/$t.log 2>&1 && echo "PASS $t" || echo "FAIL $t"
-done
+python3 tests/run_all.py | tail -14
 
 log "build"
 mkdir -p build results
