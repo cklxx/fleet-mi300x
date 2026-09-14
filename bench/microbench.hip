@@ -729,6 +729,64 @@ static double run_gemv(size_t bytes, int reps) {
   return (double)bytes * reps / (ms * 1e-3) / 1e12;  // TB/s
 }
 
+// ---------------------------------------------------------------- (g) one buffer, many readers
+//
+// Two decisions ride on this sweep, and neither needs a kernel change to
+// make. Merging two attention heads into one task only pays if an XCD's L2
+// is the bottleneck, which shows up as a per-worker read rate that falls as
+// more workgroups stream the same buffer. And the expert GEMV runs at about
+// 77% of the per-worker ceiling; one candidate explanation is page and TLB
+// behaviour, which shows up instead as a rate that falls with the working
+// set at fixed concurrency.
+__global__ __launch_bounds__(kBlock) void shared_stream(
+    const uint4* __restrict__ buf, unsigned n4, unsigned reps, unsigned active,
+    unsigned long long* __restrict__ out) {
+  if (blockIdx.x >= active) return;
+  const unsigned long long t0 = clk();
+  unsigned acc = 0;
+  for (unsigned r = 0; r < reps; ++r) {
+    for (unsigned i = threadIdx.x; i < n4; i += kBlock) acc ^= buf[i].x;
+  }
+  const unsigned long long dt = clk() - t0;
+  if (threadIdx.x == 0) out[blockIdx.x] = dt + (acc == 0xdeadbeefu ? 1u : 0u);
+}
+
+static void run_shared(double ns) {
+  const size_t sizes[] = {128u << 10, 1u << 20, 8u << 20, 64u << 20};
+  const unsigned actives[] = {1, 37, 148, 296};
+  uint4* buf = nullptr;
+  unsigned long long* out = nullptr;
+  HIP_CHECK(hipMalloc(&buf, sizes[3]));
+  HIP_CHECK(hipMemset(buf, 1, sizes[3]));
+  HIP_CHECK(hipMalloc(&out, (size_t)kGrid * sizeof(unsigned long long)));
+  std::printf("(g) one buffer, many readers: per-worker GB/s\n    %12s", "working set");
+  for (unsigned a : actives) std::printf("%12u", a);
+  std::printf("   <- concurrent workgroups\n");
+  std::vector<unsigned long long> h(kGrid);
+  for (size_t sz : sizes) {
+    const unsigned n4 = (unsigned)(sz / 16);
+    const unsigned reps = (unsigned)std::max<size_t>(1, (size_t)(64u << 20) / sz);
+    std::printf("    %10zu K", sz >> 10);
+    for (unsigned a : actives) {
+      HIP_CHECK(hipMemset(out, 0, (size_t)kGrid * sizeof(unsigned long long)));
+      hipLaunchKernelGGL(shared_stream, dim3(kGrid), dim3(kBlock), 0, 0,
+                         buf, n4, reps, a, out);
+      HIP_CHECK(hipDeviceSynchronize());
+      HIP_CHECK(hipMemcpy(h.data(), out, (size_t)kGrid * sizeof(unsigned long long),
+                          hipMemcpyDeviceToHost));
+      unsigned long long worst = 0;
+      for (unsigned i = 0; i < a; ++i) worst = std::max(worst, h[i]);
+      const double secs = (double)worst * ns / 1e9;
+      std::printf("%12.1f", (double)sz * reps / secs / 1e9);
+    }
+    std::printf("\n");
+  }
+  std::printf("    (a flat row means concurrency is free; a falling column means the\n"
+              "     working set, not the sharing, is what costs)\n\n");
+  HIP_CHECK(hipFree(buf));
+  HIP_CHECK(hipFree(out));
+}
+
 int main(int argc, char** argv) {
   const char* json_path = nullptr;
   for (int i = 1; i < argc; ++i)
@@ -836,6 +894,8 @@ int main(int argc, char** argv) {
   std::printf("    -> %.0f%% of (c)'s ceiling for gate_up alone, %.0f%% with down; with the kernel's "
               "per-worker handshake %.0f%%, with the last-worker flush %.0f%%\n",
               f_gu / best * 100, f_all / best * 100, f_sync1 / best * 100, f_sync2 / best * 100);
+
+  run_shared(ns);
 
   if (json_path) {
     FILE* f = std::fopen(json_path, "w");
