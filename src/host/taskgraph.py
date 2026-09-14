@@ -75,6 +75,7 @@ class TaskKind(IntEnum):
     EMBED = 10
     LM_HEAD = 11       # Chiplet-task x8, fold + final norm in prologue
     ARGMAX = 12
+    PREFETCH = 13      # idle-worker weight prefetch during attention (--prefetch)
 
 
 class Flags(IntFlag):
@@ -107,6 +108,7 @@ IMPLEMENTATION: dict[str, str] = {
     "DENSE_DOWN": "fleet-verified",
     "LM_HEAD": "fleet-verified",
     "ARGMAX": "fleet-verified",
+    "PREFETCH": "fleet-experimental",
 }
 
 
@@ -232,6 +234,35 @@ def build_attention(g: Graph, layer: int, e_qkv: list[int], cfg: dict) -> list[i
     return e_merge
 
 
+# Idle-worker prefetch (§12). Per XCD and layer the attention phase uses 16
+# CU-tasks (2 heads x kv_chunks) and the merge another 16, round-robined by
+# assign_workers over the 37 workers, so 5 workers sit idle through both
+# phases and 16 (the attention workers) through the merge. Emitted right
+# after the merge tasks, the prefetch CU-tasks land in that order: the first
+# 5 on the idle workers (3 slices each, ~the attention time), the next 16 on
+# the attention workers (1 slice each, ~the merge time). They wait on the
+# XCD's q/kv_a event and signal nothing.
+PREFETCH_IDLE = 5
+PREFETCH_IDLE_SLICES = 3
+PREFETCH_ATTN = 16
+
+
+def build_prefetch(g: Graph, layer: int, e_qkv: list[int]) -> None:
+    per_xcd = PREFETCH_IDLE * PREFETCH_IDLE_SLICES + PREFETCH_ATTN
+    n_split = XCDS * per_xcd
+    for xcd in range(XCDS):
+        first = xcd * per_xcd
+        for i in range(PREFETCH_IDLE):
+            g.cu_task(Task(TaskKind.PREFETCH, layer, xcd, e_qkv[xcd], None, Scope.NONE,
+                           head=PREFETCH_IDLE_SLICES, kv_chunk=first, n_split=n_split))
+            first += PREFETCH_IDLE_SLICES
+        for i in range(PREFETCH_ATTN):
+            g.cu_task(Task(TaskKind.PREFETCH, layer, xcd, e_qkv[xcd], None, Scope.NONE,
+                           head=1, kv_chunk=first, n_split=n_split))
+            first += 1
+        assert first == (xcd + 1) * per_xcd
+
+
 def build_o_proj(g: Graph, layer: int, e_merge: list[int]) -> int:
     """o_proj K-split (§12): XCD k multiplies its own heads' 256 columns of
     W_o against its o slice — the same 1 MB per XCD as the row split, but
@@ -253,6 +284,8 @@ def build_moe_layer(g: Graph, layer: int, prev_event: int | None,
 
     e_qkv = build_qkv(g, layer, prev_event)
     e_merge = build_attention(g, layer, e_qkv, cfg)
+    if cfg.get("prefetch"):
+        build_prefetch(g, layer, e_qkv)
     e_oproj = build_o_proj(g, layer, e_merge)
 
     # post-attention norm + router, once per XCD as a Chiplet-task: every
@@ -308,7 +341,8 @@ def build_dense_layer(g: Graph, layer: int, prev_event: int | None,
     residual add is done in place by dense_down, so nothing to fold after."""
     e_qkv = build_qkv(g, layer, prev_event)
     e_merge = build_attention(g, layer, e_qkv, cfg)
-
+    if cfg.get("prefetch"):
+        build_prefetch(g, layer, e_qkv)
     e_oproj = build_o_proj(g, layer, e_merge)
 
     e_norm = []
@@ -592,9 +626,10 @@ def report(g: Graph, cfg: dict) -> None:
         print(f"  ! {e}")
 
 
-def load_cfg(config: Path, kv_chunks: int) -> dict:
+def load_cfg(config: Path, kv_chunks: int, prefetch: bool = False) -> dict:
     c = json.loads(config.read_text())
     return {
+        "prefetch": prefetch,
         "layers": c["num_hidden_layers"],
         "heads": c["num_attention_heads"],
         "top_k": c["num_experts_per_tok"],
@@ -612,9 +647,11 @@ def main() -> None:
                     help="split-KV factor: attention tasks per head (8 measured best)")
     ap.add_argument("--report", action="store_true")
     ap.add_argument("--emit", type=Path, help="write packed descriptors here")
+    ap.add_argument("--prefetch", action="store_true",
+                    help="idle-worker weight prefetch tasks during attention (§12)")
     a = ap.parse_args()
 
-    cfg = load_cfg(a.config, a.kv_chunks)
+    cfg = load_cfg(a.config, a.kv_chunks, a.prefetch)
     g = build(cfg)
 
     if a.emit:

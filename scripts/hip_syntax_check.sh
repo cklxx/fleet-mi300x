@@ -12,6 +12,7 @@
 #
 #   bash scripts/hip_syntax_check.sh
 #   HIP_SYNTAX_CLANG=/path/to/clang++ bash scripts/hip_syntax_check.sh
+#   HIP_SYNTAX_DEFS="-DFLEET_NT_WEIGHTS=1" bash scripts/hip_syntax_check.sh
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -70,7 +71,7 @@ for src in "$ROOT"/bench/microbench.hip "$ROOT"/src/kernels/fleet_kernel.hip \
         # -D__gfx942__=1: parse the gfx942-only branches (the XCC_ID inline
         # asm) even when the local clang only knows an older gfx9.
         out=$("$CXX" -x hip $mode --offload-arch=$ARCH -nogpuinc -nogpulib \
-                -std=c++17 -fsyntax-only "${SDKFLAGS[@]}" -D__gfx942__=1 \
+                -std=c++17 -fsyntax-only "${SDKFLAGS[@]}" -D__gfx942__=1 ${HIP_SYNTAX_DEFS:-} \
                 -I"$STUBS" -I"$ROOT/src" \
                 -Wall -Wextra -Wno-unused-parameter -Wno-unused-function \
                 -Wno-unused-variable -Wno-missing-field-initializers \

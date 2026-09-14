@@ -19,9 +19,13 @@
 // folklore: producers release with an agent-scope fence (buffer_wbl2), the
 // counter is an agent-scope atomic, consumers acquire with an agent-scope
 // fence (buffer_inv), and polling uses agent-scope atomic loads so a stale
-// L1/L2 line can never satisfy the wait. XCD-local events use the same fences
-// today; the fence-free L2-resident variant the paper describes is a measured
-// optimisation for D1 (b), not something to assume before it is measured.
+// L1/L2 line can never satisfy the wait. XCD-local events acquire with an
+// L1-only invalidate (the payload is in the producer's own L2). With
+// uncached_acts every cross-XCD activation is in MTYPE-UC memory, which no
+// L2 caches, so global events drop both the writeback and the invalidate;
+// the KV cache (cached, written once per layer per token, read by every XCD
+// from the next token on) is the one payload that still needs them: its
+// writer flushes explicitly and the token boundary keeps the acquire.
 #pragma once
 
 #include <hip/hip_runtime.h>
@@ -60,6 +64,7 @@ enum TaskKind : uint16_t {
     TASK_EMBED = 10,
     TASK_LM_HEAD = 11,
     TASK_ARGMAX = 12,
+    TASK_PREFETCH = 13,   // stream routing-independent weights into the Infinity Cache
 };
 
 enum EventScope : int16_t {
@@ -151,6 +156,12 @@ struct RuntimeState {
                            //     on the launch's first token
     int32_t  trace_token;  // token of the launch to trace, or -1
     uint32_t spin_limit;   // polls before a wait declares a deadlock
+    int32_t  uncached_acts; // 1 = every cross-XCD activation lives in uncached
+                            //     (MTYPE UC) memory, so global events carry no
+                            //     L2 writeback / invalidate; only the token
+                            //     boundary (done_event) still fences, for the
+                            //     KV cache, whose writer flushes explicitly
+    int32_t  prefetch_nt;   // 1 = TASK_PREFETCH uses non-temporal loads
 
     // Optional per-descriptor trace (design.md §10): [n_descriptors][4] of
     // s_memrealtime ticks — began waiting, wait satisfied, signalled — plus
@@ -320,7 +331,7 @@ __device__ __forceinline__ uint32_t signal_event(
                                                 __HIP_MEMORY_SCOPE_AGENT);
     if (scope == SCOPE_XCD_LOCAL) return 0;
     if (old + 1 == epoch * (uint32_t)xcd_count) {        // last of this XCD's share
-        fence_release();
+        if (!rt.uncached_acts || event == rt.done_event) fence_release();
         const uint32_t g = __hip_atomic_fetch_add(&rt.global_events[event], (uint32_t)xcd_count,
                                                   __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
         return g + (uint32_t)xcd_count;
@@ -358,7 +369,7 @@ __device__ __forceinline__ bool wait_event(
         }
     }
     if (scope == SCOPE_XCD_LOCAL) fence_acquire_local();
-    else                          fence_acquire();
+    else if (!rt.uncached_acts || event == rt.done_event) fence_acquire();
     return true;
 }
 
@@ -391,7 +402,10 @@ __device__ __forceinline__ void run_scheduler(const RuntimeState& rt, int xcd) {
             const int e = rt.global_event_ids[k];
             const uint32_t g = poll(&rt.global_events[e]);
             if (poll(&mirror[e]) != g) {
-                if (!changed) { fence_acquire(); fence_release(); changed = true; }
+                if (!changed) {
+                    if (!rt.uncached_acts) { fence_acquire(); fence_release(); }
+                    changed = true;
+                }
                 __hip_atomic_store(&mirror[e], g, __ATOMIC_RELAXED,
                                    __HIP_MEMORY_SCOPE_AGENT);
             }

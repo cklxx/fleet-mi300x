@@ -106,8 +106,9 @@ __device__ inline void stage_x(const ModelDims& d, const Activations& act, int l
 // output and bf16 residual add.
 // The partials came from other XCDs: acquire first (their XCDs' last
 // arrivals flushed them before adding their shares).
-__device__ inline void fold_partials(const ModelDims& d, const Activations& act) {
-    if (threadIdx.x == 0) fence_acquire();
+__device__ inline void fold_partials(const RuntimeState& rt, const ModelDims& d,
+                                     const Activations& act) {
+    if (threadIdx.x == 0 && !rt.uncached_acts) fence_acquire();
     __syncthreads();
 #pragma unroll 8
     for (int i = threadIdx.x; i < d.hidden; i += kBlockThreads) {
@@ -116,6 +117,27 @@ __device__ inline void fold_partials(const ModelDims& d, const Activations& act)
         act.x[i] = bf16_round(act.x[i] + bf16_round(acc));
     }
     __syncthreads();
+}
+
+// Touch [p, p + bytes) with 16-byte loads, 8 in flight per thread, results
+// folded into a value the asm sink keeps alive (nothing else does).
+__device__ inline void prefetch_bytes(const void* p, int64_t bytes, bool nt) {
+    const fleet_u32x4* v = reinterpret_cast<const fleet_u32x4*>(p);
+    const int64_t n = bytes / 16;
+    uint32_t acc = 0;
+    int64_t i = threadIdx.x;
+    for (; i + 7 * kBlockThreads < n; i += 8 * kBlockThreads) {
+        fleet_u32x4 b[8];
+#pragma unroll
+        for (int u = 0; u < 8; ++u) {
+            b[u] = nt ? __builtin_nontemporal_load(v + i + u * kBlockThreads)
+                      : v[i + u * kBlockThreads];
+        }
+#pragma unroll
+        for (int u = 0; u < 8; ++u) acc ^= b[u].x;
+    }
+    for (; i < n; i += kBlockThreads) acc ^= v[i].x;
+    asm volatile("" :: "v"(acc));
 }
 
 // RMSNorm over the full hidden vector, then this worker's rows of the router
@@ -224,7 +246,43 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
         case TASK_NORM_ROUTER: task_norm_router(d, w, act, s, L, xcd, worker,
                                                 L >= d.first_k_dense); break;
         case TASK_ARGMAX:      task_argmax(d, act, rt, tc); break;
-        case TASK_REDUCE:      break;   // retired: folded into fold_x
+        case TASK_REDUCE:      break;   // retired: FOLD_ON_LAST
+
+        // Idle-worker prefetch (§12): stream a slice of the weights the
+        // routing does not decide — this layer's shared expert and the next
+        // layer's q/kv_a, o_proj and kv_b — during attention, so they sit in
+        // the Infinity Cache when their phase comes. Part [kv_chunk, +head)
+        // of n_split equal slices of the concatenated byte ranges.
+        case TASK_PREFETCH: {
+            const void* base[4]; int64_t bytes[4]; int n = 0;
+            if (L >= d.first_k_dense) {
+                const int shared_inter = 2 * d.moe_inter;
+                base[n] = w.layer_shared[L];
+                bytes[n++] = (int64_t)3 * shared_inter * d.hidden * 2;
+            }
+            if (L + 1 < d.layers) {
+                base[n] = w.layer_qkv[L + 1];
+                bytes[n++] = (int64_t)(d.heads * d.q_head_dim + d.kv_lora + d.qk_rope) * d.hidden * 2;
+                base[n] = w.layer_o_proj[L + 1];
+                bytes[n++] = (int64_t)d.hidden * d.heads * d.v_head * 2;
+                base[n] = w.layer_kv_b[L + 1];
+                bytes[n++] = (int64_t)d.heads * (d.qk_nope + d.v_head) * d.kv_lora * 2;
+            }
+            int64_t total = 0;
+            for (int i = 0; i < n; ++i) total += bytes[i];
+            const int parts = max(1, (int)t.n_split);
+            const int64_t begin = (total * t.kv_chunk / parts) & ~(int64_t)15;
+            const int64_t end = (total * (t.kv_chunk + max(1, (int)t.head)) / parts) & ~(int64_t)15;
+            int64_t off = 0;
+            for (int i = 0; i < n; ++i) {
+                const int64_t lo = max(begin, off), hi = min(end, off + bytes[i]);
+                if (lo < hi) {
+                    prefetch_bytes((const char*)base[i] + (lo - off), hi - lo, rt.prefetch_nt != 0);
+                }
+                off += bytes[i];
+            }
+            break;
+        }
 
         // Merge the head's kv_chunks partials (every merge task of the head
         // recomputes the 16 KB merge) and apply this task's slice of W_UV.
@@ -265,6 +323,12 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
                     d.kv_lora, d.qk_rope, d.rms_eps, s.smem,
                     /*write_cache=*/t.head == 0 && t.kv_chunk == 0,   // one writer per layer
                     cache_layer + (int64_t)tc.pos * kv.row);
+            if (rt.uncached_acts && t.head == 0 && t.kv_chunk == 0) {
+                // The cache row is the one cached cross-XCD payload: with the
+                // global fences gone, its writer flushes it to HBM itself.
+                __syncthreads();
+                if (threadIdx.x == 0) fence_release();
+            }
             q_absorb(act.q + (int64_t)t.head * d.q_head_dim, w.layer_kv_b[L],
                      tc.cos, tc.sin, s.q_c, s.q_pe, s.part, t.head,
                      d.qk_nope, d.qk_rope, d.v_head, d.kv_lora);
@@ -458,9 +522,9 @@ void fleet_decode_step(RuntimeState rt, ModelDims d, Weights w,
             // (all of them minus the fold's own +1): fold, publish, add the +1.
             if ((t->flags & FLAG_FOLD_ON_LAST) &&
                 total_smem == tc.epoch * (uint32_t)t->n_split + (tc.epoch - 1)) {
-                if (!rt.smoke) fold_partials(d, act);
+                if (!rt.smoke) fold_partials(rt, d, act);
                 if (threadIdx.x == 0) {
-                    fence_release();
+                    if (!rt.uncached_acts) fence_release();
                     __hip_atomic_fetch_add(&rt.global_events[t->signal_event], 1u,
                                            __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
                 }

@@ -225,6 +225,18 @@ static T* dev_alloc(size_t n) {
     return p;
 }
 
+// Uncached (MTYPE UC) device memory: no L2 on any XCD ever holds a line of
+// it, so a cross-XCD handshake over it needs no writeback or invalidate.
+template <typename T>
+static T* dev_alloc_uc(size_t n, bool uncached) {
+    if (!uncached) return dev_alloc<T>(n);
+    T* p = nullptr;
+    HIP_CHECK(hipExtMallocWithFlags((void**)&p, std::max<size_t>(1, n) * sizeof(T),
+                                    hipDeviceMallocUncached));
+    HIP_CHECK(hipMemset(p, 0, std::max<size_t>(1, n) * sizeof(T)));
+    return p;
+}
+
 template <typename T>
 static T* dev_upload(const std::vector<T>& v) {
     T* p = dev_alloc<T>(v.size());
@@ -302,7 +314,7 @@ static void describe_abort(uint32_t code, const std::map<int, std::string>& labe
 
 static const char* kKindNames[] = {"QKV_FUSED", "ATTENTION", "MERGE_UV", "O_PROJ",
     "NORM_ROUTER", "EXPERT_GATE_UP", "EXPERT_DOWN", "REDUCE", "DENSE_GATE_UP",
-    "DENSE_DOWN", "EMBED", "LM_HEAD", "ARGMAX"};
+    "DENSE_DOWN", "EMBED", "LM_HEAD", "ARGMAX", "PREFETCH"};
 
 // Per-task timeline (design.md §10): aggregated per task kind and per layer.
 static void report_trace(const std::vector<TaskDescriptor>& tasks,
@@ -357,7 +369,7 @@ int main(int argc, char** argv) {
     std::string hidden_path = "build/golden_hidden.bin";
     std::string json_path, dump_path, trace_path;
     int tokens = 32, context = 1024, first_token = -1, per_launch = 0, repeat = 1;
-    bool smoke = false, teacher = false;
+    bool smoke = false, teacher = false, uncached_acts = false;
     uint32_t spin_limit = 1u << 22;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -378,6 +390,7 @@ int main(int argc, char** argv) {
         else if (a == "--spin-limit") spin_limit = (uint32_t)std::atol(next().c_str());
         else if (a == "--smoke") smoke = true;
         else if (a == "--teacher-force") teacher = true;
+        else if (a == "--uncached-acts") uncached_acts = true;
         else die("unknown argument " + a);
     }
     if (per_launch <= 0 || per_launch > tokens) per_launch = tokens;
@@ -452,6 +465,8 @@ int main(int argc, char** argv) {
     rt.dump_layers = 0;
     rt.trace_token = -1;
     rt.spin_limit = spin_limit;
+    rt.uncached_acts = uncached_acts ? 1 : 0;
+    rt.prefetch_nt = std::getenv("FLEET_PREFETCH_NT") != nullptr ? 1 : 0;
     rt.epoch0 = 1;
     rt.n_tokens = per_launch;
     uint64_t* d_trace = trace_path.empty() ? nullptr : dev_alloc<uint64_t>(tasks.size() * 4);
@@ -472,9 +487,9 @@ int main(int argc, char** argv) {
     d.layers = 1;   // smoke mode: harmless defaults
 
     // Token arrays exist in every mode; the smoke run just never reads them.
-    act.token_in = dev_alloc<int32_t>(tokens + 1);
-    act.token_out = dev_alloc<int32_t>(tokens);
-    act.token_time = dev_alloc<uint64_t>((size_t)tokens * 2);
+    act.token_in = dev_alloc_uc<int32_t>(tokens + 1, uncached_acts);
+    act.token_out = dev_alloc_uc<int32_t>(tokens, uncached_acts);
+    act.token_time = dev_alloc_uc<uint64_t>((size_t)tokens * 2, uncached_acts);
 
     if (!smoke) {
         const Manifest m = load_manifest(weights_path + ".manifest");
@@ -548,15 +563,17 @@ int main(int argc, char** argv) {
         }
 
         // activations (§5)
-        act.x = dev_alloc<float>(d.hidden);
+        // cross-XCD activations (x, the fold partials, the logits) go uncached
+        // with --uncached-acts; everything XCD-local stays in that XCD's L2
+        act.x = dev_alloc_uc<float>(d.hidden, uncached_acts);
         act.x_norm = dev_alloc<float>((size_t)kNumXCDs * d.hidden);
         act.q = dev_alloc<float>((size_t)d.heads * d.q_head_dim);
         act.kv_a = dev_alloc<float>((size_t)kNumXCDs * (d.kv_lora + d.qk_rope));
         act.attn_partial = dev_alloc<float>((size_t)d.heads * kv_chunks * kPartialStride);
         act.o = dev_alloc<float>((size_t)d.heads * d.v_head);
         act.expert_h = dev_alloc<float>(std::max((size_t)kNumXCDs * d.moe_inter, (size_t)d.dense_inter));
-        act.expert_out = dev_alloc<float>((size_t)kNumXCDs * d.hidden);
-        act.logits = dev_alloc<float>(d.vocab);
+        act.expert_out = dev_alloc_uc<float>((size_t)kNumXCDs * d.hidden, uncached_acts);
+        act.logits = dev_alloc_uc<float>(d.vocab, uncached_acts);
         act.router_logits = dev_alloc<float>((size_t)kNumXCDs * d.n_routed);
         act.layer_dump = dev_alloc<float>((size_t)d.layers * d.hidden);
 

@@ -40,6 +40,27 @@ constexpr int kWaves = 256 / kWaveLanes;   // waves per workgroup (= fleet_runti
 #endif
 
 // bf16 pairs arrive as uint32; unpacking in registers costs no memory traffic.
+// Weight streams are read exactly once per token, so they gain nothing from
+// L2 residency and evict what does (KV cache, kv_b, router, norms). With
+// FLEET_NT_WEIGHTS=1 every GEMV weight load is non-temporal (global_load ...
+// nt: streaming allocation policy); the KV cache and kv_b keep normal loads.
+// Build both binaries and measure — the MALL allocation policy under nt is
+// not documented, which is exactly what the A/B decides.
+#ifndef FLEET_NT_WEIGHTS
+#define FLEET_NT_WEIGHTS 0
+#endif
+typedef unsigned int fleet_u32x4 __attribute__((ext_vector_type(4)));
+
+__device__ __forceinline__ uint4 load_weight(const uint4* __restrict__ p) {
+#if FLEET_NT_WEIGHTS
+    const fleet_u32x4 v = __builtin_nontemporal_load(reinterpret_cast<const fleet_u32x4*>(p));
+    uint4 r; r.x = v.x; r.y = v.y; r.z = v.z; r.w = v.w;
+    return r;
+#else
+    return *p;
+#endif
+}
+
 __device__ __forceinline__ void unpack_bf16x2(uint32_t p, float& lo, float& hi) {
     lo = __uint_as_float((p & 0xFFFFu) << 16);
     hi = __uint_as_float(p & 0xFFFF0000u);
@@ -110,7 +131,7 @@ __device__ __forceinline__ void wave_dot(const __hip_bfloat16* const* rows,
     for (int d = 0; d < D; ++d) {                                               \
         if ((I) + d * kWaveLanes < n4) {                                        \
             _Pragma("unroll")                                                   \
-            for (int r = 0; r < R; ++r) BUF[r][d] = r4[r][(I) + d * kWaveLanes]; \
+            for (int r = 0; r < R; ++r) BUF[r][d] = load_weight(r4[r] + (I) + d * kWaveLanes); \
         }                                                                       \
     }
 #define FLEET_CONSUME(BUF, I)                                                   \
@@ -237,7 +258,7 @@ __device__ __forceinline__ void gemv_rows_pipelined(
     for (int r = 0; r < RPI; ++r) {                                             \
         const uint4* r4 = reinterpret_cast<const uint4*>(FLEET_ROW(KK, r));     \
         _Pragma("unroll")                                                       \
-        for (int d = 0; d < D; ++d) BUF[r][d] = r4[idx[d]];                     \
+        for (int d = 0; d < D; ++d) BUF[r][d] = load_weight(r4 + idx[d]);       \
     }
 #define FLEET_REDUCE_GROUP(BUF, KK)                                             \
     {                                                                           \
@@ -409,7 +430,7 @@ __device__ inline void gemv_gate_up_rows(
     for (int r = 0; r < 2; ++r) {                                               \
         const uint4* r4 = reinterpret_cast<const uint4*>(FLEET_PAIR_ROW(KK, r)); \
         _Pragma("unroll")                                                       \
-        for (int d = 0; d < D; ++d) BUF[r][d] = r4[idx[d]];                     \
+        for (int d = 0; d < D; ++d) BUF[r][d] = load_weight(r4 + idx[d]);       \
     }
 #define FLEET_REDUCE_PAIR(BUF, KK)                                              \
     {                                                                           \

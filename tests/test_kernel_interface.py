@@ -122,6 +122,21 @@ def main() -> int:
                          "kGrid = kXCDs * kBlocksPerXCD" in r and "kXCDs = 8" in r))
     results.append(check("cooperative launch is real code",
                          "hipLaunchCooperativeKernel(" in kc))
+    # 4a. constants the host graph and the kernel must agree on
+    tg = (ROOT / "src" / "host" / "taskgraph.py").read_text()
+    ty = (ROOT / "src" / "runtime" / "fleet_types.h").read_text()
+    gm = (ROOT / "src" / "kernels" / "gemv.h").read_text()
+    pairs = [("EXPERT_K_CHUNK", tg, "kExpertKChunk", ty), ("WAVES", tg, "kWaves", gm)]
+    mismatched = []
+    for py_name, py_src, c_name, c_src in pairs:
+        py = re.search(rf"^{py_name}\s*=\s*(\d+)", py_src, re.M)
+        c = re.search(rf"{c_name}\s*=\s*(?:256\s*/\s*kWaveLanes|(\d+))", c_src)
+        c_val = None
+        if c:
+            c_val = int(c.group(1)) if c.group(1) else 256 // 64
+        if not py or c_val is None or int(py.group(1)) != c_val:
+            mismatched.append(f"{py_name}={py and py.group(1)} vs {c_name}={c_val}")
+    results.append(check("graph/kernel constants agree", not mismatched, ", ".join(mismatched)))
 
     # 4b. the epoch is what makes any wait target non-zero; the launcher must
     #     set it from the token index before each launch.

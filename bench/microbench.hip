@@ -163,6 +163,11 @@ __device__ __forceinline__ unsigned mix(unsigned i, unsigned idx) {
 // placement; both record XCC_ID so the host can confirm). Per iteration the
 // producer rewrites the whole payload with an iteration-dependent pattern, so
 // a consumer that sees the previous iteration's data is caught.
+// FENCED = false is the uncached-activation protocol (fleet_runtime.h,
+// uncached_acts): the payload is in MTYPE-UC memory, the producer only
+// drains its stores (s_waitcnt) before the relaxed atomic, the consumer only
+// polls — no L2 writeback, no L2 invalidate anywhere.
+template <bool FENCED>
 __global__ __launch_bounds__(kBlock) void payload_visibility(
     unsigned* __restrict__ payload, unsigned* __restrict__ flag_a,
     unsigned* __restrict__ flag_b, unsigned* __restrict__ errors,
@@ -180,12 +185,21 @@ __global__ __launch_bounds__(kBlock) void payload_visibility(
       }
       __syncthreads();                                // the kernel's barrier
       if (threadIdx.x == 0) {
-        signal(flag_a);                               // release + atomic, thread 0 only
-        wait_for(flag_b, (unsigned)i);
+        if (FENCED) {
+          signal(flag_a);                             // release + atomic, thread 0 only
+          wait_for(flag_b, (unsigned)i);
+        } else {
+          __builtin_amdgcn_s_waitcnt(0);
+          __hip_atomic_fetch_add(flag_a, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+          while (poll(flag_b) < (unsigned)i) { __builtin_amdgcn_s_sleep(1); }
+        }
       }
       __syncthreads();
     } else {
-      if (threadIdx.x == 0) wait_for(flag_a, (unsigned)i);   // poll + acquire, thread 0 only
+      if (threadIdx.x == 0) {                         // poll (+ acquire), thread 0 only
+        if (FENCED) wait_for(flag_a, (unsigned)i);
+        else        while (poll(flag_a) < (unsigned)i) { __builtin_amdgcn_s_sleep(1); }
+      }
       __syncthreads();
       unsigned bad = 0;
       for (int k = threadIdx.x; k < kPayloadWords; k += blockDim.x) {
@@ -193,7 +207,10 @@ __global__ __launch_bounds__(kBlock) void payload_visibility(
       }
       if (bad) atomicAdd(errors, bad);
       __syncthreads();
-      if (threadIdx.x == 0) signal(flag_b);
+      if (threadIdx.x == 0) {
+        if (FENCED) signal(flag_b);
+        else __hip_atomic_fetch_add(flag_b, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      }
     }
   }
 }
@@ -576,18 +593,30 @@ static Stats run_event(int scheme, int iters, double ns, bool* cross_xcd) {
 }
 
 // (d): returns the number of stale words seen over all iterations.
-static unsigned run_payload(int iters, bool* cross_xcd) {
+// uncached: payload and flags in MTYPE-UC memory, protocol without fences (d'').
+static unsigned run_payload(int iters, bool* cross_xcd, bool uncached = false) {
   unsigned *payload, *flags, *errors;
   unsigned long long* ids;
-  HIP_CHECK(hipMalloc(&payload, kPayloadWords * sizeof(unsigned)));
-  HIP_CHECK(hipMalloc(&flags, 256));
+  if (uncached) {
+    HIP_CHECK(hipExtMallocWithFlags((void**)&payload, kPayloadWords * sizeof(unsigned),
+                                    hipDeviceMallocUncached));
+    HIP_CHECK(hipExtMallocWithFlags((void**)&flags, 256, hipDeviceMallocUncached));
+  } else {
+    HIP_CHECK(hipMalloc(&payload, kPayloadWords * sizeof(unsigned)));
+    HIP_CHECK(hipMalloc(&flags, 256));
+  }
   HIP_CHECK(hipMalloc(&errors, sizeof(unsigned)));
   HIP_CHECK(hipMalloc(&ids, 2 * sizeof(unsigned long long)));
   HIP_CHECK(hipMemset(payload, 0, kPayloadWords * sizeof(unsigned)));
   HIP_CHECK(hipMemset(flags, 0, 256));
   HIP_CHECK(hipMemset(errors, 0, sizeof(unsigned)));
-  hipLaunchKernelGGL(payload_visibility, dim3(kGrid), dim3(kBlock), 0, 0,
-                     payload, flags, flags + 16, errors, ids, iters);
+  if (uncached) {
+    hipLaunchKernelGGL(payload_visibility<false>, dim3(kGrid), dim3(kBlock), 0, 0,
+                       payload, flags, flags + 16, errors, ids, iters);
+  } else {
+    hipLaunchKernelGGL(payload_visibility<true>, dim3(kGrid), dim3(kBlock), 0, 0,
+                       payload, flags, flags + 16, errors, ids, iters);
+  }
   HIP_CHECK(hipDeviceSynchronize());
   unsigned bad = 0;
   unsigned long long h_ids[2];
@@ -713,6 +742,15 @@ int main(int argc, char** argv) {
                 "stop here — every number below is meaningless until this passes\n");
   }
 
+  std::printf("(d'') the same payload in uncached (MTYPE UC) memory with NO fences: producer drains "
+              "stores + relaxed atomic, consumer polls, %d rounds (the --uncached-acts protocol)\n", iters);
+  bool cross_uc = false;
+  const unsigned stale_uc = run_payload(iters, &cross_uc, /*uncached=*/true);
+  const bool payload_uc_ok = !stale_uc && cross_uc;
+  std::printf("    stale words: %u of %llu  [%s]%s\n\n", stale_uc,
+              (unsigned long long)iters * kPayloadWords, payload_uc_ok ? "PASS" : "FAIL",
+              cross_uc ? "" : "   !! same XCD: not a cross-XCD result");
+
   std::printf("(d') %d producers on one XCD, drained stores, ONE last-arriver flush; a same-XCD consumer "
               "(L1-only acquire) and a cross-XCD consumer (L1+L2 acquire) verify every word, %d rounds\n",
               kProducers, iters / 4);
@@ -782,6 +820,7 @@ int main(int argc, char** argv) {
     std::fprintf(f,
         "{\n  \"device\": \"%s\",\n  \"arch\": \"%s\",\n  \"cus\": %d,\n"
         "  \"payload_stale_words\": %u, \"payload_cross_xcd\": %s,\n"
+        "  \"payload_uncached_stale_words\": %u, \"payload_uncached_cross_xcd\": %s,\n"
         "  \"event_cached_us\": {\"median\": %.3f, \"p95\": %.3f},\n"
         "  \"event_uncached_us\": {\"median\": %.3f, \"p95\": %.3f},\n"
         "  \"event_loaded_us\": {\"median\": %.3f, \"p95\": %.3f, \"load_tbs\": %.3f, \"cross_xcd\": %s},\n"
@@ -790,6 +829,7 @@ int main(int argc, char** argv) {
         "  \"gemv_best_tbs\": %.3f\n}\n",
         prop.name, prop.gcnArchName, prop.multiProcessorCount,
         stale, cross_d ? "true" : "false",
+        stale_uc, cross_uc ? "true" : "false",
         wbl2.median / 1e3, wbl2.p95 / 1e3, wt.median / 1e3, wt.p95 / 1e3,
         loaded.median / 1e3, loaded.p95 / 1e3, load_tbs, cross_e ? "true" : "false",
         loc.median / 1e3, loc.p95 / 1e3,
@@ -797,5 +837,5 @@ int main(int argc, char** argv) {
     std::fclose(f);
     std::printf("\nwrote %s\n", json_path);
   }
-  return (payload_ok && lastflush_ok) ? 0 : 1;
+  return (payload_ok && lastflush_ok && payload_uc_ok) ? 0 : 1;
 }

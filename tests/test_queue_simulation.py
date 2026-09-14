@@ -155,11 +155,11 @@ def simulate(tasks: list[dict], epochs: int, order: str, seed: int = 0,
 
 def main() -> int:
     results = []
-    for kv_chunks in (1, 8):
-        g = build(load_cfg(CONFIG, kv_chunks))
+    for kv_chunks, prefetch in ((1, False), (8, False), (8, True)):
+        g = build(load_cfg(CONFIG, kv_chunks, prefetch))
         tasks = decode(b"".join(t.pack() for t in g.tasks))
         events = g.events
-        print(f"kv_chunks={kv_chunks}: {len(tasks)} descriptors, "
+        print(f"kv_chunks={kv_chunks} prefetch={prefetch}: {len(tasks)} descriptors, "
               f"{len({(t['xcd'], t['worker']) for t in tasks})} worker queues")
 
         results.append(check("every worker queue is populated",
