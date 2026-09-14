@@ -470,11 +470,17 @@ constexpr size_t kUnitElems = (size_t)3 * kInter * kHidden;   // gate/up interle
 // (buffer_inv); 2 = the design's §4 variant — blocks drain their stores
 // (s_waitcnt) and bump the counter, only the *last* one releases; waiters
 // acquire as before. The counters are monotonic across layers and launches.
-__global__ __launch_bounds__(kBlock, 1) void expert_phase(
+// The body below is shared by two kernels that differ in one thing only: the
+// occupancy the compiler is allowed to reach. This benchmark has always run
+// at whatever its own register use permits, while the same code inside the
+// megakernel is pinned to one wave per SIMD by the 343-register union of
+// every task body. If forcing this copy to a single wave reproduces the
+// in-kernel rate, that union is what the remaining gap costs.
+__device__ __forceinline__ void expert_phase_body(
     const __hip_bfloat16* __restrict__ experts, float* __restrict__ h,
     float* __restrict__ out, unsigned long long* __restrict__ busy,
-    unsigned* __restrict__ ctr, unsigned base, int layers, int do_down, int sync) {
-  __shared__ float x[kHidden];
+    unsigned* __restrict__ ctr, unsigned base, int layers, int do_down, int sync,
+    float* __restrict__ x) {
   for (int i = threadIdx.x; i < kHidden; i += kBlock) x[i] = 0.001f * (i % 7);
   __syncthreads();
   const int xcd = blockIdx.x % kXCDs;           // which unit this block streams
@@ -511,7 +517,24 @@ __global__ __launch_bounds__(kBlock, 1) void expert_phase(
   }
 }
 
-static double run_expert_phase(int do_down, int sync, double ns) {
+__global__ __launch_bounds__(kBlock, 1) void expert_phase(
+    const __hip_bfloat16* __restrict__ experts, float* __restrict__ h,
+    float* __restrict__ out, unsigned long long* __restrict__ busy,
+    unsigned* __restrict__ ctr, unsigned base, int layers, int do_down, int sync) {
+  __shared__ float x[kHidden];
+  expert_phase_body(experts, h, out, busy, ctr, base, layers, do_down, sync, x);
+}
+
+__global__ __launch_bounds__(kBlock, 1) __attribute__((amdgpu_waves_per_eu(1, 1)))
+void expert_phase_1wave(
+    const __hip_bfloat16* __restrict__ experts, float* __restrict__ h,
+    float* __restrict__ out, unsigned long long* __restrict__ busy,
+    unsigned* __restrict__ ctr, unsigned base, int layers, int do_down, int sync) {
+  __shared__ float x[kHidden];
+  expert_phase_body(experts, h, out, busy, ctr, base, layers, do_down, sync, x);
+}
+
+static double run_expert_phase(int do_down, int sync, double ns, int force1 = 0) {
   const size_t elems = (size_t)kLayersF * kUnits * kUnitElems;
   __hip_bfloat16* w; float *h, *out; unsigned long long* busy; unsigned* ctr;
   HIP_CHECK(hipMalloc(&w, elems * sizeof(__hip_bfloat16)));
@@ -524,10 +547,18 @@ static double run_expert_phase(int do_down, int sync, double ns) {
   hipEvent_t a, b;
   HIP_CHECK(hipEventCreate(&a)); HIP_CHECK(hipEventCreate(&b));
   const unsigned per_launch = (unsigned)kLayersF * kCUsPerXCD;
-  hipLaunchKernelGGL(expert_phase, dim3(kGrid), dim3(kBlock), 0, 0, w, h, out, busy, ctr, 0u, kLayersF, do_down, sync);
+  if (force1) {
+    hipLaunchKernelGGL(expert_phase_1wave, dim3(kGrid), dim3(kBlock), 0, 0, w, h, out, busy, ctr, 0u, kLayersF, do_down, sync);
+  } else {
+    hipLaunchKernelGGL(expert_phase, dim3(kGrid), dim3(kBlock), 0, 0, w, h, out, busy, ctr, 0u, kLayersF, do_down, sync);
+  }
   HIP_CHECK(hipDeviceSynchronize());
   HIP_CHECK(hipEventRecord(a));
-  hipLaunchKernelGGL(expert_phase, dim3(kGrid), dim3(kBlock), 0, 0, w, h, out, busy, ctr, per_launch, kLayersF, do_down, sync);
+  if (force1) {
+    hipLaunchKernelGGL(expert_phase_1wave, dim3(kGrid), dim3(kBlock), 0, 0, w, h, out, busy, ctr, per_launch, kLayersF, do_down, sync);
+  } else {
+    hipLaunchKernelGGL(expert_phase, dim3(kGrid), dim3(kBlock), 0, 0, w, h, out, busy, ctr, per_launch, kLayersF, do_down, sync);
+  }
   HIP_CHECK(hipEventRecord(b));
   HIP_CHECK(hipEventSynchronize(b));
   float ms = 0; HIP_CHECK(hipEventElapsedTime(&ms, a, b));
@@ -543,7 +574,8 @@ static double run_expert_phase(int do_down, int sync, double ns) {
   const double bytes = (double)kLayersF * kUnits * (do_down ? 3.0 : 2.0) * kInter * kHidden * 2;
   static const char* names[] = {"no handshake", "per-worker release", "last-worker release"};
   std::printf("    %-22s %-20s %6.1f us/layer, %.2f TB/s; per block: mean %.1f us, slowest %.1f us\n",
-              do_down ? "gate_up + down" : "gate_up only", names[sync], ms * 1e3 / kLayersF,
+              force1 ? "gate_up + down, 1 wave" : (do_down ? "gate_up + down" : "gate_up only"),
+              names[sync], ms * 1e3 / kLayersF,
               bytes / (ms * 1e-3) / 1e12, mean_us, max_us);
   HIP_CHECK(hipFree(w)); HIP_CHECK(hipFree(h)); HIP_CHECK(hipFree(out)); HIP_CHECK(hipFree(busy));
   HIP_CHECK(hipFree(ctr));
@@ -891,6 +923,11 @@ int main(int argc, char** argv) {
   const double f_all = run_expert_phase(1, 0, ns);
   const double f_sync1 = run_expert_phase(1, 1, ns);
   const double f_sync2 = run_expert_phase(1, 2, ns);
+  // the decisive one: identical code, occupancy forced to what the megakernel
+  // is pinned at. If this lands on the in-kernel rate, the register union is
+  // the cost; if it does not, the gap is somewhere else entirely.
+  const double f_1wave = run_expert_phase(1, 0, ns, 1);
+  (void)f_1wave;
   std::printf("    -> %.0f%% of (c)'s ceiling for gate_up alone, %.0f%% with down; with the kernel's "
               "per-worker handshake %.0f%%, with the last-worker flush %.0f%%\n",
               f_gu / best * 100, f_all / best * 100, f_sync1 / best * 100, f_sync2 / best * 100);
