@@ -98,6 +98,10 @@ class Flags(IntFlag):
     ROUTING_CACHED = 128  # expert down: the same worker just ran this layer's
                           # gate_up, whose top-k is still in its LDS — skip
                           # select_experts (measured 4.9 us per task)
+    TOPK_PUBLISH = 256    # router: the last of the XCD's 37 workers to arrive on
+                          # local_event publishes the top-k for the experts
+    TOPK_READ = 512       # expert: read that published top-k instead of redoing
+                          # softmax + top-k per task
 
 
 # Implementation status per task kind, reported because the task spec asks for
@@ -319,11 +323,18 @@ def build_moe_layer(g: Graph, layer: int, prev_event: int | None,
     # XCD's logits; the expert tasks pick the top-k in their prologue. 256 KB
     # of router weights read 8 times buys an XCD-local event and 37 CUs of
     # bandwidth instead of one.
+    # the last of the XCD's 37 router workers has seen all 64 logits: it turns
+    # them into the top-k once and publishes it, then signals e_router, so any
+    # expert task released by e_router sees the publication
+    published = cfg.get("topk_published", False)
     e_router = []
     for xcd in range(XCDS):
-        e = g.new_event(Scope.XCD_LOCAL, WORKERS_PER_XCD, f"L{layer}.router.x{xcd}")
-        g.chiplet_task(Task(TaskKind.NORM_ROUTER, layer, xcd, e_oproj, e,
-                            Scope.XCD_LOCAL), [xcd])
+        e = g.new_event(Scope.XCD_LOCAL, WORKERS_PER_XCD, f"L{layer}.norm.x{xcd}")
+        pub = g.new_event(Scope.XCD_LOCAL, WORKERS_PER_XCD,
+                          f"L{layer}.topk.x{xcd}") if published else None
+        g.chiplet_task(Task(TaskKind.NORM_ROUTER, layer, xcd, e_oproj, e, Scope.XCD_LOCAL,
+                            local_event=pub, n_split=WORKERS_PER_XCD,
+                            flags=Flags.TOPK_PUBLISH if published else Flags.NONE), [xcd])
         e_router.append(e)
 
     # experts: 8 balanced units = top_k routed + shared split in two.
@@ -337,6 +348,7 @@ def build_moe_layer(g: Graph, layer: int, prev_event: int | None,
     # [G, 37) of every XCD (WORKER_GROUP), so the K-chunk tiling can actually
     # overlap them — with one group for both, a worker's own gate_up rows
     # are in front of its down task and nothing overlaps (measured).
+    read_flag = Flags.TOPK_READ if cfg.get("topk_published", False) else Flags.NONE
     n_chunks = -(-cfg["moe_inter"] // cfg.get("k_chunk", EXPERT_K_CHUNK))
     G = cfg.get("split_workers", 0)
     gu_workers = range(0, G) if G else None
@@ -357,12 +369,12 @@ def build_moe_layer(g: Graph, layer: int, prev_event: int | None,
         g.chiplet_task(Task(TaskKind.EXPERT_GATE_UP, layer, xcd, e_router[xcd],
                             None, Scope.NONE, expert_slot=slot,
                             local_event=e_chunk0[xcd], kv_chunk=n_chunks,
-                            flags=Flags.CHUNK_SIGNAL), [xcd], workers=gu_workers)
+                            flags=Flags.CHUNK_SIGNAL | read_flag), [xcd], workers=gu_workers)
     for xcd in range(XCDS):
         slot = xcd if xcd < top_k else -(xcd - top_k + 1)
         # without a worker split the down descriptor directly follows the
         # same worker's gate_up descriptor, so the routing is still in LDS
-        dn_flags = Flags.CHUNK_WAIT | (Flags.NONE if G else Flags.ROUTING_CACHED)
+        dn_flags = Flags.CHUNK_WAIT | read_flag | (Flags.NONE if G else Flags.ROUTING_CACHED)
         g.chiplet_task(Task(TaskKind.EXPERT_DOWN, layer, xcd, e_chunk0[xcd],
                             e_down, Scope.GLOBAL, expert_slot=slot,
                             local_event=e_chunk0[xcd], kv_chunk=n_chunks,
@@ -381,6 +393,7 @@ def build_dense_layer(g: Graph, layer: int, prev_event: int | None,
         build_prefetch(g, layer, e_qkv)
     e_oproj = build_o_proj(g, layer, e_merge)
 
+    # the dense layer has no experts, so nothing to publish
     e_norm = []
     for xcd in range(XCDS):
         e = g.new_event(Scope.XCD_LOCAL, WORKERS_PER_XCD, f"L{layer}.norm.x{xcd}")
@@ -496,6 +509,12 @@ def validate(g: Graph) -> list[str]:
             errors.append(f"task {t.index}: n_split {t.n_split} != producers of "
                           f"its local event")
 
+    for t in g.tasks:
+        if t.flags & Flags.TOPK_PUBLISH:
+            if t.local_event is None or t.n_split != WORKERS_PER_XCD:
+                errors.append(f"task {t.index}: TOPK_PUBLISH without a full-XCD arrival counter")
+            else:
+                signalled[t.local_event] = signalled.get(t.local_event, 0) + 1
     for ev in g.events:
         got, want = signalled.get(ev["id"], 0), ev["producers"]
         if got != want:
@@ -667,13 +686,14 @@ def report(g: Graph, cfg: dict) -> None:
 
 def load_cfg(config: Path, kv_chunks: int, prefetch: bool = False,
              k_chunk: int = EXPERT_K_CHUNK, kva_shared: bool = True,
-             split_workers: int = 0) -> dict:
+             split_workers: int = 0, topk_published: bool = False) -> dict:
     c = json.loads(config.read_text())
     return {
         "prefetch": prefetch,
         "k_chunk": k_chunk,
         "kva_shared": kva_shared,
         "split_workers": split_workers,
+        "topk_published": topk_published,
         "layers": c["num_hidden_layers"],
         "heads": c["num_attention_heads"],
         "top_k": c["num_experts_per_tok"],
@@ -700,12 +720,17 @@ def main() -> None:
                     help="every XCD computes its own copy of the 576 kv_a rows behind an "
                          "XCD-local event (the v0.10-v0.14 graph) instead of the default "
                          "split over the 8 XCDs behind one global event")
+    ap.add_argument("--topk-published", action="store_true",
+                    help="the router's last arriver publishes the top-k and the expert tasks "
+                         "read it (64 B); measured 0.4%% slower than the default, where every "
+                         "expert task redoes softmax + top-k in parallel (STATUS.md)")
     ap.add_argument("--split-workers", type=int, default=0,
                     help="G: expert gate_up on workers [0,G) and down on [G,37) per XCD, "
                          "so --k-chunk tiling can overlap them")
     a = ap.parse_args()
 
-    cfg = load_cfg(a.config, a.kv_chunks, a.prefetch, a.k_chunk, not a.kva_replicated, a.split_workers)
+    cfg = load_cfg(a.config, a.kv_chunks, a.prefetch, a.k_chunk, not a.kva_replicated,
+                   a.split_workers, a.topk_published)
     g = build(cfg)
 
     if a.emit:

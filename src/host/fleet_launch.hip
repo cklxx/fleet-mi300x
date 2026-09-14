@@ -592,6 +592,8 @@ int main(int argc, char** argv) {
         act.argmax_val = dev_alloc<float>((size_t)kNumXCDs * kWorkersPerXCD);
         act.argmax_idx = dev_alloc<int32_t>((size_t)kNumXCDs * kWorkersPerXCD);
         act.router_logits = dev_alloc<float>((size_t)kNumXCDs * d.n_routed);
+        act.topk_ids = dev_alloc<int32_t>((size_t)kNumXCDs * kMaxTopK);
+        act.topk_w = dev_alloc<float>((size_t)kNumXCDs * kMaxTopK);
         act.layer_dump = dev_alloc<float>((size_t)d.layers * d.hidden);
 
         std::vector<float> cos_h, sin_h;

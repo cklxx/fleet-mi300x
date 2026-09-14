@@ -81,6 +81,8 @@ struct Activations {
     float* __restrict__ logits;        // [vocab]
     float* __restrict__ argmax_val;    // [kNumXCDs * workers] per-worker best logit
     int32_t* __restrict__ argmax_idx;  // [kNumXCDs * workers] ...and its index
+    int32_t* __restrict__ topk_ids;    // [kNumXCDs][kMaxTopK] published once per XCD by
+    float* __restrict__ topk_w;        // the router's last arriver (TOPK_PUBLISH)
     float* __restrict__ router_logits; // [kNumXCDs][n_routed], fp32; the expert
                                        // tasks derive top-k from it themselves
     const float* __restrict__ cos;     // [max_pos][qk_rope] YaRN tables; the kernel

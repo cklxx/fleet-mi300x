@@ -121,6 +121,11 @@ enum TaskFlags : int16_t {
                               // at worker `head`, not over all 37
     FLAG_ROUTING_CACHED = 128, // expert down: this worker's previous task was
                               // the layer's gate_up; its top-k is still in LDS
+    FLAG_TOPK_PUBLISH = 256,  // router: the last of the XCD's 37 workers to
+                              // arrive on local_event turns the 64 logits into
+                              // the top-k and publishes it for the experts
+    FLAG_TOPK_READ = 512,     // expert: read that published top-k (64 B) rather
+                              // than repeating softmax + top-k per task
 };
 
 // Device-side state, allocated once by the host.

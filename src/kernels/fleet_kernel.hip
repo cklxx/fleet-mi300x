@@ -293,9 +293,15 @@ __device__ inline void prefetch_bytes(const void* p, int64_t bytes, bool nt) {
 // — a Chiplet-task per XCD, so the experts of this XCD wait on an XCD-local
 // event and one CU is not asked to stream 256 KB alone. Every worker norms
 // the same x in the same order; worker 0 publishes it for the experts.
+// defined below, used by the publication step
+template <typename I>
+__device__ inline void select_experts(const ModelDims& d, const float* __restrict__ logits,
+                                      I* __restrict__ ids, float* __restrict__ ws);
+
 __device__ void task_norm_router(const ModelDims& d, const Weights& w,
                                  Activations& act, Scratch& s, int layer,
-                                 int xcd, int worker, bool moe, const TokenCtx& tc, bool coh) {
+                                 int xcd, int worker, bool moe, const TokenCtx& tc, bool coh,
+                                 const TaskDescriptor& t, const RuntimeState& rt) {
     // x[1] = bf16(x[0] + bf16(o_proj)) from the 8 K-split partials
     stage_residual(d, act.x[0], act.oproj_partial, act.x[1], s.vec, xcd, worker, coh);
     FLEET_STAMP_STAGE();
@@ -310,6 +316,26 @@ __device__ void task_norm_router(const ModelDims& d, const Weights& w,
     gemv_rows(w.layer_router[layer], d.hidden, s.vec,
               act.router_logits + (int64_t)xcd * d.n_routed, nullptr, EPI_NONE,
               1.f, d.n_routed, d.hidden, 0, 1, worker, kWorkersPerXCD);
+
+    // The softmax + 6-pass top-k is 36 dependent shuffles on one wave while
+    // the other three wait; every expert task used to repeat it (measured
+    // ~5 us of the gate_up prologue). Here the last of the XCD's 37 router
+    // workers — the only one that can see all 64 logits — does it once and
+    // publishes 8 ids + 8 weights. It signals its own event afterwards, so
+    // a consumer that sees the event sees the publication.
+    if (t.flags & FLAG_TOPK_PUBLISH) {
+        __shared__ int last_router;
+        if (threadIdx.x == 0) {
+            last_router = arrive_last(rt, tc.epoch, t.local_event, xcd, kWorkersPerXCD) ? 1 : 0;
+        }
+        __syncthreads();
+        if (last_router) {
+            if (threadIdx.x == 0) fence_acquire_local();
+            __syncthreads();
+            select_experts(d, act.router_logits + (int64_t)xcd * d.n_routed,
+                           act.topk_ids + xcd * kMaxTopK, act.topk_w + xcd * kMaxTopK);
+        }
+    }
 }
 
 // Softmax over the router logits and top-k, on wave 0 with one expert per
@@ -322,8 +348,9 @@ __device__ inline float load_logit(const ModelDims& d, const float* __restrict__
 }
 
 // `v`: this lane's logit (wave 0), from load_logit.
+template <typename I>
 __device__ inline void select_experts_from(const ModelDims& d, float v,
-                                           int* __restrict__ ids, float* __restrict__ ws) {
+                                           I* __restrict__ ids, float* __restrict__ ws) {
     if (threadIdx.x < kWaveLanes) {
         const int lane = threadIdx.x;
         const bool valid = lane < d.n_routed;
@@ -349,8 +376,9 @@ __device__ inline void select_experts_from(const ModelDims& d, float v,
     __syncthreads();
 }
 
+template <typename I>
 __device__ inline void select_experts(const ModelDims& d, const float* __restrict__ logits,
-                                      int* __restrict__ ids, float* __restrict__ ws) {
+                                      I* __restrict__ ids, float* __restrict__ ws) {
     select_experts_from(d, load_logit(d, logits), ids, ws);
 }
 
@@ -455,7 +483,7 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
     switch (t.kind) {
         case TASK_EMBED:       task_embed(d, w, act, tc, coh); break;
         case TASK_NORM_ROUTER: task_norm_router(d, w, act, s, L, xcd, worker,
-                                                L >= d.first_k_dense, tc, coh); break;
+                                                L >= d.first_k_dense, tc, coh, t, rt); break;
         case TASK_ARGMAX:      task_argmax(d, act, rt, tc); break;
         case TASK_REDUCE:      break;   // retired: consumers fold in their prologue
 
@@ -582,16 +610,16 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
         }
 
         case TASK_EXPERT_GATE_UP: {
-            {   // the 64-logit read from this XCD's L2 measured ~5 us under full
-                // streaming load; the stage stamp brackets the load alone
-                const float v = load_logit(d, act.router_logits + (int64_t)xcd * d.n_routed);
-                __builtin_amdgcn_s_waitcnt(0);
-                FLEET_STAMP_STAGE();
-                select_experts_from(d, v, s.ids, s.ws);
+            const int32_t* ids = act.topk_ids + xcd * kMaxTopK;
+            const float* ws = act.topk_w + xcd * kMaxTopK;
+            if (!(t.flags & FLAG_TOPK_READ)) {   // per-task softmax + top-k
+                select_experts(d, act.router_logits + (int64_t)xcd * d.n_routed, s.ids, s.ws);
+                ids = s.ids; ws = s.ws;
             }
+            FLEET_STAMP_STAGE();
             const ExpertUnit u = resolve_unit(
                 t.expert_slot, w.layer_experts[L], w.layer_shared[L],
-                s.ids, s.ws, d.routed_scaling, d.hidden, d.moe_inter, d.moe_inter * 2,
+                ids, ws, d.routed_scaling, d.hidden, d.moe_inter, d.moe_inter * 2,
                 w.expert_stride);
             stage_vector(act.x_norm + (int64_t)xcd * d.hidden, s.vec, d.hidden);
             FLEET_STAMP();
@@ -605,15 +633,20 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
 
         case TASK_EXPERT_DOWN: {
             // the routing (64 logits from L2 under full streaming load, then
-            // softmax + top-k on one wave) measured 4.9 us; when this
-            // worker's previous descriptor was the layer's gate_up the
-            // choice is still in s.ids / s.ws
-            if (!(t.flags & FLAG_ROUTING_CACHED)) {
-                select_experts(d, act.router_logits + (int64_t)xcd * d.n_routed, s.ids, s.ws);
+            // softmax + top-k on one wave) measured 4.9 us per task. Either
+            // the router published it (64 B), or this worker's previous
+            // descriptor was the layer's gate_up and it is still in LDS.
+            const int32_t* ids = act.topk_ids + xcd * kMaxTopK;
+            const float* ws = act.topk_w + xcd * kMaxTopK;
+            if (!(t.flags & FLAG_TOPK_READ)) {
+                if (!(t.flags & FLAG_ROUTING_CACHED)) {
+                    select_experts(d, act.router_logits + (int64_t)xcd * d.n_routed, s.ids, s.ws);
+                }
+                ids = s.ids; ws = s.ws;
             }
             const ExpertUnit u = resolve_unit(
                 t.expert_slot, w.layer_experts[L], w.layer_shared[L],
-                s.ids, s.ws, d.routed_scaling, d.hidden, d.moe_inter, d.moe_inter * 2,
+                ids, ws, d.routed_scaling, d.hidden, d.moe_inter, d.moe_inter * 2,
                 w.expert_stride);
             // K-chunked (§12): chunk c of h is consumed as soon as this XCD's
             // gate_up waves have stored it. Chunk 0 was the descriptor's

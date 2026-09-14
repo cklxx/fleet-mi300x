@@ -93,20 +93,22 @@ run_variant() {   # name binary graph extra-args...
 python3 src/host/taskgraph.py --kv-chunks 16 --k-chunk 512 --emit build/taskgraph_d16_k512.bin | tail -1
 python3 src/host/taskgraph.py --kv-chunks 16 --prefetch --emit build/taskgraph_d16_prefetch.bin | tail -1
 python3 src/host/taskgraph.py --kv-chunks 16 --kva-replicated --emit build/taskgraph_d16_kvarep.bin | tail -1
+python3 src/host/taskgraph.py --kv-chunks 16 --topk-published --emit build/taskgraph_d16_topkpub.bin | tail -1
 python3 src/host/taskgraph.py --kv-chunks 16 --split-workers 18 --k-chunk 512 --emit build/taskgraph_d16_split18_k512.bin | tail -1
 python3 src/host/taskgraph.py --kv-chunks 16 --split-workers 18 --emit build/taskgraph_d16_split18.bin | tail -1
 python3 src/host/taskgraph.py --kv-chunks 16 --split-workers 22 --k-chunk 512 --emit build/taskgraph_d16_split22_k512.bin | tail -1
 
 run_variant nt_d16_fenced    $BIN                 build/taskgraph_d16.bin
-run_variant nt_d16_coherent  $BIN                 build/taskgraph_d16.bin          --coherent-acts
+run_variant nt_d16_coherent  $BIN                 build/taskgraph_d16_kvarep.bin   --coherent-acts
 run_variant nt_d16_fenced_b  $BIN                 build/taskgraph_d16.bin
-run_variant nt_d16_coherent_b $BIN                build/taskgraph_d16.bin          --coherent-acts
+run_variant nt_d16_coherent_b $BIN                build/taskgraph_d16_kvarep.bin   --coherent-acts
 run_variant plain_d16        ./build/fleet_decode build/taskgraph_d16.bin
 run_variant nt_d8            $BIN                 build/taskgraph_d8.bin
 run_variant nt_d16_kchunk512 $BIN                 build/taskgraph_d16_k512.bin
 run_variant nt_d16_prefetch  $BIN                 build/taskgraph_d16_prefetch.bin
 run_variant nt_d16_v1        $BIN                 build/taskgraph_d16.bin          --tokens-per-launch 1
 run_variant nt_d16_kvarep    $BIN                 build/taskgraph_d16_kvarep.bin
+run_variant nt_d16_topkpub   $BIN                 build/taskgraph_d16_topkpub.bin
 run_variant nt_d16_pfnext    $BIN                 build/taskgraph_d16.bin          --prefetch-next
 run_variant nt_d16_pfnext_b  $BIN                 build/taskgraph_d16.bin          --prefetch-next
 run_variant nt_d16_split18_k512 $BIN              build/taskgraph_d16_split18_k512.bin

@@ -108,6 +108,8 @@ def simulate(tasks: list[dict], epochs: int, order: str, seed: int = 0,
                         for c in range(t["kv_chunk"]):     # every wave, in-body
                             local[t["xcd"]][t["local_event"] + c] += WAVES
                     do_signal = True
+                    if t["flags"] & Flags.TOPK_PUBLISH:
+                        local[t["xcd"]][t["local_event"]] += 1
                     if t["flags"] & Flags.SIGNAL_LAST:
                         local[t["xcd"]][t["local_event"]] += 1
                         do_signal = local[t["xcd"]][t["local_event"]] == epoch * t["n_split"]
@@ -150,6 +152,7 @@ def main() -> int:
     results = []
     variants = [dict(kv_chunks=1), dict(kv_chunks=8), dict(kv_chunks=8, prefetch=True),
                 dict(kv_chunks=16, kva_shared=False),
+                dict(kv_chunks=16, topk_published=True),
                 dict(kv_chunks=16, split_workers=18, k_chunk=512)]
     for v in variants:
         kv_chunks, prefetch = v["kv_chunks"], v.get("prefetch", False)

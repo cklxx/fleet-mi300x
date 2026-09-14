@@ -22,22 +22,22 @@ grid: 304 workgroups x 256 threads   tick 10.00 ns
     median  1.320  p95  1.480   (vs cross-XCD 1.36)
 
 (e) cross-XCD event round-trip while 302 workgroups stream HBM (us)
-    median   6.00  p95   7.20   (idle: 1.36)  under 1.64 TB/s of streaming load  <- the value for design.md §9
+    median   6.36  p95   7.52   (idle: 1.36)  under 1.68 TB/s of streaming load  <- the value for design.md §9
 
 (c) register-streamed read bandwidth by in-flight depth
-    depth  1:  2.64 TB/s
+    depth  1:  2.67 TB/s
     depth  2:  3.41 TB/s
-    depth  4:  3.76 TB/s
+    depth  4:  3.78 TB/s
     depth  8:  4.28 TB/s
     depth 12:  4.19 TB/s
     depth 16:  3.80 TB/s
     -> best 4.28 TB/s = 81% of 5.3 peak (design assumes 4.0 achievable)
 
 (f) the kernel's expert GEMVs in isolation (gemv.h, 8 x 17.3 MB units/layer, 27 layers)
-    gate_up only           no handshake           24.3 us/layer, 3.79 TB/s; per block: mean 23.5 us, slowest 29.7 us
-    gate_up + down         no handshake           37.3 us/layer, 3.71 TB/s; per block: mean 36.1 us, slowest 43.0 us
-    gate_up + down         per-worker release     46.9 us/layer, 2.95 TB/s; per block: mean 46.1 us, slowest 52.1 us
-    gate_up + down         last-worker release    38.7 us/layer, 3.58 TB/s; per block: mean 38.0 us, slowest 40.7 us
-    -> 89% of (c)'s ceiling for gate_up alone, 87% with down; with the kernel's per-worker handshake 69%, with the last-worker flush 84%
+    gate_up only           no handshake           24.6 us/layer, 3.75 TB/s; per block: mean 23.6 us, slowest 29.8 us
+    gate_up + down         no handshake           37.0 us/layer, 3.74 TB/s; per block: mean 35.9 us, slowest 43.2 us
+    gate_up + down         per-worker release     47.2 us/layer, 2.93 TB/s; per block: mean 46.4 us, slowest 51.8 us
+    gate_up + down         last-worker release    38.9 us/layer, 3.56 TB/s; per block: mean 37.8 us, slowest 40.7 us
+    -> 87% of (c)'s ceiling for gate_up alone, 87% with down; with the kernel's per-worker handshake 68%, with the last-worker flush 83%
 
 wrote results/microbench.json

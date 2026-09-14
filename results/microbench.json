@@ -7,8 +7,8 @@
   "payload_atomic_stale_words": 0, "payload_atomic_cross_xcd": true,
   "event_cached_us": {"median": 1.360, "p95": 1.560},
   "event_uncached_us": {"median": 1.360, "p95": 1.440},
-  "event_loaded_us": {"median": 6.000, "p95": 7.200, "load_tbs": 1.642, "cross_xcd": true},
+  "event_loaded_us": {"median": 6.360, "p95": 7.520, "load_tbs": 1.675, "cross_xcd": true},
   "xcd_local_us": {"median": 1.3200, "p95": 1.4800},
-  "gemv_tbs": [2.638, 3.413, 3.762, 4.279, 4.194, 3.798],
-  "gemv_best_tbs": 4.279
+  "gemv_tbs": [2.667, 3.407, 3.777, 4.283, 4.194, 3.804],
+  "gemv_best_tbs": 4.283
 }

@@ -1,6 +1,6 @@
 # Fleet-style Batch-1 Decode for DeepSeek-Coder-V2-Lite-Base on MI300X — Technical Design
 
-Author: Kailun Chen · Status: v0.15 (measured on the MI300X; v0.8 is the submitted proposal, kept verbatim in `docs/task/`) · Target: single MI300X (gfx942), BF16, bs=1, 1024-token context, 32 greedy tokens
+Author: Kailun Chen · Status: v0.16 (measured on the MI300X; v0.8 is the submitted proposal, kept verbatim in `docs/task/`) · Target: single MI300X (gfx942), BF16, bs=1, 1024-token context, 32 greedy tokens
 
 ---
 
@@ -215,7 +215,7 @@ Measured on 2026-09-14/15 (1×MI300X VM, ROCm 7.2; raw files in `results/`, narr
 | Achievable streaming bandwidth | 4.0 TB/s | 4.24 TB/s (`microbench (c)`, depth 8) |
 | Cross-XCD event, idle / under load | 2–4 µs (confidence L) | 1.40 µs / 6.00 µs at 1.66 TB/s of load (`microbench (e)`, final session) |
 | First correct e2e | 8–15 ms/token | 22.05 ms, then 4.08 ms after the trace-driven passes |
-| Tuned target | 2.5–3.5 ms/token | **3.63 ms (276 tok/s), 32/32 tokens, 27/27 layers** — ~1.4 TB/s at ~5.2 GB/token; the loss is serial phases and their prologues, not bytes or events (STATUS.md). vLLM on the same box: 4.52 ms |
+| Tuned target | 2.5–3.5 ms/token | **3.66 ms (273 tok/s), 32/32 tokens, 27/27 layers** — ~1.4 TB/s at ~5.2 GB/token; the loss is serial phases and their prologues, not bytes or events (STATUS.md). vLLM on the same box: 4.52 ms |
 | Protocol only, per token | ~0.3–0.7 ms | 2.84 ms with 1,346 events (2.20 ms without fences): the smoke run has no bodies, so every wait is back-to-back |
 | Launches/token | 1 → 1/32 | 1 launch per 32 tokens (v2 implemented) |
 
@@ -290,6 +290,6 @@ The D5 report presents these as follows; no estimate from §9 survives into it u
 | Register-streamed GEMV (no LDS staging) | Weights go HBM → VGPR directly with `global_load_dwordx4` (1 KB per wave-instruction; gfx942 LDS DMA is only 4 B/lane, 256 B per instruction). Little's law: 18 GB/s per CU (5.3 TB/s ÷ 296 workers) × ~1 µs HBM load-to-use (Infinity Cache hit alone is ~218 ns) = 18 KB in flight per CU → 4 waves × 5 outstanding dwordx4, 2× margin planned; `vmcnt` limit 63, register file 512 KB/CU. Chunk k+1 loads are issued before chunk k's FMAs; `s_waitcnt vmcnt(N)` retires exactly one chunk | Prerequisite for ≥75% of HBM peak on 17 MB per-XCD streams; 4× fewer load instructions than LDS staging |
 | Monotonic event epochs (implemented in v1) | Event counters never reset; wait condition `G[e] ≥ epoch × producers`, with `producers` carried on the waiting descriptor; enables the in-kernel 32-token loop (v2) with a single launch | Removes per-token counter reset; v2 removes the launch |
 | Idle-worker prefetch of routing-independent weights (`--prefetch`) | 21 CU-tasks per XCD and layer on the workers idle during attention/merge stream this layer's shared expert and the next layer's q/kv_a, o_proj, kv_b into the Infinity Cache | *Implemented and measured: no gain (STATUS.md)* |
-| Cross-task prefetch (next task's first chunk) | With AOT queues a worker knows its next task before the current one ends; for every task except routed experts the weight address is static, so the worker issues the next task's first K-chunk loads (≤ 18 KB, §12 row 3) while draining the current task's FMAs and waits on the next event only when the loads are already in flight. Routed-expert tasks prefetch nothing (expert id unknown until the router event). | The event wait overlaps with HBM latency instead of preceding it; this is the mechanism behind the 78–80% results on NVIDIA megakernels. D3 for attention/o_proj/shared-expert tasks |
+| Cross-task prefetch (next task's first chunk) — *implemented as `--prefetch-next` and measured 4% slower: the 8 held loads cost more than the head start (STATUS.md)* | With AOT queues a worker knows its next task before the current one ends; for every task except routed experts the weight address is static, so the worker issues the next task's first K-chunk loads (≤ 18 KB, §12 row 3) while draining the current task's FMAs and waits on the next event only when the loads are already in flight. Routed-expert tasks prefetch nothing (expert id unknown until the router event). | The event wait overlaps with HBM latency instead of preceding it; this is the mechanism behind the 78–80% results on NVIDIA megakernels. D3 for attention/o_proj/shared-expert tasks |
 
 Implementation order: register-streamed GEMV + fused prologues + AOT queues with event mirroring (D2) → interleaved gate/up + tile-granular counters + cross-task prefetch (D3) → split-KV, epochs + in-kernel loop (D4, if e2e reached).
