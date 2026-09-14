@@ -113,6 +113,8 @@ struct RuntimeState {
     int32_t  done_event;   // the graph's final event: schedulers stop at epoch
     int32_t  use_uncached_counters;  // event scheme (ii) from §4, set by D1 (a)
     int32_t  smoke;        // 1 = run the protocol only, skip every task body
+    int32_t  direct_poll;  // 1 = workers poll global counters themselves,
+                           //     bypassing the scheduler mirror (A/B on D1)
     int32_t  dump_layers;  // 1 = copy every layer's output x to act.layer_dump
     uint32_t spin_limit;   // polls before a wait declares a deadlock
 
@@ -255,7 +257,8 @@ __device__ __forceinline__ bool wait_event(
     const uint32_t target = rt.epoch * (uint32_t)producers;
     uint32_t* p = (scope == SCOPE_XCD_LOCAL)
         ? &rt.xcd_counters[xcd * kMaxEvents + event]
-        : &rt.xcd_flags[xcd * kMaxEvents + event];
+        : (rt.direct_poll ? &rt.global_events[event]
+                          : &rt.xcd_flags[xcd * kMaxEvents + event]);
     uint32_t spins = 0;
     while (poll(p) < target) {
         backoff();

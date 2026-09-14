@@ -67,10 +67,18 @@ __device__ __forceinline__ void fma8(const uint4& v, const float* __restrict__ x
     unpack_bf16x2(v.w, a, b); acc += a * x8[6] + b * x8[7];
 }
 
-// R rows (1 or 2) of a bf16 [*, K] matrix times an fp32 [K] vector, one wave,
-// fp32 accumulate; every lane returns the full sums. K is a multiple of 8 for
-// every tensor in this model (smallest is 512).
-template <int R>
+// R rows of a bf16 [*, K] matrix times an fp32 [K] vector, one wave, fp32
+// accumulate, D 16-byte chunks per row in flight per lane; every lane returns
+// the full sums. K is a multiple of 8 for every tensor in this model (smallest
+// is 512). R x D is the number of loads in flight per lane, kept at 8 by the
+// callers: for K = 2048 a row is 4 chunks per lane, so 2 rows x 4 chunks; for
+// K = 512 it is 1 chunk, so 8 rows x 1.
+//
+// The final partial batch is issued in full before any of it is consumed
+// (predicated, unrolled): the first version's plain tail loop loaded one
+// chunk at a time, and with depth 8 and K = 2048 *every* row went through
+// that tail, which is why raising the depth changed nothing on the MI300X.
+template <int R, int D>
 __device__ __forceinline__ void wave_dot(const __hip_bfloat16* const* rows,
                                          const float* __restrict__ x, int K,
                                          float* sums) {
@@ -84,26 +92,23 @@ __device__ __forceinline__ void wave_dot(const __hip_bfloat16* const* rows,
         acc[r] = 0.f;
     }
 
-    int i = lane;
-    uint4 buf[R][kStreamDepth];
-    while (i + (kStreamDepth - 1) * kWaveLanes < n4) {
+    uint4 buf[R][D];
+    for (int i = lane; i < n4; i += D * kWaveLanes) {
 #pragma unroll
-        for (int d = 0; d < kStreamDepth; ++d) {           // issue everything
+        for (int d = 0; d < D; ++d) {                      // issue everything
+            if (i + d * kWaveLanes < n4) {
 #pragma unroll
-            for (int r = 0; r < R; ++r) buf[r][d] = r4[r][i + d * kWaveLanes];
+                for (int r = 0; r < R; ++r) buf[r][d] = r4[r][i + d * kWaveLanes];
+            }
         }
 #pragma unroll
-        for (int d = 0; d < kStreamDepth; ++d) {           // then consume
-            const float* x8 = x + (i + d * kWaveLanes) * 8;
+        for (int d = 0; d < D; ++d) {                      // then consume
+            if (i + d * kWaveLanes < n4) {
+                const float* x8 = x + (i + d * kWaveLanes) * 8;
 #pragma unroll
-            for (int r = 0; r < R; ++r) fma8(buf[r][d], x8, acc[r]);
+                for (int r = 0; r < R; ++r) fma8(buf[r][d], x8, acc[r]);
+            }
         }
-        i += kStreamDepth * kWaveLanes;
-    }
-    for (; i < n4; i += kWaveLanes) {                      // tail, < depth
-        const float* x8 = x + i * 8;
-#pragma unroll
-        for (int r = 0; r < R; ++r) fma8(r4[r][i], x8, acc[r]);
     }
 #pragma unroll
     for (int r = 0; r < R; ++r) sums[r] = wave_sum(acc[r]);
@@ -167,6 +172,42 @@ enum GemvEpilogue { EPI_NONE = 0, EPI_BF16 = 1, EPI_RESIDUAL = 2 };
 
 // y[n] = W[n, :] . x  for this (xcd, worker)'s rows of [0, N), with x already
 // wherever the caller wants it read from (LDS for the ≤ 2048-wide operands).
+// Each wave takes RPI of the worker's rows per iteration (a short row means
+// more rows per iteration, so the loads in flight stay at 8 per lane).
+template <int RPI, int D>
+__device__ __forceinline__ void gemv_rows_impl(
+        const __hip_bfloat16* __restrict__ w, int ld,
+        const float* __restrict__ x, float* __restrict__ y,
+        const float* __restrict__ residual, GemvEpilogue epi, float scale,
+        int K, int first, int cnt, int n_workers) {
+    const int wave = threadIdx.x / kWaveLanes;
+    const int lane = threadIdx.x % kWaveLanes;
+    for (int k = RPI * wave; k < cnt; k += RPI * kWaves) {
+        const int nr = min(RPI, cnt - k);
+        const __hip_bfloat16* rows[RPI];
+#pragma unroll
+        for (int r = 0; r < RPI; ++r) {   // past the end: repeat the last row
+            rows[r] = w + (int64_t)(first + (k + min(r, nr - 1)) * n_workers) * ld;
+        }
+        float sums[RPI];
+        wave_dot<RPI, D>(rows, x, K, sums);
+        if (lane == 0) {
+#pragma unroll
+            for (int r = 0; r < RPI; ++r) {
+                if (r < nr) {
+                    const int n = first + (k + r) * n_workers;
+                    const float v = sums[r];
+                    switch (epi) {
+                        case EPI_BF16:     y[n] = bf16_round(scale * bf16_round(v)); break;
+                        case EPI_RESIDUAL: y[n] = bf16_round(residual[n] + bf16_round(v)); break;
+                        default:           y[n] = v;
+                    }
+                }
+            }
+        }
+    }
+}
+
 __device__ inline void gemv_rows(
         const __hip_bfloat16* __restrict__ w, int ld,
         const float* __restrict__ x, float* __restrict__ y,
@@ -176,29 +217,17 @@ __device__ inline void gemv_rows(
     const int first = s.begin + worker;
     if (first >= s.end) return;
     const int cnt = (s.end - first + n_workers - 1) / n_workers;   // rows owned
-    const int wave = threadIdx.x / kWaveLanes;
-    const int lane = threadIdx.x % kWaveLanes;
-
-    for (int k = 2 * wave; k < cnt; k += 2 * kWaves) {
-        const int r0 = first + k * n_workers;
-        const bool two = (k + 1) < cnt;
-        const int r1 = two ? r0 + n_workers : r0;
-        const __hip_bfloat16* rows[2] = {w + (int64_t)r0 * ld, w + (int64_t)r1 * ld};
-        float sums[2];
-        if (two) wave_dot<2>(rows, x, K, sums);
-        else     wave_dot<1>(rows, x, K, sums);
-        if (lane == 0) {
-            const int nr = two ? 2 : 1;
-            for (int r = 0; r < nr; ++r) {
-                const int n = r ? r1 : r0;
-                const float v = sums[r];
-                switch (epi) {
-                    case EPI_BF16:     y[n] = bf16_round(scale * bf16_round(v)); break;
-                    case EPI_RESIDUAL: y[n] = bf16_round(residual[n] + bf16_round(v)); break;
-                    default:           y[n] = v;
-                }
-            }
-        }
+    const int n4 = K / 8;   // 16-byte chunks per row; 64 lanes take 64 at a time
+    // 16 loads in flight per lane (64 KB per workgroup) for every shape: the
+    // tasks own 7–350 rows each, so what they pay is round trips, not bytes.
+    if (n4 <= kWaveLanes) {             // K <= 512:  8 rows x 1 chunk  (merge W_UV)
+        gemv_rows_impl<8, 1>(w, ld, x, y, residual, epi, scale, K, first, cnt, n_workers);
+    } else if (n4 <= 2 * kWaveLanes) {  // K <= 1024: 8 rows x 2 chunks
+        gemv_rows_impl<8, 2>(w, ld, x, y, residual, epi, scale, K, first, cnt, n_workers);
+    } else if (n4 <= 4 * kWaveLanes) {  // K <= 2048: 4 rows x 4 chunks (q/kv_a, o_proj,
+        gemv_rows_impl<4, 4>(w, ld, x, y, residual, epi, scale, K, first, cnt, n_workers);  // down, lm_head)
+    } else {                            // longer rows: 2 rows x kStreamDepth
+        gemv_rows_impl<2, kStreamDepth>(w, ld, x, y, residual, epi, scale, K, first, cnt, n_workers);
     }
 }
 
@@ -219,14 +248,21 @@ __device__ inline void gemv_gate_up_rows(
     const int wave = threadIdx.x / kWaveLanes;
     const int lane = threadIdx.x % kWaveLanes;
 
-    for (int k = wave; k < cnt; k += kWaves) {
-        const int n = first + k * n_workers;
-        const __hip_bfloat16* rows[2] = {gate_up + (int64_t)(2 * n) * K,
-                                         gate_up + (int64_t)(2 * n + 1) * K};
-        float sums[2];
-        wave_dot<2>(rows, x, K, sums);
+    // Two (gate, up) pairs per wave iteration: 4 rows x 4 chunks = 16 loads
+    // in flight per lane, the same depth as gemv_rows.
+    for (int k = 2 * wave; k < cnt; k += 2 * kWaves) {
+        const int n0 = first + k * n_workers;
+        const bool two = (k + 1) < cnt;
+        const int n1 = two ? n0 + n_workers : n0;
+        const __hip_bfloat16* rows[4] = {gate_up + (int64_t)(2 * n0) * K,
+                                         gate_up + (int64_t)(2 * n0 + 1) * K,
+                                         gate_up + (int64_t)(2 * n1) * K,
+                                         gate_up + (int64_t)(2 * n1 + 1) * K};
+        float sums[4];
+        wave_dot<4, 4>(rows, x, K, sums);
         if (lane == 0) {
-            h[n] = bf16_round(bf16_round(silu(bf16_round(sums[0]))) * bf16_round(sums[1]));
+            h[n0] = bf16_round(bf16_round(silu(bf16_round(sums[0]))) * bf16_round(sums[1]));
+            if (two) h[n1] = bf16_round(bf16_round(silu(bf16_round(sums[2]))) * bf16_round(sums[3]));
         }
     }
 }

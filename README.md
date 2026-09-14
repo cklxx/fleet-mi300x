@@ -75,17 +75,14 @@ bash scripts/setup_env.sh        # checks, deps, model, hipcc, graphs, smoke tes
 python3 src/host/reference_run.py --model ~/models/dsv2-lite-base \
         --out build/golden.npz            # golden tokens, fleet_cache.bin, golden_tokens.txt
 python3 src/host/kv_convert.py --model ~/models/dsv2-lite-base --verify
-./build/fleet_decode --graph build/taskgraph_d2.bin --teacher-force   # step-isolated check
-./build/fleet_decode --graph build/taskgraph_d2.bin --json results/decode_d2.json
+./build/fleet_decode --graph build/taskgraph_d8.bin --teacher-force   # step-isolated check
+./build/fleet_decode --graph build/taskgraph_d8.bin --json results/decode_d8.json
 ```
 
 Every non-smoke run also prints, for the first decode step, each layer's
 output against HF's (max rel, cosine) and how many consecutive layers sit
 inside the §6 gate — the evidence for the "one MoE layer through the Fleet
 path" milestone, independent of whether the 32 tokens all match.
-
-```bash
-```
 
 Order matters. `setup_env.sh` ends with `fleet_decode --smoke`, which runs the
 whole per-token protocol — cooperative launch at grid 304, XCD role discovery,
@@ -97,6 +94,22 @@ golden run comes next because every later boundary is judged against it.
 `setup_env.sh` pins `transformers>=4.39,<5`: the vendored `modeling_deepseek.py`
 imports symbols that transformers 5 removed. Results should be reproduced under
 that pin.
+
+## Measured (1×MI300X, Hot Aisle, ROCm 7.2, 2026-09-14)
+
+Raw files in [`results/`](results/); the narrative and the trace-driven
+optimisation steps in [docs/STATUS.md](docs/STATUS.md).
+
+| | |
+|---|---|
+| Greedy tokens matching HF, free-running / teacher-forced | 32/32 and 32/32 |
+| Layers inside the §6 gate on the first decode step | 27 of 27 (layer 1: max rel 3.1e-3, cosine 0.999993) |
+| Per-token latency, median / p95, one launch per token | 5.46 ms / 5.51 ms (171 tok/s); first correct version was 22.05 ms |
+| Protocol alone (`--smoke`, 805 events, no task bodies) | 1.17 ms per token |
+| Cross-XCD event, idle / under a 1.46 TB/s stream | 1.44 µs / 6.0 µs |
+| Cross-XCD payload visibility under the kernel's fence placement | 0 stale words in 16.4 M |
+| Streamed read bandwidth | 4.25 TB/s at depth 8 (80% of peak) |
+| Byte floor at that bandwidth | 1.16 ms per token |
 
 ## Why the numbers in the design are checkable
 

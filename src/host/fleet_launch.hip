@@ -412,13 +412,16 @@ int main(int argc, char** argv) {
     rt.done_event = done_event;
     rt.use_uncached_counters = uncached ? 1 : 0;
     rt.smoke = smoke ? 1 : 0;
+    rt.direct_poll = std::getenv("FLEET_DIRECT_POLL") != nullptr ? 1 : 0;
     rt.dump_layers = 0;   // set for token 0 below
     rt.spin_limit = spin_limit;
     uint64_t* d_trace = trace_path.empty() ? nullptr : dev_alloc<uint64_t>(tasks.size() * 4);
     rt.trace = nullptr;   // enabled for token 1 only (token 0 carries the warm-up)
     rt.epoch = 0;   // set per token below; a zero epoch makes every wait trivially true
-    std::printf("event counters: %s\n",
-                uncached ? "uncached (scheme ii)" : "cached + release fence (scheme i)");
+    std::printf("event counters: %s; workers poll %s\n",
+                uncached ? "uncached (scheme ii)" : "cached + release fence (scheme i)",
+                rt.direct_poll ? "the global counters directly (FLEET_DIRECT_POLL)"
+                               : "the per-XCD scheduler mirror");
 
     // ---- model
     ModelDims d{};

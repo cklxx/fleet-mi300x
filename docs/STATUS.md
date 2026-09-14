@@ -24,12 +24,12 @@ Raw numbers: [`results/`](../results/).
 |---|---|
 | Tokens matching HF greedy, free-running / teacher-forced | 32/32 and 32/32 |
 | Layers inside the §6 gate on step 0 | 27 of 27 |
-| Per-token latency, median / p95 (1 launch per token), split-KV graph | **6.50 ms / 6.56 ms (146 tok/s)**; first version of the day was 22.05 ms |
+| Per-token latency, median / p95 (1 launch per token), split-KV ×8 graph | **5.46 ms / 5.51 ms (171 tok/s)** free-running; 5.41 ms teacher-forced; the first version of the day was 22.05 ms |
 | Protocol only (`--smoke`, all 805 events, no task bodies) | 1.17 ms per token |
 | Cross-XCD event, idle / under a 1.46 TB/s stream | 1.44 µs / 6.0 µs (§9 was 2–4 µs) |
 | Cross-XCD payload visibility (4 waves store, thread 0 releases) | 0 stale words in 16.4 M |
 | Streamed read bandwidth, best depth | 4.25 TB/s at depth 8 (80% of peak) |
-| Kernel resources | 249 VGPRs, 0 AGPRs, 24 KB LDS, 2 waves/SIMD, 185 SGPR spills, 144 B/lane scratch |
+| Kernel resources | 253 VGPRs, 0 AGPRs, 24 KB LDS, 1 wave/SIMD (the design point), 169 SGPR spills, 80 B/lane scratch |
 | KV-cache conversion vs HF's own cache | K_nope, K_rope, V all exactly 0 error, 27 layers |
 
 **From 22 ms to 6.5 ms in four steps, each attributed by the per-task trace**
@@ -41,17 +41,20 @@ Raw numbers: [`results/`](../results/).
 | router top-k mask in registers | 13.7 ms | `bool taken[64]` was in scratch memory and thread 0 paid a memory round trip per element; a 64-bit mask made it 68 µs |
 | q-absorb streamed by rows; GEMV depth 8 | 11.6 ms | the attention prologue walked 128 rows per output column with one dependent load each; streaming W_UK rows made attention 203 µs. Depth 8 changed nothing: with a dozen rows per worker the GEMV tasks are latency-bound, not bandwidth-bound |
 | split-KV graph (4 chunks/head, 64 tasks/layer) | 7.65 ms | attention 61 µs/task; the `taskgraph_d4.bin` from D0, no kernel change |
-| prologues unrolled; router softmax/top-k as wave reductions | **6.50 ms** | `stage_vector` / RMSNorm loads all in flight; router 31 µs; MoE layer critical path now ~227 µs |
+| prologues unrolled; router softmax/top-k as wave reductions | 6.50 ms | `stage_vector` / RMSNorm loads all in flight; router 31 µs; MoE layer critical path ~227 µs |
+| GEMV tails batched, 8 chunks/head split-KV | 5.35 ms | with depth 8 and K = 2048 every row had been going through a one-load-at-a-time tail loop (so "depth 8" never happened); now every partial batch is issued in full. Attention 37 µs/task on `taskgraph_d8.bin` |
+| 16 loads in flight per lane in every GEMV shape; direct polling A/B | **5.46 ms** | no gain: the expert GEMVs already stream at ~2.4 TB/s aggregate and the small ones are round-trip bound. Workers polling the global counters directly instead of the scheduler mirror is *slower* (5.8 ms): 296 fabric pollers cost more than the mirror hop, which settles §4's open question in favour of the scheduler |
 
-Where the remaining 6.5 ms goes (per MoE layer, 227 µs): attention 61,
-gate_up 37, router 31, merge 24, down 23, q/kv_a 17, o_proj 11, reduce 5, and
-~6 global events at ~6 µs each. The GEMV tasks are 2–4× above their byte
-time because each worker owns only 7–55 rows and pays a few serial round
-trips; the levers are §12's cross-task prefetch (issue the next task's first
-loads before waiting on its event) and fusing merge into attention when
-kv_chunks == 1 is not used. The byte floor is 1.2 ms and the protocol alone
-is 1.2 ms, so the design's 2.5–3.5 ms target is still plausible but not
-reached.
+Where the remaining 5.4 ms goes (per MoE layer, ~190 µs; `results/trace_d8_mirror_summary.txt`):
+gate_up 39, attention 38, router 20, down 20, merge 20, q/kv_a 16, o_proj 12,
+reduce 5, and ~6 global events at ~6 µs each. The layer's bytes at the
+measured 4.25 TB/s are 39 µs, so the layer runs at ~20% of the bandwidth
+ceiling; per token that is 5.4 ms against a 1.2 ms byte floor and a 1.2 ms
+protocol cost. The levers left are §12's cross-task prefetch (the small
+GEMVs pay 2–4 round trips each that could overlap the preceding event
+wait), fusing merge into attention, and fewer, larger tasks for q/kv_a and
+o_proj so each worker streams more than a dozen rows. The design's
+2.5–3.5 ms target was not reached in the day on the machine.
 
 ## Review pass before GPU time (2026-09-13)
 
