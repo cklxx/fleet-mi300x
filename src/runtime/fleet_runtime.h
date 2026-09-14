@@ -60,7 +60,7 @@ enum EventScope : int16_t {
     SCOPE_GLOBAL = 2,
 };
 
-// 64 bytes, laid out to match taskgraph.py's struct.pack("<Hhhh hhhh hhhh h 2x i 32x").
+// 64 bytes, laid out to match taskgraph.py's struct.pack("<Hhhh hhhh hhhh hhh 2x i 28x").
 // Any drift here is silent and catastrophic, so static_assert guards the size
 // and tests/test_descriptor_layout.py re-checks the field offsets from Python.
 //
@@ -82,11 +82,19 @@ struct TaskDescriptor {
     int16_t  expert_slot;     // >=0 routed slot k, <0 shared half, else -1
     int16_t  wait_scope;      // EventScope of wait_event
     int16_t  wait_count;      // producers of wait_event (per epoch)
+    int16_t  local_event;     // FLAG_SIGNAL_LAST: XCD-local arrival counter, else -1
+    int16_t  flags;           // TaskFlags
     int16_t  _pad0;
     int32_t  index;           // position in the global task list (> 32767)
-    uint8_t  _pad[32];
+    uint8_t  _pad[28];
 };
 static_assert(sizeof(TaskDescriptor) == 64, "descriptor must stay 64 B");
+
+enum TaskFlags : int16_t {
+    FLAG_FOLD_PARTIALS = 1,   // prologue adds the 8 expert partials to the residual
+    FLAG_SIGNAL_LAST = 2,     // signal signal_event only as the last of n_split
+                              // arrivals on local_event (the merging KV chunk)
+};
 
 // Device-side state, allocated once by the host.
 struct RuntimeState {
@@ -108,19 +116,28 @@ struct RuntimeState {
     const int32_t* __restrict__ global_event_ids;
     int32_t  n_global_events;
 
-    uint32_t epoch;        // 1-based token index; counters are never reset (§12)
+    // Launch model v2 (§4): one launch decodes n_tokens tokens. Token t of the
+    // launch runs the whole graph at epoch epoch0 + t; counters are never
+    // reset (§12), so wait targets are epoch x producers. The embed task of
+    // token t > 0 additionally waits for the previous token's final event.
+    uint32_t epoch0;       // epoch of the launch's first token (1 for a fresh state)
+    int32_t  n_tokens;     // tokens decoded by this launch
+    int32_t  teacher;      // 1 = token_in is pre-filled by the host (teacher forcing)
     int32_t  n_events;
-    int32_t  done_event;   // the graph's final event: schedulers stop at epoch
+    int32_t  done_event;   // the graph's final event: schedulers stop when it
+                           // reaches epoch0 + n_tokens - 1
     int32_t  use_uncached_counters;  // event scheme (ii) from §4, set by D1 (a)
     int32_t  smoke;        // 1 = run the protocol only, skip every task body
     int32_t  direct_poll;  // 1 = workers poll global counters themselves,
                            //     bypassing the scheduler mirror (A/B on D1)
     int32_t  dump_layers;  // 1 = copy every layer's output x to act.layer_dump
+                           //     on the launch's first token
+    int32_t  trace_token;  // token of the launch to trace, or -1
     uint32_t spin_limit;   // polls before a wait declares a deadlock
 
-    // Optional per-descriptor trace (design.md §10): [n_descriptors][3] of
-    // s_memrealtime ticks — wait done, task done — plus the XCD id. nullptr
-    // disables it. Written by thread 0 of the worker, so it costs one store.
+    // Optional per-descriptor trace (design.md §10): [n_descriptors][4] of
+    // s_memrealtime ticks — began waiting, wait satisfied, signalled — plus
+    // the XCD id. nullptr disables it. Written by thread 0 of the worker.
     uint64_t* __restrict__ trace;
 };
 
@@ -223,6 +240,20 @@ __device__ __forceinline__ const TaskDescriptor* fetch_task(
     return &rt.tasks[rt.queue_index[begin + slot]];
 }
 
+// arrive_last: bump an XCD-local arrival counter with release semantics and
+// report whether this arrival completed the group for this epoch (the last
+// KV chunk of a head then merges the partials). Returns the old count, so the
+// caller decides; the acquire that makes the other arrivals' data visible
+// is the caller's fence_acquire().
+__device__ __forceinline__ bool arrive_last(
+        const RuntimeState& rt, uint32_t epoch, int counter, int xcd, int members) {
+    fence_release();
+    const uint32_t old = __hip_atomic_fetch_add(
+        &rt.xcd_counters[xcd * kMaxEvents + counter], 1u,
+        __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    return old + 1 == epoch * (uint32_t)members;
+}
+
 // signal_event: publish this task's stores, then count. Called by one thread
 // after a __syncthreads(), so every wave's stores precede the fence.
 //
@@ -251,10 +282,10 @@ __device__ __forceinline__ void signal_event(
 // own timeout or someone else's), so the worker can drain and exit instead of
 // hanging the launch.
 __device__ __forceinline__ bool wait_event(
-        const RuntimeState& rt, int event, EventScope scope, int xcd,
-        int producers) {
+        const RuntimeState& rt, uint32_t epoch, int event, EventScope scope,
+        int xcd, int producers) {
     if (event < 0) return true;
-    const uint32_t target = rt.epoch * (uint32_t)producers;
+    const uint32_t target = epoch * (uint32_t)producers;
     uint32_t* p = (scope == SCOPE_XCD_LOCAL)
         ? &rt.xcd_counters[xcd * kMaxEvents + event]
         : (rt.direct_poll ? &rt.global_events[event]
@@ -286,7 +317,7 @@ __device__ __forceinline__ void run_scheduler(const RuntimeState& rt, int xcd) {
     asm volatile("s_setprio 3");     // scheduler waves win arbitration
     const int lane = threadIdx.x;
     uint32_t* mirror = rt.xcd_flags + xcd * kMaxEvents;
-    const uint32_t done_target = rt.epoch;
+    const uint32_t done_target = rt.epoch0 + (uint32_t)rt.n_tokens - 1;
     __shared__ int stop;
     if (lane == 0) stop = 0;
     __syncthreads();

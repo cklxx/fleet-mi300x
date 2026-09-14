@@ -74,13 +74,13 @@ hipcc --offload-arch=gfx942 -O3 -std=c++17 \
 echo "  compiled -> build/fleet_decode"
 
 log "task graph"
-python3 "$REPO_ROOT/src/host/taskgraph.py" --kv-chunks 1 \
-    --emit "$REPO_ROOT/build/taskgraph_d2.bin"
+python3 "$REPO_ROOT/src/host/taskgraph.py" --kv-chunks 8 \
+    --emit "$REPO_ROOT/build/taskgraph_d8.bin"
 python3 "$REPO_ROOT/src/host/taskgraph.py" --kv-chunks 4 \
     --emit "$REPO_ROOT/build/taskgraph_d4.bin"
 
 log "protocol smoke test (no weights): residency, XCD roles, every event"
-"$REPO_ROOT/build/fleet_decode" --graph "$REPO_ROOT/build/taskgraph_d2.bin" --smoke --tokens 4
+"$REPO_ROOT/build/fleet_decode" --graph "$REPO_ROOT/build/taskgraph_d8.bin" --smoke --tokens 4
 
 # Everything above ran without the checkpoint; only now spend the download.
 if [[ $WANT_MODEL -eq 1 ]]; then
@@ -119,9 +119,9 @@ Next, in the order the design's D1 expects:
   3. python3 src/host/kv_convert.py --model $MODEL_DIR --verify
        Confirms K,V rebuilt from the compressed cache match HF's own, <= 1e-2.
 
-  4. ./build/fleet_decode --graph build/taskgraph_d2.bin --teacher-force
+  4. ./build/fleet_decode --graph build/taskgraph_d8.bin --teacher-force
        Every step fed HF's token: a mismatch is isolated to the step it appears in.
 
-  5. ./build/fleet_decode --graph build/taskgraph_d2.bin --json results/decode_d2.json
+  5. ./build/fleet_decode --graph build/taskgraph_d8.bin --json results/decode_d8.json
        Free-running 32-token decode, compared with HF greedy; latency per token.
 EOF

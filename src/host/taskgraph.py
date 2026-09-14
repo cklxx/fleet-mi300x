@@ -6,22 +6,26 @@ descriptors are generated once on the host, validated as a DAG, assigned to
 per-XCD worker queues, and emitted as a flat binary the kernel reads without
 synchronisation.
 
-Per MoE layer the graph is
+Per MoE layer the graph (v0.10, three global events) is
 
-    QKV ──global──▶ AT ──xcd-local──▶ MG ──global──▶ OP ──global──▶ N2
-     │                                                               │
-     └───────────────────────────── global ──────────────────────────┘
-    N2 ──global──▶ GU ──xcd-local──▶ DN ──global──▶ RD ──global──▶ next layer
+    QKV[x] ──xcd──▶ AT[x] (last chunk merges) ──global──▶ OP ──global──▶ RT[x]
+    RT[x] ──xcd──▶ GU[x] ──xcd──▶ DN[x] ──global──▶ next layer's QKV
+                                                     (which folds the 8 partials)
 
-which is 6 global events and 2 XCD-local events per layer; four fusions (§3)
-removed the other four global events an unfused graph would need.
+Compared with the v0.9 graph (six global events) the differences are:
+  * q/kv_a is head-aligned: XCD k computes the q rows of heads 2k, 2k+1 and
+    its own copy of kv_a, so attention waits on an XCD-local event;
+  * the merge is done by whichever KV chunk of a head arrives last (an
+    XCD-local counter decides), so there is no MERGE task and no extra hop;
+  * the router runs once per XCD (256 KB of weights, replicated), so the
+    experts wait on an XCD-local event;
+  * there is no REDUCE task: the next layer's q/kv_a prologue (and lm_head's)
+    folds the 8 expert partials into the residual stream.
 
-Two granularities are reported. A *logical task* is a node of the graph above
-(66 per MoE layer). A *descriptor* is what a worker dequeues: a CU-task is one
-descriptor, but a Chiplet-task fans out to one descriptor per worker on each
-XCD it spans (37 per XCD), each carrying its worker id, so the kernel's row
-split is a pure function of (xcd, worker) and the signalled event simply has
-8 x 37 producers. Nothing on the device ever has to broadcast a task.
+Two granularities are reported. A *logical task* is a node of the graph above.
+A *descriptor* is what a worker dequeues: a CU-task is one descriptor, a
+Chiplet-task fans out to one descriptor per worker on each XCD it spans (37
+per XCD), each carrying its worker id.
 
     python3 src/host/taskgraph.py --report
     python3 src/host/taskgraph.py --emit build/taskgraph.bin
@@ -32,7 +36,7 @@ import argparse
 import json
 import struct
 from dataclasses import dataclass, field
-from enum import IntEnum
+from enum import IntEnum, IntFlag
 from pathlib import Path
 
 XCDS = 8              # MI300X chiplets
@@ -41,54 +45,52 @@ WORKERS_PER_XCD = CUS_PER_XCD - 1
 DESCRIPTOR_BYTES = 64
 # Must match struct TaskDescriptor in src/runtime/fleet_runtime.h field for
 # field; tests/test_descriptor_layout.py checks that it does.
-PACK_FORMAT = "<Hhhh hhhh hhhh h 2x i 32x"
-# Field order of PACK_FORMAT; the layout test compares it with the C struct.
+PACK_FORMAT = "<Hhhh hhhh hhhh hhh 2x i 28x"
 PACK_FIELDS = ["kind", "layer", "xcd", "worker", "wait_event", "signal_event",
                "signal_scope", "n_split", "head", "kv_chunk", "expert_slot",
-               "wait_scope", "wait_count", "index"]
+               "wait_scope", "wait_count", "local_event", "flags", "index"]
 
 
 class TaskKind(IntEnum):
     """Mirrors the task levels in §3. Values are baked into the descriptor."""
-    QKV_FUSED = 0      # q_proj ‖ kv_a, Chiplet-task x8, RMSNorm in prologue
-    ATTENTION = 1      # MLA, CU-task, head-affine, kv-post + q-absorb in prologue
-    MERGE_UV = 2       # merge split-KV partials + W_UV, CU-task per head
+    QKV_FUSED = 0      # q rows of this XCD's heads ‖ kv_a, Chiplet-task per XCD
+    ATTENTION = 1      # MLA, CU-task, head-affine, kv-post + q-absorb in prologue;
+                       # the last KV chunk of a head also merges + W_UV
+    MERGE_UV = 2       # (retired: merged into ATTENTION; kept so kinds stay stable)
     O_PROJ = 3         # o_proj + residual, Chiplet-task x8
-    NORM_ROUTER = 4    # RMSNorm + router top-k, CU-task x1
-    EXPERT_GATE_UP = 5  # gate_up + SiLU⊙up, Chiplet-task x8
-    EXPERT_DOWN = 6    # down x routing weight, Chiplet-task x8
-    REDUCE = 7         # reduce partials + residual, CU-task x1
+    NORM_ROUTER = 4    # RMSNorm + router top-k, CU-task per XCD
+    EXPERT_GATE_UP = 5  # gate_up + SiLU⊙up, Chiplet-task per XCD
+    EXPERT_DOWN = 6    # down x routing weight, Chiplet-task per XCD
+    REDUCE = 7         # (retired: folded into the next QKV / lm_head prologue)
     DENSE_GATE_UP = 8  # layer 0 only
     DENSE_DOWN = 9     # layer 0 only
     EMBED = 10
-    LM_HEAD = 11       # Chiplet-task x8, final norm in prologue
+    LM_HEAD = 11       # Chiplet-task x8, fold + final norm in prologue
     ARGMAX = 12
+
+
+class Flags(IntFlag):
+    """Descriptor flags (TaskDescriptor.flags)."""
+    NONE = 0
+    FOLD_PARTIALS = 1   # prologue adds the 8 expert partials to the residual
+    SIGNAL_LAST = 2     # signal signal_event only if this task is the last of
+                        # n_split to bump local_event (XCD-local counter)
 
 
 # Implementation status per task kind, reported because the task spec asks for
 # "Fleet-native operations, remaining fallbacks" as a deliverable metric.
-#
-#   fleet-verified   : runs in the persistent kernel, checked against the
-#                      reference on device
-#   fleet-unverified : implemented in the kernel, never executed on hardware
-#   fallback         : still runs as a torch op between launches
-#
-# Nothing is "fleet-verified" until it has run on the MI300X. Marking code
-# verified because it was written would defeat the purpose of the column.
 IMPLEMENTATION: dict[str, str] = {
-    "EMBED": "fleet-unverified",
-    "QKV_FUSED": "fleet-unverified",
-    "ATTENTION": "fleet-unverified",
-    "MERGE_UV": "fleet-unverified",
-    "O_PROJ": "fleet-unverified",
-    "NORM_ROUTER": "fleet-unverified",
-    "EXPERT_GATE_UP": "fleet-unverified",
-    "EXPERT_DOWN": "fleet-unverified",
-    "REDUCE": "fleet-unverified",
-    "DENSE_GATE_UP": "fleet-unverified",
-    "DENSE_DOWN": "fleet-unverified",
-    "LM_HEAD": "fleet-unverified",
-    "ARGMAX": "fleet-unverified",
+    "EMBED": "fleet-verified",
+    "QKV_FUSED": "fleet-verified",
+    "ATTENTION": "fleet-verified",
+    "O_PROJ": "fleet-verified",
+    "NORM_ROUTER": "fleet-verified",
+    "EXPERT_GATE_UP": "fleet-verified",
+    "EXPERT_DOWN": "fleet-verified",
+    "DENSE_GATE_UP": "fleet-verified",
+    "DENSE_DOWN": "fleet-verified",
+    "LM_HEAD": "fleet-verified",
+    "ARGMAX": "fleet-verified",
 }
 
 
@@ -107,14 +109,16 @@ class Task:
     wait_event: int | None     # event id this task blocks on
     signal_event: int | None   # event id it contributes to on completion
     signal_scope: Scope = Scope.NONE
-    head: int = -1             # attention/merge only
+    head: int = -1             # attention only
     kv_chunk: int = -1         # split-KV only
     expert_slot: int = -1      # 0..top_k-1 routed, or shared half
-    n_split: int = 1           # attention/merge: number of KV chunks
+    n_split: int = 1           # attention: number of KV chunks of this head
     worker: int = -1           # pinned for Chiplet-tasks, else assign_workers()
     index: int = -1
     wait_scope: Scope = Scope.NONE   # filled by finalize() from the event table
     wait_count: int = 0              # producers of wait_event, per epoch
+    local_event: int | None = None   # SIGNAL_LAST: the XCD-local arrival counter
+    flags: Flags = Flags.NONE
     logical: int = -1                # graph node this descriptor belongs to
 
     def pack(self) -> bytes:
@@ -126,7 +130,9 @@ class Task:
             -1 if self.signal_event is None else self.signal_event,
             int(self.signal_scope), self.n_split,
             self.head, self.kv_chunk, self.expert_slot,
-            int(self.wait_scope), self.wait_count, self.index,
+            int(self.wait_scope), self.wait_count,
+            -1 if self.local_event is None else self.local_event,
+            int(self.flags), self.index,
         )
 
 
@@ -154,12 +160,8 @@ class Graph:
         return self.add(t)
 
     def chiplet_task(self, proto: Task, xcds) -> None:
-        """Chiplet-tasks: one logical task per XCD in `xcds` (the design's
-        "Chiplet-task x8"), each a descriptor per worker of that XCD.
-
-        The event they signal must have been created with
-        len(xcds) * WORKERS_PER_XCD producers; validate() checks that.
-        """
+        """Chiplet-tasks: one logical task per XCD in `xcds`, each a
+        descriptor per worker of that XCD."""
         for xcd in xcds:
             lid = self.n_logical
             self.n_logical += 1
@@ -173,102 +175,100 @@ def chiplet_producers(n_xcds: int = XCDS) -> int:
     return n_xcds * WORKERS_PER_XCD
 
 
-def build_attention(g: Graph, layer: int, e_qkv: int, cfg: dict) -> int:
-    """Attention + merge for one layer; returns the merge event (global)."""
+def build_qkv(g: Graph, layer: int, prev_event: int | None, fold: bool) -> list[int]:
+    """Head-aligned q rows + this XCD's kv_a copy, one Chiplet-task per XCD,
+    each signalling its own XCD-local event. Returns the 8 events."""
+    events = []
+    for xcd in range(XCDS):
+        e = g.new_event(Scope.XCD_LOCAL, WORKERS_PER_XCD, f"L{layer}.qkv.x{xcd}")
+        g.chiplet_task(Task(TaskKind.QKV_FUSED, layer, xcd, prev_event, e,
+                            Scope.XCD_LOCAL,
+                            flags=Flags.FOLD_PARTIALS if fold else Flags.NONE),
+                       [xcd])
+        events.append(e)
+    return events
+
+
+def build_attention(g: Graph, layer: int, e_qkv: list[int], cfg: dict) -> int:
+    """Attention (+ merge by the last chunk) for one layer; returns the global
+    merge event, which has one producer per head."""
     heads, kv_chunks = cfg["heads"], cfg["kv_chunks"]
     heads_per_xcd = heads // XCDS
 
-    # XCD k owns heads 2k, 2k+1 — 3072 q columns / 8 = exactly two heads — so
-    # the merge below stays XCD-local.
-    e_attn = [g.new_event(Scope.XCD_LOCAL, kv_chunks, f"L{layer}.attn.h{h}")
-              for h in range(heads)]
-    for h in range(heads):
-        for chunk in range(kv_chunks):
-            g.cu_task(Task(TaskKind.ATTENTION, layer, h // heads_per_xcd, e_qkv,
-                           e_attn[h], Scope.XCD_LOCAL, head=h, kv_chunk=chunk,
-                           n_split=kv_chunks))
-
     e_merge = g.new_event(Scope.GLOBAL, heads, f"L{layer}.merge")
     for h in range(heads):
-        g.cu_task(Task(TaskKind.MERGE_UV, layer, h // heads_per_xcd, e_attn[h],
-                       e_merge, Scope.GLOBAL, head=h, n_split=kv_chunks))
+        xcd = h // heads_per_xcd
+        e_arr = g.new_event(Scope.XCD_LOCAL, kv_chunks, f"L{layer}.attn.h{h}")
+        for chunk in range(kv_chunks):
+            g.cu_task(Task(TaskKind.ATTENTION, layer, xcd, e_qkv[xcd], e_merge,
+                           Scope.GLOBAL, head=h, kv_chunk=chunk, n_split=kv_chunks,
+                           local_event=e_arr, flags=Flags.SIGNAL_LAST))
     return e_merge
 
 
 def build_moe_layer(g: Graph, layer: int, prev_event: int | None,
-                    cfg: dict) -> int:
+                    cfg: dict, fold: bool) -> int:
     """Emit one MoE layer; returns the event the next layer must wait on."""
     top_k = cfg["top_k"]
 
-    # 1. fused q_proj ‖ kv_a GEMV. RMSNorm is recomputed per worker in the
-    #    prologue (8 KB vector) instead of costing a global event.
-    e_qkv = g.new_event(Scope.GLOBAL, chiplet_producers(), f"L{layer}.qkv")
-    g.chiplet_task(Task(TaskKind.QKV_FUSED, layer, -1, prev_event, e_qkv,
-                        Scope.GLOBAL), range(XCDS))
-
-    # 2/3. attention, merge + W_UV.
+    e_qkv = build_qkv(g, layer, prev_event, fold)
     e_merge = build_attention(g, layer, e_qkv, cfg)
 
-    # 4. o_proj + residual — needs all 16 heads, so this one is global.
+    # o_proj + residual — needs all 16 heads, so this one is global.
     e_oproj = g.new_event(Scope.GLOBAL, chiplet_producers(), f"L{layer}.o_proj")
     g.chiplet_task(Task(TaskKind.O_PROJ, layer, -1, e_merge, e_oproj,
                         Scope.GLOBAL), range(XCDS))
 
-    # 5. post-attention norm + router. Single task: needs the whole vector.
-    #    Rotate the single-task XCD by layer: these signal global events, so the
-    #    placement is free, and pinning them all to XCD 0 would queue every
-    #    CU-task of the run there.
-    e_router = g.new_event(Scope.GLOBAL, 1, f"L{layer}.router")
-    g.cu_task(Task(TaskKind.NORM_ROUTER, layer, layer % XCDS, e_oproj, e_router,
-                   Scope.GLOBAL))
+    # post-attention norm + router, once per XCD: 256 KB of router weights
+    # read 8 times buys an XCD-local event instead of a global one.
+    e_router = []
+    for xcd in range(XCDS):
+        e = g.new_event(Scope.GLOBAL if False else Scope.XCD_LOCAL, 1,
+                        f"L{layer}.router.x{xcd}")
+        g.cu_task(Task(TaskKind.NORM_ROUTER, layer, xcd, e_oproj, e,
+                       Scope.XCD_LOCAL))
+        e_router.append(e)
 
-    # 6/7. experts: 8 balanced units = top_k routed + shared split in two.
-    #      Each XCD streams exactly one unit; gate_up → down is XCD-local.
+    # experts: 8 balanced units = top_k routed + shared split in two.
     e_gate_up = [g.new_event(Scope.XCD_LOCAL, WORKERS_PER_XCD,
                              f"L{layer}.gate_up.x{x}") for x in range(XCDS)]
     e_down = g.new_event(Scope.GLOBAL, chiplet_producers(), f"L{layer}.down")
     for xcd in range(XCDS):
         slot = xcd if xcd < top_k else -(xcd - top_k + 1)  # <0 marks shared half
-        g.chiplet_task(Task(TaskKind.EXPERT_GATE_UP, layer, xcd, e_router,
+        g.chiplet_task(Task(TaskKind.EXPERT_GATE_UP, layer, xcd, e_router[xcd],
                             e_gate_up[xcd], Scope.XCD_LOCAL, expert_slot=slot),
                        [xcd])
     for xcd in range(XCDS):
         slot = xcd if xcd < top_k else -(xcd - top_k + 1)
         g.chiplet_task(Task(TaskKind.EXPERT_DOWN, layer, xcd, e_gate_up[xcd],
                             e_down, Scope.GLOBAL, expert_slot=slot), [xcd])
-
-    # 8. reduce the 8 partials + residual.
-    e_out = g.new_event(Scope.GLOBAL, 1, f"L{layer}.out")
-    g.cu_task(Task(TaskKind.REDUCE, layer, (layer + 4) % XCDS, e_down, e_out,
-                   Scope.GLOBAL))
-    return e_out
+    # The 8 partials are folded by whoever consumes x next (FOLD_PARTIALS).
+    return e_down
 
 
 def build_dense_layer(g: Graph, layer: int, prev_event: int | None,
-                      cfg: dict) -> int:
-    """Layer 0: same attention path, dense MLP instead of experts.
-
-    The dense gate_up → down boundary needs the full h[10944], which does not
-    fit an XCD-local buffer, so it costs one extra global event versus MoE.
-    """
-    e_qkv = g.new_event(Scope.GLOBAL, chiplet_producers(), f"L{layer}.qkv")
-    g.chiplet_task(Task(TaskKind.QKV_FUSED, layer, -1, prev_event, e_qkv,
-                        Scope.GLOBAL), range(XCDS))
-
+                      cfg: dict, fold: bool) -> int:
+    """Layer 0: same attention path, dense MLP instead of experts. The dense
+    gate_up → down boundary needs the full h[10944], so it is global; the
+    residual add is done in place by dense_down, so nothing to fold after."""
+    e_qkv = build_qkv(g, layer, prev_event, fold)
     e_merge = build_attention(g, layer, e_qkv, cfg)
 
     e_oproj = g.new_event(Scope.GLOBAL, chiplet_producers(), f"L{layer}.o_proj")
     g.chiplet_task(Task(TaskKind.O_PROJ, layer, -1, e_merge, e_oproj,
                         Scope.GLOBAL), range(XCDS))
 
-    e_norm = g.new_event(Scope.GLOBAL, 1, f"L{layer}.norm")
-    g.cu_task(Task(TaskKind.NORM_ROUTER, layer, layer % XCDS, e_oproj, e_norm,
-                   Scope.GLOBAL))
+    e_norm = []
+    for xcd in range(XCDS):
+        e = g.new_event(Scope.XCD_LOCAL, 1, f"L{layer}.norm.x{xcd}")
+        g.cu_task(Task(TaskKind.NORM_ROUTER, layer, xcd, e_oproj, e, Scope.XCD_LOCAL))
+        e_norm.append(e)
 
     e_gate_up = g.new_event(Scope.GLOBAL, chiplet_producers(),
                             f"L{layer}.dense_gate_up")
-    g.chiplet_task(Task(TaskKind.DENSE_GATE_UP, layer, -1, e_norm, e_gate_up,
-                        Scope.GLOBAL), range(XCDS))
+    for xcd in range(XCDS):
+        g.chiplet_task(Task(TaskKind.DENSE_GATE_UP, layer, xcd, e_norm[xcd],
+                            e_gate_up, Scope.GLOBAL), [xcd])
 
     e_out = g.new_event(Scope.GLOBAL, chiplet_producers(), f"L{layer}.dense_down")
     g.chiplet_task(Task(TaskKind.DENSE_DOWN, layer, -1, e_gate_up, e_out,
@@ -281,14 +281,18 @@ def build_graph(cfg: dict) -> Graph:
     e = g.new_event(Scope.GLOBAL, 1, "embed")
     g.cu_task(Task(TaskKind.EMBED, -1, 0, None, e, Scope.GLOBAL))
 
+    prev_moe = False
     for layer in range(cfg["layers"]):
         if layer < cfg["first_k_dense"]:
-            e = build_dense_layer(g, layer, e, cfg)
+            e = build_dense_layer(g, layer, e, cfg, fold=prev_moe)
+            prev_moe = False
         else:
-            e = build_moe_layer(g, layer, e, cfg)
+            e = build_moe_layer(g, layer, e, cfg, fold=prev_moe)
+            prev_moe = True
 
     e_lm = g.new_event(Scope.GLOBAL, chiplet_producers(), "lm_head")
-    g.chiplet_task(Task(TaskKind.LM_HEAD, -1, -1, e, e_lm, Scope.GLOBAL),
+    g.chiplet_task(Task(TaskKind.LM_HEAD, -1, -1, e, e_lm, Scope.GLOBAL,
+                        flags=Flags.FOLD_PARTIALS if prev_moe else Flags.NONE),
                    range(XCDS))
     e_arg = g.new_event(Scope.GLOBAL, 1, "argmax")
     g.cu_task(Task(TaskKind.ARGMAX, -1, 0, e_lm, e_arg, Scope.GLOBAL))
@@ -296,11 +300,7 @@ def build_graph(cfg: dict) -> Graph:
 
 
 def finalize(g: Graph) -> None:
-    """Copy each waited event's scope and producer count onto the waiter.
-
-    The kernel computes its wait target as epoch x wait_count and picks the
-    counter array from wait_scope; both are properties of the *waited* event.
-    """
+    """Copy each waited event's scope and producer count onto the waiter."""
     for t in g.tasks:
         if t.wait_event is None:
             continue
@@ -313,9 +313,33 @@ def validate(g: Graph) -> list[str]:
     """DAG checks that would otherwise show up as a deadlocked kernel."""
     errors: list[str] = []
     signalled: dict[int, int] = {}
+    last_groups: dict[tuple[int, int], int] = {}   # (signal, local) -> members
     for t in g.tasks:
-        if t.signal_event is not None:
+        if t.signal_event is None:
+            continue
+        if t.flags & Flags.SIGNAL_LAST:
+            if t.local_event is None:
+                errors.append(f"task {t.index}: SIGNAL_LAST without local_event")
+                continue
+            key = (t.signal_event, t.local_event)
+            last_groups[key] = last_groups.get(key, 0) + 1
+            signalled[t.local_event] = signalled.get(t.local_event, 0) + 1
+        else:
             signalled[t.signal_event] = signalled.get(t.signal_event, 0) + 1
+    for (sig, loc), members in last_groups.items():
+        # the group counts as ONE producer of the global event, and its size
+        # must equal the local counter's producer count and each member's n_split
+        signalled[sig] = signalled.get(sig, 0) + 1
+        want = g.events[loc]["producers"]
+        if members != want:
+            errors.append(f"event {loc} ({g.events[loc]['label']}): {members} tasks "
+                          f"bump it, table says {want}")
+        if g.events[loc]["scope"] != int(Scope.XCD_LOCAL):
+            errors.append(f"event {loc}: last-arrival counter must be XCD-local")
+    for t in g.tasks:
+        if t.flags & Flags.SIGNAL_LAST and t.n_split != g.events[t.local_event]["producers"]:
+            errors.append(f"task {t.index}: n_split {t.n_split} != producers of "
+                          f"its local event")
 
     for ev in g.events:
         got, want = signalled.get(ev["id"], 0), ev["producers"]
@@ -349,8 +373,9 @@ def validate(g: Graph) -> list[str]:
     # XCD-local events must not cross chiplets.
     xcds_of_event: dict[int, set[int]] = {}
     for t in g.tasks:
-        if t.signal_event is not None:
-            xcds_of_event.setdefault(t.signal_event, set()).add(t.xcd)
+        for e in (t.signal_event, t.local_event):
+            if e is not None:
+                xcds_of_event.setdefault(e, set()).add(t.xcd)
     for t in g.tasks:
         if t.wait_event is None:
             continue
@@ -360,6 +385,10 @@ def validate(g: Graph) -> list[str]:
             if producers - {t.xcd}:
                 errors.append(f"task {t.index} on XCD {t.xcd} waits on XCD-local "
                               f"event {t.wait_event} signalled from {sorted(producers)}")
+    for e, xs in xcds_of_event.items():
+        if g.events[e]["scope"] == int(Scope.XCD_LOCAL) and len(xs) > 1:
+            errors.append(f"XCD-local event {e} ({g.events[e]['label']}) is produced "
+                          f"from XCDs {sorted(xs)}")
     return errors
 
 
@@ -384,8 +413,6 @@ def build(cfg: dict) -> Graph:
 def emit(g: Graph, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"".join(t.pack() for t in g.tasks))
-    # Event labels alongside, so the launcher can name an event in a timeout
-    # message instead of printing a number.
     side = path.with_suffix(path.suffix + ".events.txt")
     side.write_text("".join(f"{e['id']} {e['scope']} {e['producers']} {e['label']}\n"
                             for e in g.events))
@@ -407,7 +434,7 @@ def report(g: Graph, cfg: dict) -> None:
 
     moe = [t for t in g.tasks if t.layer == cfg["first_k_dense"]]
     moe_logical = len({t.logical for t in moe})
-    moe_events = {t.signal_event for t in moe}
+    moe_events = {t.signal_event for t in moe} | {t.local_event for t in moe if t.local_event is not None}
     moe_global = sum(1 for e in moe_events if g.events[e]["scope"] == int(Scope.GLOBAL))
     moe_local = len(moe_events) - moe_global
 
@@ -430,7 +457,6 @@ def report(g: Graph, cfg: dict) -> None:
     print(f"\ndescriptor memory: {len(g.tasks) * DESCRIPTOR_BYTES / 1024:.1f} KB "
           f"({len(g.tasks)} x {DESCRIPTOR_BYTES} B)")
 
-    # Fleet-native vs fallback, weighted by logical task count.
     by_status: dict[str, int] = {}
     for kind, n in logical_kinds.items():
         st = IMPLEMENTATION.get(kind, "fallback")
@@ -465,8 +491,8 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", type=Path,
                     default=Path(__file__).resolve().parents[2] / "reference" / "dsv2lite_config.json")
-    ap.add_argument("--kv-chunks", type=int, default=1,
-                    help="split-KV factor: 1 = one task per head (D2), 4 = D4")
+    ap.add_argument("--kv-chunks", type=int, default=8,
+                    help="split-KV factor: attention tasks per head (8 measured best)")
     ap.add_argument("--report", action="store_true")
     ap.add_argument("--emit", type=Path, help="write packed descriptors here")
     a = ap.parse_args()

@@ -92,23 +92,42 @@ __device__ __forceinline__ void wave_dot(const __hip_bfloat16* const* rows,
         acc[r] = 0.f;
     }
 
-    uint4 buf[R][D];
-    for (int i = lane; i < n4; i += D * kWaveLanes) {
+    // Double-buffered: batch i+1 is issued before batch i is consumed, so
+    // consecutive batches overlap their memory latency instead of paying it
+    // serially (measured on the MI300X: with one buffer the expert GEMVs
+    // streamed at ~2.4 TB/s against a 4.25 TB/s ceiling).
+    uint4 bufA[R][D], bufB[R][D];
+    auto issue = [&](uint4 (&buf)[R][D], int i) {
 #pragma unroll
-        for (int d = 0; d < D; ++d) {                      // issue everything
+        for (int d = 0; d < D; ++d) {
             if (i + d * kWaveLanes < n4) {
 #pragma unroll
                 for (int r = 0; r < R; ++r) buf[r][d] = r4[r][i + d * kWaveLanes];
             }
         }
+    };
+    auto consume = [&](const uint4 (&buf)[R][D], int i) {
 #pragma unroll
-        for (int d = 0; d < D; ++d) {                      // then consume
+        for (int d = 0; d < D; ++d) {
             if (i + d * kWaveLanes < n4) {
                 const float* x8 = x + (i + d * kWaveLanes) * 8;
 #pragma unroll
                 for (int r = 0; r < R; ++r) fma8(buf[r][d], x8, acc[r]);
             }
         }
+    };
+    const int step = D * kWaveLanes;
+    int i = lane;
+    issue(bufA, i);
+    while (true) {
+        const int j = i + step;
+        if (j < n4) issue(bufB, j);
+        consume(bufA, i);
+        if (j >= n4) break;
+        i = j + step;
+        if (i < n4) issue(bufA, i);
+        consume(bufB, j);
+        if (i >= n4) break;
     }
 #pragma unroll
     for (int r = 0; r < R; ++r) sums[r] = wave_sum(acc[r]);

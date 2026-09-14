@@ -1,10 +1,12 @@
-// The persistent kernel: one launch per token, 304 co-resident workgroups.
+// The persistent kernel: one launch per token sequence, 304 co-resident
+// workgroups.
 //
 // docs/design.md §3, §4. Every workgroup enters here, discovers which chiplet
 // it landed on, and becomes either that XCD's scheduler (one CU) or one of its
-// 37 workers. Workers walk their pre-built queue: wait on the task's dependent
-// event, run the task, signal completion. No host involvement, no kernel
-// launches between operators — that is the entire point.
+// 37 workers. For each token of the launch, workers walk their pre-built
+// queue: wait on the task's dependent event, run the task, signal completion.
+// No host involvement, no kernel launches between operators or between
+// tokens — that is the entire point.
 //
 // This file holds the control structure and the small tasks. The bandwidth-
 // critical bodies (GEMV, attention) live in separate headers so they can be
@@ -12,8 +14,7 @@
 //
 // A Chiplet-task (§3) reaches the device as one descriptor per worker: the
 // host emits 37 descriptors per XCD for it, each carrying the worker id, and
-// the row split is a pure function of (xcd, worker, wave) in gemv.h. The
-// event the Chiplet-task signals therefore has 8 x 37 = 296 producers.
+// the row split is a pure function of (xcd, worker, wave) in gemv.h.
 
 #include "runtime/fleet_runtime.h"
 #include "runtime/fleet_types.h"
@@ -27,65 +28,103 @@ namespace fleet {
 // from a global buffer another workgroup might be using at the same time.
 struct Scratch {
     float smem[kBlock];                          // block reductions
-    float vec[kMaxHidden];                       // staged GEMV operand
+    float vec[kMaxHidden];                       // staged GEMV operand / folded x
     float row[kMaxKvLora + kMaxQkRope];          // this token's cache row
-    float q_c[kMaxKvLora];
+    float q_c[kMaxKvLora];                       // q_c, then the merge's o_c
     float q_pe[kMaxQkRope];
     float part[kWaves * kPartialStride];         // per-wave attention partials
     float logits[kMaxRouted];
 };
 
+// One token's loop variables, derived from the token index of the launch.
+struct TokenCtx {
+    int tok;            // 0 .. n_tokens-1 within this launch
+    uint32_t epoch;     // rt.epoch0 + tok
+    int pos;            // absolute position of this token
+    int seq_len;        // rows valid after this step = pos + 1
+    const float* cos;   // YaRN row for pos
+    const float* sin;
+    bool dump;          // copy layer outputs (first token of the launch)
+    bool trace;         // per-task timeline for this token
+};
+
 // ---------------------------------------------------------------- small tasks
-//
-// These are the "CU-task x1" entries in §3: microsecond-scale, single
-// workgroup, and only standalone because they need the whole vector after a
-// cross-XCD step.
 
 __device__ void task_embed(const ModelDims& d, const Weights& w,
-                           Activations& act, int token) {
+                           Activations& act, const TokenCtx& tc) {
+    if (threadIdx.x == 0 && act.token_time) {
+        act.token_time[2 * tc.tok] = __builtin_amdgcn_s_memrealtime();
+    }
+    const int token = act.token_in[tc.tok];
     const __hip_bfloat16* row = w.embed + (int64_t)token * d.hidden;
+    float* x0 = act.x[0];                        // layer 0 reads x[0]
     for (int i = threadIdx.x; i < d.hidden; i += blockDim.x) {
-        act.x[i] = __bfloat162float(row[i]);
+        x0[i] = __bfloat162float(row[i]);
     }
 }
 
-// RMSNorm of the hidden vector into LDS. Recomputed in the prologue of every
-// GEMV task that needs it (§3 fusion 1): the vector is 8 KB, so recomputation
-// is far cheaper than an extra global event, and the GEMV then streams its
-// operand from LDS.
-//
-// HF's DeepseekV2RMSNorm in bf16: variance and scaling in fp32, the scaled
-// value cast to bf16, then multiplied by the bf16 weight — two roundings,
-// reproduced exactly here (reference_decode.py rms_norm with bf16=True).
-__device__ inline void rms_norm_to_lds(const ModelDims& d,
-                                       const __hip_bfloat16* __restrict__ gamma,
-                                       const float* __restrict__ in,
-                                       float* __restrict__ out, float* smem) {
-    // Pull the vector into LDS with all loads in flight, then reduce; the
-    // second pass reads LDS, not global memory again.
-    stage_vector(in, out, d.hidden);
+// RMSNorm of an LDS vector in place. HF's DeepseekV2RMSNorm in bf16: variance
+// and scaling in fp32, the scaled value cast to bf16, then multiplied by the
+// bf16 weight — two roundings (reference_decode.py rms_norm with bf16=True).
+__device__ inline void rms_norm_lds(const ModelDims& d,
+                                    const __hip_bfloat16* __restrict__ gamma,
+                                    float* __restrict__ v, float* smem) {
     float local = 0.f;
 #pragma unroll 8
-    for (int i = threadIdx.x; i < d.hidden; i += kBlockThreads) {
-        const float v = out[i];
-        local += v * v;
-    }
+    for (int i = threadIdx.x; i < d.hidden; i += kBlockThreads) local += v[i] * v[i];
     const float ssq = block_reduce_ordered(local, smem);
     const float inv = rsqrtf(ssq / d.hidden + d.rms_eps);
 #pragma unroll 8
     for (int i = threadIdx.x; i < d.hidden; i += kBlockThreads) {
-        out[i] = bf16_round(bf16_round(out[i] * inv) * __bfloat162float(gamma[i]));
+        v[i] = bf16_round(bf16_round(v[i] * inv) * __bfloat162float(gamma[i]));
     }
     __syncthreads();
 }
 
-// RMSNorm over the full hidden vector, then the router. Kept together because
-// the router needs the normed vector and nothing else does before the experts.
-// The normed vector is published to act.x_norm for the expert tasks.
+// The residual stream at the entry of layer `layer` (or of lm_head when
+// layer == d.layers), into LDS: x of the previous layer plus, if that layer
+// was MoE, the 8 expert partials (HF: bf16 MoE output, bf16 residual add —
+// the retired REDUCE task's arithmetic, now in the consumer's prologue).
+// One worker per layer publishes the folded x to x[layer & 1] for o_proj's
+// residual and the router; every other worker only reads.
+__device__ inline void fold_x(const ModelDims& d, const Activations& act,
+                              const TaskDescriptor& t, int layer, int xcd, int worker,
+                              float* __restrict__ vec, const TokenCtx& tc) {
+    const int src_par = layer == 0 ? 0 : (layer - 1) & 1;
+    const int dst_par = layer & 1;
+    const float* src = act.x[src_par];
+    const bool fold = (t.flags & FLAG_FOLD_PARTIALS) != 0;
+    const bool publish = xcd == 0 && worker == 0 && layer < d.layers && dst_par != src_par;
+    float* dst = act.x[dst_par];
+#pragma unroll 8
+    for (int i = threadIdx.x; i < d.hidden; i += kBlockThreads) {
+        float v = src[i];
+        if (fold) {
+            float acc = 0.f;
+            for (int x = 0; x < kNumXCDs; ++x) acc += act.expert_out[x * d.hidden + i];
+            v = bf16_round(v + bf16_round(acc));
+        }
+        vec[i] = v;
+        if (publish) dst[i] = v;
+    }
+    __syncthreads();
+    // Layer-boundary capture (§6): vec now holds the output of layer-1.
+    if (tc.dump && xcd == 0 && worker == 0 && layer > 0) {
+        float* out = act.layer_dump + (int64_t)(layer - 1) * d.hidden;
+        for (int i = threadIdx.x; i < d.hidden; i += blockDim.x) out[i] = vec[i];
+    }
+}
+
+// RMSNorm over the full hidden vector, then the router — once per XCD, so
+// the experts of this XCD wait on an XCD-local event. Every XCD computes
+// the same values from the same x in the same order, so the copies agree.
 __device__ void task_norm_router(const ModelDims& d, const Weights& w,
-                                 Activations& act, Scratch& s, int layer, bool moe) {
-    rms_norm_to_lds(d, w.layer_norm_post[layer], act.x, s.vec, s.smem);
-    for (int i = threadIdx.x; i < d.hidden; i += blockDim.x) act.x_norm[i] = s.vec[i];
+                                 Activations& act, Scratch& s, int layer,
+                                 int xcd, bool moe) {
+    float* x_norm = act.x_norm + (int64_t)xcd * d.hidden;
+    stage_vector(act.x[layer & 1], s.vec, d.hidden);
+    rms_norm_lds(d, w.layer_norm_post[layer], s.vec, s.smem);
+    for (int i = threadIdx.x; i < d.hidden; i += blockDim.x) x_norm[i] = s.vec[i];
     if (!moe) return;
 
     // Router: fp32 throughout, matching HF (softmax over 64 logits, top-k with
@@ -94,10 +133,8 @@ __device__ void task_norm_router(const ModelDims& d, const Weights& w,
               1.f, d.n_routed, d.hidden, 0, 1, 0, 1);
     __syncthreads();
 
-    // Softmax and top-k on wave 0, one expert per lane: the max, the sum and
-    // each of the k argmax picks are shuffle reductions instead of a serial
-    // scan by one thread over LDS (that scan was 371 us with a scratch-
-    // resident bool[64], and still ~70 us as a register mask).
+    // Softmax and top-k on wave 0, one expert per lane: max, sum and each of
+    // the k argmax picks are shuffle reductions.
     if (threadIdx.x < kWaveLanes) {
         const int lane = threadIdx.x;
         const bool valid = lane < d.n_routed;
@@ -109,9 +146,9 @@ __device__ void task_norm_router(const ModelDims& d, const Weights& w,
         const float inv = 1.f / wave_sum(p);
         p *= inv;
 
-        // top-k by selection: k is 6. Ties go to the lower index, matching
-        // torch.topk's stable order on equal scores: the reduction carries
-        // (score, -index) and takes the larger pair.
+        // top-k by selection; ties go to the lower index (torch.topk order).
+        int32_t* ids = act.topk_ids + xcd * kMaxTopK;
+        float* ws = act.topk_w + xcd * kMaxTopK;
         for (int k = 0; k < d.top_k; ++k) {
             float bv = p;
             int bi = valid ? lane : 0x7fffffff;
@@ -121,30 +158,17 @@ __device__ void task_norm_router(const ModelDims& d, const Weights& w,
                 const int oi = __shfl_xor(bi, off, kWaveLanes);
                 if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
             }
-            if (lane == 0) {
-                act.topk_ids[k] = bi;
-                act.topk_w[k] = bv;      // unnormalised; scaling applied in resolve_unit
-            }
-            if (lane == bi) p = -INFINITY;   // taken
+            if (lane == 0) { ids[k] = bi; ws[k] = bv; }   // unnormalised
+            if (lane == bi) p = -INFINITY;                // taken
         }
     }
 }
 
-// Fixed-order reduction of the 8 expert partials plus the residual. No float
-// atomics anywhere: the determinism rule in §4 is what makes the bitwise
-// reproducibility check in §6 meaningful. The MoE output is a bf16 tensor in
-// HF and the residual add is a bf16 add, hence the two roundings.
-__device__ void task_reduce(const ModelDims& d, Activations& act) {
-    for (int i = threadIdx.x; i < d.hidden; i += blockDim.x) {
-        float acc = 0.f;
-        for (int x = 0; x < kXCDs; ++x) acc += act.expert_out[x * d.hidden + i];
-        act.x[i] = bf16_round(act.x[i] + bf16_round(acc));
-    }
-}
-
 // Greedy pick over the bf16 logits (lm_head writes them bf16-rounded, as HF's
-// lm_head does); ties go to the lower index, as torch.argmax does.
-__device__ void task_argmax(const ModelDims& d, Activations& act) {
+// lm_head does); ties go to the lower index, as torch.argmax does. Feeds the
+// next token unless the host pre-filled token_in (teacher forcing).
+__device__ void task_argmax(const ModelDims& d, Activations& act, const RuntimeState& rt,
+                            const TokenCtx& tc) {
     __shared__ float best_val[kBlock];
     __shared__ int best_idx[kBlock];
 
@@ -158,7 +182,6 @@ __device__ void task_argmax(const ModelDims& d, Activations& act) {
     __syncthreads();
     for (int s = (int)blockDim.x >> 1; s; s >>= 1) {
         if ((int)threadIdx.x < s) {
-            // Tie-break on the lower index so the result is reproducible.
             const bool take = best_val[threadIdx.x + s] > best_val[threadIdx.x] ||
                               (best_val[threadIdx.x + s] == best_val[threadIdx.x] &&
                                best_idx[threadIdx.x + s] < best_idx[threadIdx.x]);
@@ -169,90 +192,101 @@ __device__ void task_argmax(const ModelDims& d, Activations& act) {
         }
         __syncthreads();
     }
-    if (threadIdx.x == 0) *act.next_token = best_idx[0];
+    if (threadIdx.x == 0) {
+        act.token_out[tc.tok] = best_idx[0];
+        if (!rt.teacher) act.token_in[tc.tok + 1] = best_idx[0];
+        if (act.token_time) act.token_time[2 * tc.tok + 1] = __builtin_amdgcn_s_memrealtime();
+    }
 }
 
 // ---------------------------------------------------------------- dispatch
+//
+// Returns whether the task should signal its signal_event: always, except
+// for FLAG_SIGNAL_LAST tasks, where only the last arrival does.
 
-// Layer-boundary capture (§6): x at the entry of layer L's QKV task is the
-// output of layer L-1, and x at lm_head's entry is the last layer's. One
-// worker copies it out; every other worker only reads x here, so the copy
-// races with nothing. Enabled by the launcher for the first token only,
-// which is the step the golden per-layer states were captured for.
-__device__ __forceinline__ void dump_layer_output(const ModelDims& d, const Activations& act,
-                                                  int layer_done) {
-    float* dst = act.layer_dump + (int64_t)layer_done * d.hidden;
-    for (int i = threadIdx.x; i < d.hidden; i += blockDim.x) dst[i] = act.x[i];
-}
-
-__device__ void run_task(const TaskDescriptor& t, const ModelDims& d,
-                         const Weights& w, Activations& act, KVCache& kv,
-                         Scratch& s, int token, int xcd, int worker, int dump) {
+__device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
+                         const ModelDims& d, const Weights& w, Activations& act,
+                         KVCache& kv, Scratch& s, const TokenCtx& tc, int xcd,
+                         int worker) {
     const int L = t.layer;
     const int nw = kWorkersPerXCD;
     const int chunks = max(1, (int)t.n_split);
-    const bool dumper = dump && xcd == 0 && worker == 0;
+    const int heads_per_xcd = d.heads / kNumXCDs;
 
     switch (t.kind) {
-        case TASK_EMBED:       task_embed(d, w, act, token); break;
-        case TASK_NORM_ROUTER: task_norm_router(d, w, act, s, L,
+        case TASK_EMBED:       task_embed(d, w, act, tc); break;
+        case TASK_NORM_ROUTER: task_norm_router(d, w, act, s, L, xcd,
                                                 L >= d.first_k_dense); break;
-        case TASK_REDUCE:      task_reduce(d, act); break;
-        case TASK_ARGMAX:      task_argmax(d, act); break;
+        case TASK_ARGMAX:      task_argmax(d, act, rt, tc); break;
+        case TASK_REDUCE:      break;   // retired: folded into fold_x
+        case TASK_MERGE_UV:    break;   // retired: done by the last KV chunk
 
-        // q_proj ‖ kv_a as one GEMV: 3072 q columns + 576 kv_a columns split
-        // evenly over 8 XCDs (456 each = 2 heads' worth plus kv_a). RMSNorm is
-        // recomputed per worker in the prologue rather than costing an event.
+        // This XCD's heads' q rows plus its own copy of kv_a, from the fused
+        // [3072 + 576, hidden] matrix. RMSNorm (and the fold of the previous
+        // layer's expert partials) is recomputed per worker in the prologue.
         case TASK_QKV_FUSED: {
-            if (dumper && L > 0) dump_layer_output(d, act, L - 1);
-            rms_norm_to_lds(d, w.layer_norm_in[L], act.x, s.vec, s.smem);
-            const int N = d.heads * d.q_head_dim + d.kv_lora + d.qk_rope;
-            gemv_rows(w.layer_qkv[L], d.hidden, s.vec, act.q, nullptr, EPI_BF16,
-                      1.f, N, d.hidden, xcd, kXCDs, worker, nw);
+            fold_x(d, act, t, L, xcd, worker, s.vec, tc);
+            rms_norm_lds(d, w.layer_norm_in[L], s.vec, s.smem);
+            const int q_rows = heads_per_xcd * d.q_head_dim;                // 384
+            const int q0 = xcd * q_rows;
+            gemv_rows(w.layer_qkv[L] + (int64_t)q0 * d.hidden, d.hidden, s.vec,
+                      act.q + q0, nullptr, EPI_BF16, 1.f, q_rows, d.hidden,
+                      0, 1, worker, nw);
+            const int kv_rows = d.kv_lora + d.qk_rope;                      // 576
+            const int kv0 = d.heads * d.q_head_dim;
+            gemv_rows(w.layer_qkv[L] + (int64_t)kv0 * d.hidden, d.hidden, s.vec,
+                      act.kv_a + (int64_t)xcd * kv_rows, nullptr, EPI_BF16, 1.f,
+                      kv_rows, d.hidden, 0, 1, worker, nw);
             break;
         }
 
         // Attention: kv post + q-absorb (+ q_pe RoPE) in the prologue, all
-        // into LDS, then this task's slice of the cache. XCD k owns heads 2k,
-        // 2k+1 so the merge stays local.
+        // into LDS, then this task's slice of the cache. The last chunk of
+        // the head to arrive (XCD-local counter) merges the partials and
+        // applies W_UV; only it signals the global merge event.
         case TASK_ATTENTION: {
             __hip_bfloat16* cache_layer = kv.data + (int64_t)L * kv.max_pos * kv.row;
-            kv_post(act.kv_a, w.layer_kv_a_norm[L], act.cos, act.sin, s.row,
+            const float* kv_a = act.kv_a + (int64_t)xcd * (d.kv_lora + d.qk_rope);
+            kv_post(kv_a, w.layer_kv_a_norm[L], tc.cos, tc.sin, s.row,
                     d.kv_lora, d.qk_rope, d.rms_eps, s.smem,
-                    /*write_cache=*/t.head == 0 && t.kv_chunk == 0,
-                    cache_layer + (int64_t)(d.seq_len - 1) * kv.row);
+                    /*write_cache=*/t.head == 0 && t.kv_chunk == 0,   // one writer per layer
+                    cache_layer + (int64_t)tc.pos * kv.row);
             q_absorb(act.q + (int64_t)t.head * d.q_head_dim, w.layer_kv_b[L],
-                     act.cos, act.sin, s.q_c, s.q_pe, s.part, t.head,
+                     tc.cos, tc.sin, s.q_c, s.q_pe, s.part, t.head,
                      d.qk_nope, d.qk_rope, d.v_head, d.kv_lora);
+            float* partials = act.attn_partial + (int64_t)t.head * chunks * kPartialStride;
             attention_chunk(cache_layer, s.q_c, s.q_pe, s.row, d.softmax_scale,
-                            d.seq_len, kv.row, t.kv_chunk, chunks,
-                            act.attn_partial +
-                                ((int64_t)t.head * chunks + t.kv_chunk) * kPartialStride,
-                            s.part);
-            break;
-        }
-
-        case TASK_MERGE_UV:
-            merge_and_uv(act.attn_partial + (int64_t)t.head * chunks * kPartialStride,
-                         w.layer_kv_b[L], act.o, t.head, chunks,
+                            tc.seq_len, kv.row, t.kv_chunk, chunks,
+                            partials + (int64_t)t.kv_chunk * kPartialStride, s.part);
+            __syncthreads();
+            __shared__ int last_smem;
+            if (threadIdx.x == 0) {
+                last_smem = arrive_last(rt, tc.epoch, t.local_event, xcd, chunks) ? 1 : 0;
+                if (last_smem) fence_acquire();
+            }
+            __syncthreads();
+            if (!last_smem) return false;
+            merge_and_uv(partials, w.layer_kv_b[L], act.o, t.head, chunks,
                          d.kv_lora, d.qk_nope, d.v_head, s.q_c);
-            break;
+            return true;
+        }
 
         // o_proj needs all 16 heads, so it is the layer's one unavoidable
         // global event; the residual add is folded into its epilogue.
         case TASK_O_PROJ:
             stage_vector(act.o, s.vec, d.heads * d.v_head);
-            gemv_rows(w.layer_o_proj[L], d.heads * d.v_head, s.vec, act.x, act.x,
-                      EPI_RESIDUAL, 1.f, d.hidden, d.heads * d.v_head,
-                      xcd, kXCDs, worker, nw);
+            gemv_rows(w.layer_o_proj[L], d.heads * d.v_head, s.vec, act.x[L & 1],
+                      act.x[L & 1], EPI_RESIDUAL, 1.f, d.hidden, d.heads * d.v_head,
+                      xcd, kNumXCDs, worker, nw);
             break;
 
         case TASK_EXPERT_GATE_UP: {
             const ExpertUnit u = resolve_unit(
                 t.expert_slot, w.layer_experts[L], w.layer_shared[L],
-                act.topk_ids, act.topk_w, d.routed_scaling, d.hidden, d.moe_inter,
-                d.moe_inter * 2, w.expert_stride);
-            stage_vector(act.x_norm, s.vec, d.hidden);
+                act.topk_ids + xcd * kMaxTopK, act.topk_w + xcd * kMaxTopK,
+                d.routed_scaling, d.hidden, d.moe_inter, d.moe_inter * 2,
+                w.expert_stride);
+            stage_vector(act.x_norm + (int64_t)xcd * d.hidden, s.vec, d.hidden);
             expert_gate_up(u, s.vec, act.expert_h + (int64_t)xcd * d.moe_inter,
                            d.hidden, worker, nw);
             break;
@@ -261,8 +295,9 @@ __device__ void run_task(const TaskDescriptor& t, const ModelDims& d,
         case TASK_EXPERT_DOWN: {
             const ExpertUnit u = resolve_unit(
                 t.expert_slot, w.layer_experts[L], w.layer_shared[L],
-                act.topk_ids, act.topk_w, d.routed_scaling, d.hidden, d.moe_inter,
-                d.moe_inter * 2, w.expert_stride);
+                act.topk_ids + xcd * kMaxTopK, act.topk_w + xcd * kMaxTopK,
+                d.routed_scaling, d.hidden, d.moe_inter, d.moe_inter * 2,
+                w.expert_stride);
             stage_vector(act.expert_h + (int64_t)xcd * d.moe_inter, s.vec, u.inter);
             expert_down(u, s.vec, act.expert_out + (int64_t)xcd * d.hidden,
                         d.hidden, worker, nw);
@@ -270,28 +305,30 @@ __device__ void run_task(const TaskDescriptor& t, const ModelDims& d,
         }
 
         case TASK_DENSE_GATE_UP:
-            stage_vector(act.x_norm, s.vec, d.hidden);
+            stage_vector(act.x_norm + (int64_t)xcd * d.hidden, s.vec, d.hidden);
             dense_gate_up(w.layer_dense[L], s.vec, act.expert_h, d.hidden,
-                          d.dense_inter, xcd, kXCDs, worker, nw);
+                          d.dense_inter, xcd, kNumXCDs, worker, nw);
             break;
 
         // h is 10944 wide here: read from L2 rather than staged.
         case TASK_DENSE_DOWN:
             gemv_rows(w.layer_dense[L] + (int64_t)2 * d.dense_inter * d.hidden,
-                      d.dense_inter, act.expert_h, act.x, act.x, EPI_RESIDUAL, 1.f,
-                      d.hidden, d.dense_inter, xcd, kXCDs, worker, nw);
+                      d.dense_inter, act.expert_h, act.x[L & 1], act.x[L & 1],
+                      EPI_RESIDUAL, 1.f, d.hidden, d.dense_inter, xcd, kNumXCDs,
+                      worker, nw);
             break;
 
         case TASK_LM_HEAD:
-            if (dumper) dump_layer_output(d, act, d.layers - 1);
-            rms_norm_to_lds(d, w.final_norm, act.x, s.vec, s.smem);
+            fold_x(d, act, t, d.layers, xcd, worker, s.vec, tc);
+            rms_norm_lds(d, w.final_norm, s.vec, s.smem);
             gemv_rows(w.lm_head, d.hidden, s.vec, act.logits, nullptr, EPI_BF16,
-                      1.f, d.vocab, d.hidden, xcd, kXCDs, worker, nw);
+                      1.f, d.vocab, d.hidden, xcd, kNumXCDs, worker, nw);
             break;
 
         default:
             break;
     }
+    return true;
 }
 
 // ---------------------------------------------------------------- entry point
@@ -303,9 +340,10 @@ __device__ void run_task(const TaskDescriptor& t, const ModelDims& d,
 
 extern "C" __global__ __launch_bounds__(kBlock, 1)
 void fleet_decode_step(RuntimeState rt, ModelDims d, Weights w,
-                       Activations act, KVCache kv, int token) {
+                       Activations act, KVCache kv) {
     __shared__ Scratch s;
     __shared__ int slot_smem;
+    __shared__ int ok_smem;
 
     const int xcd = xcd_id();
     const int worker = claim_role(rt, xcd, &slot_smem);
@@ -316,34 +354,69 @@ void fleet_decode_step(RuntimeState rt, ModelDims d, Weights w,
         return;
     }
 
-    __shared__ int ok_smem;
-    for (int slot = 0;; ++slot) {
-        const TaskDescriptor* t = fetch_task(rt, xcd, worker, slot);
-        if (t == nullptr) break;
+    for (int tok = 0; tok < rt.n_tokens; ++tok) {
+        TokenCtx tc;
+        tc.tok = tok;
+        tc.epoch = rt.epoch0 + (uint32_t)tok;
+        tc.pos = d.context + tok;
+        tc.seq_len = tc.pos + 1;
+        tc.cos = act.cos + (int64_t)tc.pos * d.qk_rope;
+        tc.sin = act.sin + (int64_t)tc.pos * d.qk_rope;
+        tc.dump = rt.dump_layers && tok == 0;
+        tc.trace = rt.trace != nullptr && tok == rt.trace_token;
 
-        uint64_t t_start = 0, t_ready = 0;
-        if (threadIdx.x == 0) {
-            if (rt.trace) t_start = __builtin_amdgcn_s_memrealtime();
-            ok_smem = wait_event(rt, t->wait_event, (EventScope)t->wait_scope, xcd,
-                                 t->wait_count) ? 1 : 0;
-            if (rt.trace) t_ready = __builtin_amdgcn_s_memrealtime();
-        }
-        __syncthreads();
-        if (!ok_smem) break;          // abort raised somewhere: drain, exit
+        bool stop = false;
+        for (int slot = 0;; ++slot) {
+            const TaskDescriptor* t = fetch_task(rt, xcd, worker, slot);
+            if (t == nullptr) break;
 
-        if (!rt.smoke) run_task(*t, d, w, act, kv, s, token, xcd, worker, rt.dump_layers);
-        __syncthreads();
+            uint64_t t_start = 0, t_ready = 0;
+            if (threadIdx.x == 0) {
+                if (tc.trace) t_start = __builtin_amdgcn_s_memrealtime();
+                bool ok = true;
+                // Token boundary: the embed of token t waits for token t-1's
+                // final event (the previous epoch of the graph's last event).
+                if (t->kind == TASK_EMBED && tok > 0) {
+                    ok = wait_event(rt, tc.epoch - 1, rt.done_event, SCOPE_GLOBAL, xcd, 1);
+                }
+                if (ok) {
+                    ok = wait_event(rt, tc.epoch, t->wait_event, (EventScope)t->wait_scope,
+                                    xcd, t->wait_count);
+                }
+                ok_smem = ok ? 1 : 0;
+                if (tc.trace) t_ready = __builtin_amdgcn_s_memrealtime();
+            }
+            __syncthreads();
+            if (!ok_smem) { stop = true; break; }   // abort raised somewhere
 
-        if (threadIdx.x == 0) {
-            signal_event(rt, t->signal_event, (EventScope)t->signal_scope, xcd);
-            if (rt.trace) {
-                uint64_t* tr = rt.trace + (int64_t)t->index * 4;
-                tr[0] = t_start;                                  // began waiting
-                tr[1] = t_ready;                                  // wait satisfied
-                tr[2] = __builtin_amdgcn_s_memrealtime();         // signalled
-                tr[3] = (uint64_t)xcd;
+            bool do_signal = true;
+            if (!rt.smoke) {
+                do_signal = run_task(*t, rt, d, w, act, kv, s, tc, xcd, worker);
+            } else if (t->flags & FLAG_SIGNAL_LAST) {
+                __shared__ int last_smem2;
+                if (threadIdx.x == 0) {
+                    last_smem2 = arrive_last(rt, tc.epoch, t->local_event, xcd,
+                                             max(1, (int)t->n_split)) ? 1 : 0;
+                }
+                __syncthreads();
+                do_signal = last_smem2 != 0;
+            }
+            __syncthreads();
+
+            if (threadIdx.x == 0) {
+                if (do_signal) {
+                    signal_event(rt, t->signal_event, (EventScope)t->signal_scope, xcd);
+                }
+                if (tc.trace) {
+                    uint64_t* tr = rt.trace + (int64_t)t->index * 4;
+                    tr[0] = t_start;                                  // began waiting
+                    tr[1] = t_ready;                                  // wait satisfied
+                    tr[2] = __builtin_amdgcn_s_memrealtime();         // signalled
+                    tr[3] = (uint64_t)xcd;
+                }
             }
         }
+        if (stop) break;
     }
 }
 
@@ -353,13 +426,8 @@ void fleet_decode_step(RuntimeState rt, ModelDims d, Weights w,
 //
 // The launch lives in this translation unit so the host stub the runtime
 // registers for fleet_decode_step is the one being launched; the launcher
-// only ever sees these two C functions.
+// only ever sees these C functions.
 
-// Pre-flight: where do kGrid workgroups actually land? One ordinary launch,
-// each block counts itself under its HW_REG_XCC_ID. The launcher prints the
-// histogram and refuses to continue unless every XCD got kCUsPerXCD blocks,
-// which is the placement assumption design.md §4 makes and claim_role() would
-// otherwise only report after a cooperative launch has been paid for.
 __global__ void fleet_probe_xcc(uint32_t* hist) {
     if (threadIdx.x == 0) atomicAdd(&hist[fleet::xcd_id() & 15], 1u);
 }
@@ -379,9 +447,9 @@ extern "C" hipError_t fleet_launch_step(const fleet::RuntimeState* rt,
                                         const fleet::ModelDims* d,
                                         const fleet::Weights* w,
                                         const fleet::Activations* act,
-                                        const fleet::KVCache* kv, int token,
+                                        const fleet::KVCache* kv,
                                         hipStream_t stream) {
-    void* args[] = {(void*)rt, (void*)d, (void*)w, (void*)act, (void*)kv, &token};
+    void* args[] = {(void*)rt, (void*)d, (void*)w, (void*)act, (void*)kv};
     return hipLaunchCooperativeKernel((const void*)fleet::fleet_decode_step,
                                       dim3(fleet::kGrid), dim3(fleet::kBlock),
                                       args, 0, stream);

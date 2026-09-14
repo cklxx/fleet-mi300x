@@ -30,7 +30,7 @@ C_SCALARS = {"uint16_t": ("H", 2), "int16_t": ("h", 2), "int32_t": ("i", 4),
 # be mirrored deliberately rather than silently.
 PY_FIELDS = ["kind", "layer", "xcd", "worker", "wait_event", "signal_event",
              "signal_scope", "n_split", "head", "kv_chunk", "expert_slot",
-             "wait_scope", "wait_count", "index"]
+             "wait_scope", "wait_count", "local_event", "flags", "index"]
 
 
 def parse_header(path: Path) -> tuple[list[tuple[str, str, int]], int]:
@@ -77,10 +77,12 @@ def main() -> int:
             off += width
     c_offsets = {n: (code, o) for n, code, o in c_fields}
 
+    from taskgraph import Flags
     sample = Task(kind=TaskKind.ATTENTION, layer=7, xcd=3, wait_event=11,
                   signal_event=12, signal_scope=Scope.XCD_LOCAL, head=5,
                   kv_chunk=2, expert_slot=-1, n_split=4, worker=9,
-                  wait_scope=Scope.GLOBAL, wait_count=296)
+                  wait_scope=Scope.GLOBAL, wait_count=296, local_event=13,
+                  flags=Flags.SIGNAL_LAST)
     sample.index = 40000            # > int16: the d2 graph has 33k descriptors
     packed = sample.pack()
 
@@ -104,7 +106,8 @@ def main() -> int:
               "wait_event": 11, "signal_event": 12,
               "signal_scope": int(Scope.XCD_LOCAL), "n_split": 4, "head": 5,
               "kv_chunk": 2, "expert_slot": -1, "index": 40000,
-              "wait_scope": int(Scope.GLOBAL), "wait_count": 296}
+              "wait_scope": int(Scope.GLOBAL), "wait_count": 296,
+              "local_event": 13, "flags": int(Flags.SIGNAL_LAST)}
     bad = {k: (got.get(k), expect[k]) for k in expect if got.get(k) != expect[k]}
     results.append(check("field values round-trip", not bad,
                          "" if not bad else str(bad)))
@@ -116,9 +119,10 @@ def main() -> int:
     empty.index = 0
     lay, = struct.unpack_from("<h", empty.pack(), 2)
     w, s = struct.unpack_from("<hh", empty.pack(), 8)
+    le, = struct.unpack_from("<h", empty.pack(), c_offsets["local_event"][1])
     results.append(check("None/-1 sentinels stay signed",
-                         w == -1 and s == -1 and lay == -1,
-                         f"layer={lay} wait={w} signal={s}"))
+                         w == -1 and s == -1 and lay == -1 and le == -1,
+                         f"layer={lay} wait={w} signal={s} local={le}"))
 
     print(f"\n{sum(results)}/{len(results)} passed")
     return 0 if all(results) else 1

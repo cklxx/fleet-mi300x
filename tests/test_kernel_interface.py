@@ -81,8 +81,8 @@ def main() -> int:
     # 1d. argument-count sanity for run_task: definition vs call site. A
     #     signature change that misses the call site is exactly the kind of
     #     error no static grep would otherwise notice.
-    defn = re.search(r"void run_task\(([^)]*)\)", kc)
-    callsite = re.search(r"run_task\(([^;]*?)\);", kc)
+    defn = re.search(r"(?:void|bool) run_task\(([^)]*)\)", kc)
+    callsite = re.search(r"=\s*run_task\(([^;]*?)\);", kc)
     if defn and callsite:
         n_params = len([p for p in defn.group(1).split(",") if p.strip()])
         n_args = len([a for a in callsite.group(1).split(",") if a.strip()])
@@ -109,7 +109,7 @@ def main() -> int:
 
     # 3b. the wait must use the wait-side pair. Passing signal_scope/n_split
     #     to wait_event made every wait target wrong once already.
-    wait_call = re.search(r"wait_event\(\s*rt,\s*t->wait_event,[^;]*;", kc, re.S)
+    wait_call = re.search(r"wait_event\(\s*rt,\s*tc\.epoch,\s*t->wait_event,[^;]*;", kc, re.S)
     ok_wait = bool(wait_call) and "wait_scope" in wait_call.group(0) \
         and "wait_count" in wait_call.group(0) \
         and "signal_scope" not in wait_call.group(0) and "n_split" not in wait_call.group(0)
@@ -125,8 +125,9 @@ def main() -> int:
 
     # 4b. the epoch is what makes any wait target non-zero; the launcher must
     #     set it from the token index before each launch.
-    results.append(check("launcher sets rt.epoch",
-                         re.search(r"rt\.epoch\s*=", lc) is not None))
+    results.append(check("launcher sets rt.epoch0 and n_tokens",
+                         re.search(r"rt\.epoch0\s*=", lc) is not None
+                         and re.search(r"rt\.n_tokens\s*=", lc) is not None))
     results.append(check("launcher checks the abort code",
                          "kAbortWaitTimeout" in lc and "kAbortXcdDistribution" in lc))
 
@@ -154,7 +155,7 @@ def main() -> int:
             continue
         fields = set()
         for line in m.group(1).splitlines():
-            fields.update(re.findall(r"(\w+)\s*(?:;|,)", re.sub(r"//.*", "", line)))
+            fields.update(re.findall(r"(\w+)\s*(?:\[\d+\])?\s*(?:;|,)", re.sub(r"//.*", "", line)))
         used = set(re.findall(rf"\b{var}\.(\w+)", users))
         total_used += len(used)
         if used - fields:

@@ -23,12 +23,14 @@ constexpr int kMaxMoeInter = 1408; // expert h staged in LDS for down
 constexpr int kMaxRouted = 64;     // router logits
 constexpr int kMaxTopK = 8;
 constexpr int kPartialStride = 2 + kMaxKvLora;   // attention partial: m, l, acc[512]
+constexpr int kNumXCDs = 8;        // per-XCD buffers below
 
 // Static model shape, read from build/weights.manifest by the host.
 struct ModelDims {
     int hidden, heads, q_head_dim, qk_nope, qk_rope, v_head;
     int kv_lora, moe_inter, dense_inter, n_routed, top_k, vocab;
-    int layers, first_k_dense, seq_len;   // seq_len = rows valid after this step
+    int layers, first_k_dense;
+    int context;           // prefill length: token t of a launch sits at position context + t
     float rms_eps, softmax_scale, routed_scaling;
 };
 
@@ -52,28 +54,37 @@ struct Weights {
     int64_t expert_stride;                        // elements between experts
 };
 
-// Per-token activations, allocated once (docs/design.md §5, under 1 MB total).
-// Everything a task needs only for itself lives in LDS instead (x_norm for
-// the GEMV prologues, the rebuilt cache row, q_c, q_pe): no two workgroups
-// ever share scratch through global memory.
+// Per-token activations, allocated once (docs/design.md §5).
+//
+// The residual stream is double-buffered by layer parity: layer L's q/kv_a
+// prologue reads x[(L-1)&1] (plus the 8 expert partials of layer L-1, if it
+// was MoE) and one worker writes the folded value to x[L&1], which o_proj
+// then updates in place. Anything an XCD produces for its own consumption
+// (kv_a, the normed vector, the routing choice) is per XCD, so those
+// handoffs are XCD-local events and identical values are never written to
+// the same line from two chiplets.
 struct Activations {
-    float* __restrict__ x;             // [hidden], bf16-rounded at residuals
-    float* __restrict__ x_norm;        // [hidden] post-attention norm (router task)
-    float* __restrict__ q;             // [heads * q_head_dim + kv_lora + qk_rope]
-    float* __restrict__ kv_a;          // = q + heads * q_head_dim, raw pre-norm
+    float* __restrict__ x[2];          // [hidden] each, bf16-valued
+    float* __restrict__ x_norm;        // [kNumXCDs][hidden] post-attention norm
+    float* __restrict__ q;             // [heads * q_head_dim]; XCD k writes its heads'
+    float* __restrict__ kv_a;          // [kNumXCDs][kv_lora + qk_rope] raw, pre-norm
     float* __restrict__ attn_partial;  // [heads][chunks][2 + kv_lora] m, l, acc
     float* __restrict__ o;             // [heads * v_head]
-    float* __restrict__ expert_h;      // [XCDs][moe_inter], or [dense_inter]
-    float* __restrict__ expert_out;    // [XCDs][hidden] partials to reduce
+    float* __restrict__ expert_h;      // [kNumXCDs][moe_inter], or [dense_inter]
+    float* __restrict__ expert_out;    // [kNumXCDs][hidden] partials, folded later
     float* __restrict__ logits;        // [vocab]
-    int32_t* __restrict__ topk_ids;    // [top_k]
-    float* __restrict__ topk_w;        // [top_k]
-    int32_t* __restrict__ next_token;
-    const float* __restrict__ cos;     // [qk_rope] for this position; YaRN is
-    const float* __restrict__ sin;     // position-only, so the host computes it
-    float* __restrict__ layer_dump;    // [layers][hidden]: each layer's output x,
-                                       // written when RuntimeState.dump_layers
-                                       // is set (the golden-state comparison, §6)
+    int32_t* __restrict__ topk_ids;    // [kNumXCDs][top_k]
+    float* __restrict__ topk_w;        // [kNumXCDs][top_k]
+    const float* __restrict__ cos;     // [max_pos][qk_rope] YaRN tables; the kernel
+    const float* __restrict__ sin;     // indexes them by position
+    float* __restrict__ layer_dump;    // [layers][hidden] each layer's output x on
+                                       // the launch's first token, if dump_layers
+    // In-kernel decode loop (design.md §4, launch model v2):
+    int32_t* __restrict__ token_in;    // [n_tokens + 1]: input token of step t; the
+                                       // argmax task writes token_in[t+1] unless
+                                       // teacher-forced (then the host filled it)
+    int32_t* __restrict__ token_out;   // [n_tokens]: argmax of step t
+    uint64_t* __restrict__ token_time; // [n_tokens][2]: s_memrealtime at embed, argmax
 };
 
 // Absorbed-MLA cache: one compressed row per position, shared by all heads.
