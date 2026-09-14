@@ -32,12 +32,14 @@ rows = [(t, s) for t, s in zip(tasks, stamps) if t["layer"] == a.layer and s[0]]
 t0 = min(s[1] for _, s in rows)
 by_kind = {}
 for t, s in rows:
-    k = by_kind.setdefault(t["kind"], [10**30, 0, 0, 0.0, 0, 0.0])
+    k = by_kind.setdefault(t["kind"], [10**30, 0, 0, 0.0, 0, 0.0, 0.0])
     k[0] = min(k[0], s[1]); k[1] = max(k[1], s[2]); k[2] = max(k[2], s[1])
-    k[3] += s[2] - s[1]; k[4] += 1; k[5] += s[3] >> 8
+    k[3] += s[2] - s[1]; k[4] += 1
+    k[5] += (s[3] >> 32) & 0xffffff; k[6] += (s[3] >> 8) & 0xffffff
 us = 0.01
 print(f"layer {a.layer}: {len(rows)} descriptors, span {(max(s[2] for _, s in rows) - t0) * us:.1f} us")
-print(f"  {'kind':<15} {'first-ready':>11} {'last-ready':>10} {'last-done':>10} {'avg-busy':>9} {'prologue':>9}  n")
-for kind, (fr, ld, lr, busy, cnt, pro) in sorted(by_kind.items(), key=lambda kv: kv[1][0]):
+print(f"  {'kind':<15} {'first-ready':>11} {'last-ready':>10} {'last-done':>10} {'avg-busy':>9} {'prologue':>9} {'of it:stage':>11}  n")
+for kind, (fr, ld, lr, busy, cnt, pro, stg) in sorted(by_kind.items(), key=lambda kv: kv[1][0]):
     print(f"  {TaskKind(kind).name:<15} {(fr - t0) * us:>9.1f}us {(lr - t0) * us:>8.1f}us "
-          f"{(ld - t0) * us:>8.1f}us {busy * us / cnt:>7.1f}us {pro * us / cnt:>7.1f}us  {cnt}")
+          f"{(ld - t0) * us:>8.1f}us {busy * us / cnt:>7.1f}us {pro * us / cnt:>7.1f}us "
+          f"{stg * us / cnt:>9.1f}us  {cnt}")

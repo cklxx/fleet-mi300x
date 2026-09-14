@@ -115,6 +115,10 @@ enum TaskFlags : int16_t {
     FLAG_CHUNK_WAIT = 16,     // down: waits local_event + c (c >= 1) in the
                               // body before consuming chunk c; chunk 0 is the
                               // descriptor's wait_event
+    FLAG_KVA_SHARED = 32,     // q/kv_a: kv_a rows split over the 8 XCDs into
+                              // one buffer; attention: read that buffer
+    FLAG_WORKER_GROUP = 64,   // rows split over the n_split workers starting
+                              // at worker `head`, not over all 37
 };
 
 // Device-side state, allocated once by the host.

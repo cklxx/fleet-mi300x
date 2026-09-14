@@ -41,12 +41,14 @@ struct __attribute__((aligned(16))) Scratch {
     int   ids[kMaxTopK];                         // this XCD's routing choice
     float ws[kMaxTopK];
     uint64_t stamp;                              // trace: end of the task's prologue
+    uint64_t stamp_stage;                        // trace: end of the staging (before the norm)
     int   ids_blk[kBlock];                       // lm_head argmax candidate reduction
 };
 
 // Trace sub-phase: thread 0 stamps the end of a task's prologue (staging,
 // norm, routing) so the report can split busy time into prologue and body.
 #define FLEET_STAMP() do { if (tc.trace && threadIdx.x == 0) s.stamp = __builtin_amdgcn_s_memrealtime(); } while (0)
+#define FLEET_STAMP_STAGE() do { if (tc.trace && threadIdx.x == 0) s.stamp_stage = __builtin_amdgcn_s_memrealtime(); } while (0)
 
 // One token's loop variables, derived from the token index of the launch.
 struct TokenCtx {
@@ -190,6 +192,7 @@ __device__ void task_norm_router(const ModelDims& d, const Weights& w,
                                  int xcd, int worker, bool moe, const TokenCtx& tc, bool coh) {
     // x[1] = bf16(x[0] + bf16(o_proj)) from the 8 K-split partials
     stage_residual(d, act.x[0], act.oproj_partial, act.x[1], s.vec, xcd, worker, coh);
+    FLEET_STAMP_STAGE();
     rms_norm_lds(d, w.layer_norm_post[layer], s.vec, s.smem);
     FLEET_STAMP();
     if (worker == 0) {
@@ -325,7 +328,10 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
                          KVCache& kv, Scratch& s, const TokenCtx& tc, int xcd,
                          int worker) {
     const int L = t.layer;
-    const int nw = kWorkersPerXCD;
+    // WORKER_GROUP: this task's rows are split over a sub-range of the XCD's
+    // workers (expert gate_up / down on disjoint groups, so they overlap)
+    const int nw = (t.flags & FLAG_WORKER_GROUP) ? (int)t.n_split : kWorkersPerXCD;
+    worker = (t.flags & FLAG_WORKER_GROUP) ? worker - (int)t.head : worker;
     const int chunks = max(1, (int)t.n_split);
     const bool coh = rt.coherent_acts != 0;   // cross-XCD activations via atomics
     const int heads_per_xcd = d.heads / kNumXCDs;
@@ -394,6 +400,7 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
             const float* parts = (t.flags & FLAG_FOLD_PARTIALS) ? act.expert_out : nullptr;
             stage_residual(d, src, parts, (L == 0) ? nullptr : act.x[0], s.vec, xcd, worker, coh);
             dump_layer(d, act, L - 1, s.vec, xcd, worker, tc);
+            FLEET_STAMP_STAGE();
             rms_norm_lds(d, w.layer_norm_in[L], s.vec, s.smem);
             FLEET_STAMP();
             const int q_rows = heads_per_xcd * d.q_head_dim;                // 384
@@ -403,9 +410,15 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
                       0, 1, worker, nw);
             const int kv_rows = d.kv_lora + d.qk_rope;                      // 576
             const int kv0 = d.heads * d.q_head_dim;
-            gemv_rows(w.layer_qkv[L] + (int64_t)kv0 * d.hidden, d.hidden, s.vec,
-                      act.kv_a + (int64_t)xcd * kv_rows, nullptr, EPI_BF16, 1.f,
-                      kv_rows, d.hidden, 0, 1, worker, nw);
+            if (t.flags & FLAG_KVA_SHARED) {   // this XCD's 1/8 of the rows, one buffer
+                gemv_rows(w.layer_qkv[L] + (int64_t)kv0 * d.hidden, d.hidden, s.vec,
+                          act.kv_a, nullptr, EPI_BF16, 1.f, kv_rows, d.hidden,
+                          xcd, kNumXCDs, worker, nw);
+            } else {                            // this XCD's own full copy
+                gemv_rows(w.layer_qkv[L] + (int64_t)kv0 * d.hidden, d.hidden, s.vec,
+                          act.kv_a + (int64_t)xcd * kv_rows, nullptr, EPI_BF16, 1.f,
+                          kv_rows, d.hidden, 0, 1, worker, nw);
+            }
             break;
         }
 
@@ -413,11 +426,13 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
         // into LDS, then this task's slice of the cache into a partial.
         case TASK_ATTENTION: {
             __hip_bfloat16* cache_layer = kv.data + (int64_t)L * kv.max_pos * kv.row;
-            const float* kv_a = act.kv_a + (int64_t)xcd * (d.kv_lora + d.qk_rope);
+            const float* kv_a = act.kv_a + ((t.flags & FLAG_KVA_SHARED) ? 0
+                                            : (int64_t)xcd * (d.kv_lora + d.qk_rope));
             kv_post(kv_a, w.layer_kv_a_norm[L], tc.cos, tc.sin, s.row,
                     d.kv_lora, d.qk_rope, d.rms_eps, s.smem,
                     /*write_cache=*/t.head == 0 && t.kv_chunk == 0,   // one writer per layer
                     cache_layer + (int64_t)tc.pos * kv.row);
+            FLEET_STAMP_STAGE();   // after kv_post, before q_absorb
             if (rt.coherent_acts && t.head == 0 && t.kv_chunk == 0) {
                 // The cache row is the one cached cross-XCD payload: with the
                 // global fences gone, its writer flushes it to HBM itself.
@@ -456,6 +471,7 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
                 t.expert_slot, w.layer_experts[L], w.layer_shared[L],
                 s.ids, s.ws, d.routed_scaling, d.hidden, d.moe_inter, d.moe_inter * 2,
                 w.expert_stride);
+            FLEET_STAMP_STAGE();   // after routing + resolve, before the 8 KB stage
             stage_vector(act.x_norm + (int64_t)xcd * d.hidden, s.vec, d.hidden);
             FLEET_STAMP();
             uint32_t* chunk_counters = (t.flags & FLAG_CHUNK_SIGNAL)
@@ -589,7 +605,7 @@ void fleet_decode_step(RuntimeState rt, ModelDims d, Weights w,
             if (!ok_smem) { stop = true; break; }   // abort raised somewhere
 
             bool do_signal = true;
-            if (threadIdx.x == 0) s.stamp = 0;
+            if (threadIdx.x == 0) { s.stamp = 0; s.stamp_stage = 0; }
             if (!rt.smoke) {
                 do_signal = run_task(*t, rt, d, w, act, kv, s, tc, xcd, worker);
             } else if (t->flags & FLAG_CHUNK_SIGNAL) {
@@ -625,7 +641,8 @@ void fleet_decode_step(RuntimeState rt, ModelDims d, Weights w,
                     // xcd in the low byte; prologue ticks (ready -> end of
                     // prologue, 0 if the kind has none) above it
                     const uint64_t pro = s.stamp ? (s.stamp - t_ready) : 0;
-                    tr[3] = (uint64_t)xcd | (pro << 8);
+                    const uint64_t stg = s.stamp_stage ? (s.stamp_stage - t_ready) : 0;
+                    tr[3] = (uint64_t)xcd | ((stg & 0xffffff) << 8) | ((pro & 0xffffff) << 32);
                 }
             }
         }

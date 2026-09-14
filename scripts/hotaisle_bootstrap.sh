@@ -92,6 +92,11 @@ run_variant() {   # name binary graph extra-args...
 }
 python3 src/host/taskgraph.py --kv-chunks 16 --k-chunk 512 --emit build/taskgraph_d16_k512.bin | tail -1
 python3 src/host/taskgraph.py --kv-chunks 16 --prefetch --emit build/taskgraph_d16_prefetch.bin | tail -1
+python3 src/host/taskgraph.py --kv-chunks 16 --kva-shared --emit build/taskgraph_d16_kva.bin | tail -1
+python3 src/host/taskgraph.py --kv-chunks 16 --split-workers 18 --k-chunk 512 --emit build/taskgraph_d16_split18_k512.bin | tail -1
+python3 src/host/taskgraph.py --kv-chunks 16 --split-workers 18 --emit build/taskgraph_d16_split18.bin | tail -1
+python3 src/host/taskgraph.py --kv-chunks 16 --split-workers 22 --k-chunk 512 --emit build/taskgraph_d16_split22_k512.bin | tail -1
+python3 src/host/taskgraph.py --kv-chunks 16 --kva-shared --split-workers 18 --k-chunk 512 --emit build/taskgraph_d16_kva_split18_k512.bin | tail -1
 run_variant nt_d16_fenced    $BIN                 build/taskgraph_d16.bin
 run_variant nt_d16_coherent  $BIN                 build/taskgraph_d16.bin          --coherent-acts
 run_variant nt_d16_fenced_b  $BIN                 build/taskgraph_d16.bin
@@ -101,6 +106,27 @@ run_variant nt_d8            $BIN                 build/taskgraph_d8.bin
 run_variant nt_d16_kchunk512 $BIN                 build/taskgraph_d16_k512.bin
 run_variant nt_d16_prefetch  $BIN                 build/taskgraph_d16_prefetch.bin
 run_variant nt_d16_v1        $BIN                 build/taskgraph_d16.bin          --tokens-per-launch 1
+run_variant nt_d16_kva       $BIN                 build/taskgraph_d16_kva.bin
+run_variant nt_d16_split18_k512 $BIN              build/taskgraph_d16_split18_k512.bin
+run_variant nt_d16_split18   $BIN                 build/taskgraph_d16_split18.bin
+run_variant nt_d16_split22_k512 $BIN              build/taskgraph_d16_split22_k512.bin
+run_variant nt_d16_kva_split18_k512 $BIN          build/taskgraph_d16_kva_split18_k512.bin
+for v in kva split18_k512; do
+  $BIN --graph build/taskgraph_d16_$v.bin --repeat 1 --trace results/trace_$v.bin > /dev/null 2>&1
+  python3 scripts/trace_timeline.py results/trace_$v.bin build/taskgraph_d16_$v.bin --layer 5 | tee results/timeline_${v}_L5.txt
+done
+
+log "ISA: where the scratch comes from"
+mkdir -p build/isa && (cd build/isa && hipcc --offload-arch=gfx942 -O3 -std=c++17 -DFLEET_NT_WEIGHTS=1 -I../../src -save-temps -c ../../src/kernels/fleet_kernel.hip -o fleet_kernel.o > /dev/null 2>&1)
+ISA=$(ls build/isa/*gfx942*.s 2>/dev/null | head -1)
+if [ -n "$ISA" ]; then
+  grep -E "private_segment_fixed_size|vgpr_spill_count|sgpr_spill_count|\.vgpr_count|\.agpr_count" "$ISA" | head -8 | tee results/isa_summary.txt
+  echo "scratch instructions: $(grep -cE '^\s+scratch_(load|store)' "$ISA")" | tee -a results/isa_summary.txt
+  # the nearest preceding label / inlined-function comment of each scratch access
+  grep -nE '^\s+scratch_(load|store)|^;.*(inline|Function)|^\.LBB' "$ISA" | grep -B1 scratch_ | grep -vE scratch_ | sort | uniq -c | sort -rn | head -10 | tee -a results/isa_summary.txt
+  cp "$ISA" results/fleet_kernel_gfx942.s.txt
+fi
+
 
 log "bytes actually fetched (rocprof, 4 tokens, teacher-forced): best effort, rocprofv3 --kernel-trace segfaulted on ROCm 7.2.4"
 if command -v rocprofv3 >/dev/null 2>&1; then

@@ -310,7 +310,7 @@ static void report_trace(const std::vector<TaskDescriptor>& tasks,
                          const std::vector<uint64_t>& tr, int token,
                          const std::string& path) {
     uint64_t t0 = ~0ull, t1 = 0;
-    struct Agg { double busy = 0, wait = 0, pro = 0; int n = 0; };
+    struct Agg { double busy = 0, wait = 0, pro = 0, stg = 0; int n = 0; };
     std::map<int, Agg> by_kind;
     std::map<int, std::pair<uint64_t, uint64_t>> by_layer;
     for (size_t i = 0; i < tasks.size(); ++i) {
@@ -320,7 +320,8 @@ static void report_trace(const std::vector<TaskDescriptor>& tasks,
         Agg& a = by_kind[t.kind];
         a.busy += (double)(tr[4 * i + 2] - tr[4 * i + 1]);
         a.wait += (double)(tr[4 * i + 1] - tr[4 * i]);
-        a.pro += (double)(tr[4 * i + 3] >> 8);
+        a.pro += (double)((tr[4 * i + 3] >> 32) & 0xffffff);
+        a.stg += (double)((tr[4 * i + 3] >> 8) & 0xffffff);
         ++a.n;
         auto& L = by_layer[t.layer];
         if (L.first == 0) L = {tr[4 * i + 1], tr[4 * i + 2]};
@@ -329,10 +330,11 @@ static void report_trace(const std::vector<TaskDescriptor>& tasks,
     if (t1 == 0) { std::printf("trace: empty\n"); return; }
     const double us = 0.01;   // 100 MHz ticks -> us
     std::printf("\ntrace of token %d: %.3f ms from first wait to last signal\n", token, (t1 - t0) * us / 1e3);
-    std::printf("  %-15s %6s %10s %10s %10s %12s\n", "kind", "tasks", "busy-sum", "wait-sum", "avg-busy", "avg-prologue");
+    std::printf("  %-15s %6s %10s %10s %10s %12s %10s\n", "kind", "tasks", "busy-sum", "wait-sum", "avg-busy", "avg-prologue", "avg-stage");
     for (auto& [k, a] : by_kind) {
-        std::printf("  %-15s %6d %8.2f ms %8.2f ms %8.1f us %10.1f us\n", kKindNames[k], a.n,
-                    a.busy * us / 1e3, a.wait * us / 1e3, a.busy * us / a.n, a.pro * us / a.n);
+        std::printf("  %-15s %6d %8.2f ms %8.2f ms %8.1f us %10.1f us %8.1f us\n", kKindNames[k], a.n,
+                    a.busy * us / 1e3, a.wait * us / 1e3, a.busy * us / a.n, a.pro * us / a.n,
+                    a.stg * us / a.n);
     }
     std::printf("  per-layer span (first task ready -> last task signalled): ");
     double sum_layers = 0;
@@ -463,6 +465,11 @@ int main(int argc, char** argv) {
     // cached payloads that still cross XCDs under --coherent-acts: the dense
     // layer's h (gate_up -> down), found by event label
     for (int i = 0; i < 4; ++i) rt.fenced_events[i] = -1;
+    if (coherent_acts) {
+        for (const auto& t : tasks) {
+            if (t.flags & FLAG_KVA_SHARED) die("--coherent-acts cannot be combined with a --kva-shared graph (kv_a would cross XCDs with plain loads)");
+        }
+    }
     {
         int nf = 0;
         for (const auto& kv_ : labels) {
