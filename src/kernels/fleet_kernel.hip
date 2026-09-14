@@ -362,7 +362,8 @@ __device__ void task_norm_router(const ModelDims& d, const Weights& w,
     // Router logits: fp32 throughout, matching HF's fp32 gate.
     gemv_rows(w.layer_router[layer], d.hidden, s.vec,
               act.router_logits + (int64_t)xcd * d.n_routed, nullptr, EPI_NONE,
-              1.f, d.n_routed, d.hidden, 0, 1, worker, kWorkersPerXCD);
+              1.f, d.n_routed, d.hidden, 0, 1, worker, kWorkersPerXCD,
+              /*coh=*/false, /*y16=*/nullptr, /*nt=*/false);
 
     // The softmax + 6-pass top-k is 36 dependent shuffles on one wave while
     // the other three wait; every expert task used to repeat it (measured
@@ -687,10 +688,18 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
         }
 
         case TASK_EXPERT_GATE_UP: {
+            // Issue the 64-logit load first, stage the 8 KB of x_norm while it
+            // is in flight, and only then run the chain that depends on it
+            // (softmax, top-k, expert pointers). Under a full weight stream
+            // that load costs microseconds and the staging does not need it.
             const int32_t* ids = act.topk_ids + xcd * kMaxTopK;
             const float* ws = act.topk_w + xcd * kMaxTopK;
-            if (!(t.flags & FLAG_TOPK_READ)) {   // per-task softmax + top-k
-                select_experts(d, act.router_logits + (int64_t)xcd * d.n_routed, s.ids, s.ws);
+            const bool own_topk = !(t.flags & FLAG_TOPK_READ);
+            const float logit = own_topk
+                ? load_logit(d, act.router_logits + (int64_t)xcd * d.n_routed) : 0.f;
+            stage_vector(act.x_norm + (int64_t)xcd * d.hidden, s.vec, d.hidden);
+            if (own_topk) {
+                select_experts_from(d, logit, s.ids, s.ws);
                 ids = s.ids; ws = s.ws;
             }
             FLEET_STAMP_STAGE();
@@ -698,7 +707,6 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
                 t.expert_slot, w.layer_experts[L], w.layer_shared[L],
                 ids, ws, d.routed_scaling, d.hidden, d.moe_inter, d.moe_inter * 2,
                 w.expert_stride);
-            stage_vector(act.x_norm + (int64_t)xcd * d.hidden, s.vec, d.hidden);
             FLEET_STAMP();
             uint32_t* chunk_counters = (t.flags & FLAG_CHUNK_SIGNAL)
                 ? rt.xcd_counters + (int64_t)xcd * kMaxEvents + t.local_event : nullptr;

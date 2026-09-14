@@ -407,7 +407,8 @@ __device__ inline void merge_and_uv(
     const __hip_bfloat16* w_uv =
         kv_b + (int64_t)head * row_stride * kv_lora + (int64_t)(qk_nope + row0) * kv_lora;
     gemv_rows(w_uv, kv_lora, o_c_lds, o + head * v_head + row0, nullptr, EPI_BF16, 1.f,
-              n_rows, kv_lora, /*xcd=*/0, /*n_xcds=*/1, /*worker=*/0, /*n_workers=*/1);
+              n_rows, kv_lora, /*xcd=*/0, /*n_xcds=*/1, /*worker=*/0, /*n_workers=*/1,
+              /*coh=*/false, /*y16=*/nullptr, /*nt=*/false);
 }
 
 }  // namespace fleet

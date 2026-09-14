@@ -51,14 +51,22 @@ constexpr int kWaves = 256 / kWaveLanes;   // waves per workgroup (= fleet_runti
 #endif
 typedef unsigned int fleet_u32x4 __attribute__((ext_vector_type(4)));
 
-__device__ __forceinline__ uint4 load_weight(const uint4* __restrict__ p) {
+// nt = false for the weight tensors small enough to live in the 256 MB
+// Infinity Cache for the whole run and read again every token: the router
+// (6.9 MB over 27 layers) and kv_b (113 MB). Marking those non-temporal
+// tells the hardware to discard exactly what we want it to keep. Everything
+// else is read once per token and is streamed.
+__device__ __forceinline__ uint4 load_weight(const uint4* __restrict__ p, bool nt) {
 #if FLEET_NT_WEIGHTS
-    const fleet_u32x4 v = __builtin_nontemporal_load(reinterpret_cast<const fleet_u32x4*>(p));
-    uint4 r; r.x = v.x; r.y = v.y; r.z = v.z; r.w = v.w;
-    return r;
+    if (nt) {
+        const fleet_u32x4 v = __builtin_nontemporal_load(reinterpret_cast<const fleet_u32x4*>(p));
+        uint4 r; r.x = v.x; r.y = v.y; r.z = v.z; r.w = v.w;
+        return r;
+    }
 #else
-    return *p;
+    (void)nt;
 #endif
+    return *p;
 }
 
 __device__ __forceinline__ void unpack_bf16x2(uint32_t p, float& lo, float& hi) {
@@ -105,7 +113,7 @@ __device__ __forceinline__ void fma8(const uint4& v, const float* __restrict__ x
 template <int R, int D>
 __device__ __forceinline__ void wave_dot(const __hip_bfloat16* const* rows,
                                          const float* __restrict__ x, int K,
-                                         float* sums) {
+                                         float* sums, bool nt) {
     const int lane = threadIdx.x & (kWaveLanes - 1);
     const int n4 = K / 8;
     const uint4* r4[R];
@@ -131,7 +139,7 @@ __device__ __forceinline__ void wave_dot(const __hip_bfloat16* const* rows,
     for (int d = 0; d < D; ++d) {                                               \
         if ((I) + d * kWaveLanes < n4) {                                        \
             _Pragma("unroll")                                                   \
-            for (int r = 0; r < R; ++r) BUF[r][d] = load_weight(r4[r] + (I) + d * kWaveLanes); \
+            for (int r = 0; r < R; ++r) BUF[r][d] = load_weight(r4[r] + (I) + d * kWaveLanes, nt); \
         }                                                                       \
     }
 #define FLEET_CONSUME(BUF, I)                                                   \
@@ -268,7 +276,7 @@ __device__ __forceinline__ void gemv_rows_pipelined(
         const float* __restrict__ x, float* __restrict__ y,
         const float* __restrict__ residual, GemvEpilogue epi, float scale,
         int K, int first, int cnt, int n_workers, bool coh,
-        __hip_bfloat16* __restrict__ y16) {
+        __hip_bfloat16* __restrict__ y16, bool nt) {
     const int wave = threadIdx.x / kWaveLanes;
     const int lane = threadIdx.x % kWaveLanes;
     const int n4 = K / 8;
@@ -291,7 +299,7 @@ __device__ __forceinline__ void gemv_rows_pipelined(
     for (int r = 0; r < RPI; ++r) {                                             \
         const uint4* r4 = reinterpret_cast<const uint4*>(FLEET_ROW(KK, r));     \
         _Pragma("unroll")                                                       \
-        for (int d = 0; d < D; ++d) BUF[r][d] = load_weight(r4 + idx[d]);       \
+        for (int d = 0; d < D; ++d) BUF[r][d] = load_weight(r4 + idx[d], nt);       \
     }
 #define FLEET_REDUCE_GROUP(BUF, KK)                                             \
     {                                                                           \
@@ -349,7 +357,7 @@ __device__ __forceinline__ void gemv_rows_pipelined_half(
         const float* __restrict__ x, float* __restrict__ y,
         const float* __restrict__ residual, GemvEpilogue epi, float scale,
         int K, int first, int cnt, int n_workers, bool coh,
-        __hip_bfloat16* __restrict__ y16) {
+        __hip_bfloat16* __restrict__ y16, bool nt) {
     constexpr int H = RPI / 2;
     const int wave = threadIdx.x / kWaveLanes;
     const int lane = threadIdx.x % kWaveLanes;
@@ -365,7 +373,7 @@ __device__ __forceinline__ void gemv_rows_pipelined_half(
 #define FLEET_HISSUE(BUF, KK)                                                   \
     _Pragma("unroll")                                                           \
     for (int j = 0; j < H; ++j) {                                               \
-        BUF[j] = load_weight(reinterpret_cast<const uint4*>(FLEET_HROW(KK, j)) + idx); \
+        BUF[j] = load_weight(reinterpret_cast<const uint4*>(FLEET_HROW(KK, j)) + idx, nt); \
     }
 #define FLEET_HREDUCE(BUF, KK)                                                  \
     {                                                                           \
@@ -412,7 +420,7 @@ __device__ __forceinline__ void gemv_rows_impl(
         const float* __restrict__ x, float* __restrict__ y,
         const float* __restrict__ residual, GemvEpilogue epi, float scale,
         int K, int first, int cnt, int n_workers, bool coh,
-        __hip_bfloat16* __restrict__ y16) {
+        __hip_bfloat16* __restrict__ y16, bool nt) {
     const int wave = threadIdx.x / kWaveLanes;
     const int lane = threadIdx.x % kWaveLanes;
     for (int k = RPI * wave; k < cnt; k += RPI * kWaves) {
@@ -423,7 +431,7 @@ __device__ __forceinline__ void gemv_rows_impl(
             rows[r] = w + (int64_t)(first + (k + min(r, nr - 1)) * n_workers) * ld;
         }
         float sums[RPI];
-        wave_dot<RPI, D>(rows, x, K, sums);
+        wave_dot<RPI, D>(rows, x, K, sums, nt);
         if (lane == 0) {
 #pragma unroll
             for (int r = 0; r < RPI; ++r) {
@@ -442,7 +450,7 @@ __device__ inline void gemv_rows(
         const float* __restrict__ x, float* __restrict__ y,
         const float* __restrict__ residual, GemvEpilogue epi, float scale,
         int N, int K, int xcd, int n_xcds, int worker, int n_workers, bool coh = false,
-        __hip_bfloat16* __restrict__ y16 = nullptr) {
+        __hip_bfloat16* __restrict__ y16 = nullptr, bool nt = true) {
     const RowSlice s = xcd_rows(N, xcd, n_xcds);
     const int first = s.begin + worker;
     if (first >= s.end) return;
@@ -454,15 +462,15 @@ __device__ inline void gemv_rows(
     // kind 1.5-3x slower), so the batch stays at 8 and the overlap does the
     // rest. The tasks own 7–350 rows each; they pay round trips, not bytes.
     if (n4 <= kWaveLanes / 2) {         // K <= 256:  half-wave rows (K-split o_proj)
-        gemv_rows_pipelined_half<8>(w, ld, x, y, residual, epi, scale, K, first, cnt, n_workers, coh, y16);
+        gemv_rows_pipelined_half<8>(w, ld, x, y, residual, epi, scale, K, first, cnt, n_workers, coh, y16, nt);
     } else if (n4 <= kWaveLanes) {      // K <= 512:  8 rows x 1 chunk  (merge W_UV)
-        gemv_rows_pipelined<8, 1>(w, ld, x, y, residual, epi, scale, K, first, cnt, n_workers, coh, y16);
+        gemv_rows_pipelined<8, 1>(w, ld, x, y, residual, epi, scale, K, first, cnt, n_workers, coh, y16, nt);
     } else if (n4 <= 2 * kWaveLanes) {  // K <= 1024: 4 rows x 2 chunks
-        gemv_rows_pipelined<4, 2>(w, ld, x, y, residual, epi, scale, K, first, cnt, n_workers, coh, y16);
+        gemv_rows_pipelined<4, 2>(w, ld, x, y, residual, epi, scale, K, first, cnt, n_workers, coh, y16, nt);
     } else if (n4 <= 4 * kWaveLanes) {  // K = 1408, 2048: 2 rows x 4 chunks
-        gemv_rows_pipelined<2, 4>(w, ld, x, y, residual, epi, scale, K, first, cnt, n_workers, coh, y16);
+        gemv_rows_pipelined<2, 4>(w, ld, x, y, residual, epi, scale, K, first, cnt, n_workers, coh, y16, nt);
     } else {                            // K = 10944: rows do not fit a buffer
-        gemv_rows_impl<2, 4>(w, ld, x, y, residual, epi, scale, K, first, cnt, n_workers, coh, y16);
+        gemv_rows_impl<2, 4>(w, ld, x, y, residual, epi, scale, K, first, cnt, n_workers, coh, y16, nt);
     }
 }
 
@@ -486,7 +494,7 @@ __device__ inline void gemv_gate_up_rows(
         float* __restrict__ h, int inter, int K, int xcd, int n_xcds,
         int worker, int n_workers,
         uint32_t* __restrict__ chunk_counters = nullptr, int chunk_rows = 0,
-        int n_chunks = 0) {
+        int n_chunks = 0, bool nt = true) {
     const RowSlice s = xcd_rows(inter, xcd, n_xcds);
     const int first = s.begin + worker;
     const int cnt = first < s.end ? (s.end - first + n_workers - 1) / n_workers : 0;
@@ -527,7 +535,7 @@ __device__ inline void gemv_gate_up_rows(
     for (int r = 0; r < 2; ++r) {                                               \
         const uint4* r4 = reinterpret_cast<const uint4*>(FLEET_PAIR_ROW(KK, r)); \
         _Pragma("unroll")                                                       \
-        for (int d = 0; d < D; ++d) BUF[r][d] = load_weight(r4 + idx[d]);       \
+        for (int d = 0; d < D; ++d) BUF[r][d] = load_weight(r4 + idx[d], nt);       \
     }
 #define FLEET_REDUCE_PAIR(BUF, KK)                                              \
     {                                                                           \
