@@ -28,11 +28,11 @@ Raw numbers: [`results/`](../results/).
 | Same, one launch per token (v1, for comparison) | 4.07 ms on the device, 4.11 ms wall per token with 32 launches vs 4.09 with one: the launch itself is cheap; the single launch is the design's v2 delivered, not a speed-up |
 | Where the first version of the day stood | 22.05 ms |
 | Protocol only (`--smoke`, 1157 events, no task bodies), one token per launch | 1.06 ms per token |
-| Cross-XCD event, idle / under a 1.46 TB/s stream | 1.44 µs / 6.0 µs |
+| Cross-XCD event, idle / under load (last full run, `results/microbench_summary.txt`) | 1.44 µs / 6.76 µs at 1.64 TB/s of streaming load; across the session's runs 5.9–6.8 µs at 1.5–2.2 TB/s (`microbench.json` is an earlier run: 5.88 µs at 2.20 TB/s) |
 | Payload visibility: 37 producers, drained stores, one last-arriver flush; same-XCD consumer with an L1-only acquire, cross-XCD consumer | 0 stale words in 151 M, each |
 | The kernel's expert GEMVs in isolation (`microbench (f)`) | 3.9 TB/s gate_up, 3.8 TB/s with down; with the per-producer flush protocol 2.8 TB/s, with the last-arriver flush 3.3 TB/s |
 | Streamed read bandwidth, best depth | 4.2 TB/s (79% of peak) |
-| Kernel resources | 253 VGPRs, 0 AGPRs, 0 scratch, 24 KB LDS, 1 wave/SIMD |
+| Kernel resources (`results/kernel_resource_usage.txt`) | 253 VGPRs + 16 AGPRs (VGPR pressure spilling into AGPRs), 274 SGPR spills, 0 scratch, 24 KB LDS, 1 wave/SIMD |
 | KV-cache conversion vs HF's own cache | K_nope, K_rope, V all exactly 0 error, 27 layers |
 
 **From 22 ms to 4.1 ms**, each step attributed by the per-task trace
@@ -167,42 +167,53 @@ happening to be zero; the routing weight is multiplied by
 
 ## Known limitations, open risks
 
-1. **Nothing has run on the target hardware.** Every latency and bandwidth
-   figure is a prediction. design.md §9 marks the synchronisation-overhead row
-   as low confidence; `--smoke` mode measures it directly (every event, no
-   task bodies) before any weights are downloaded.
-2. **The HIP sources have been parsed, not compiled.** The local check runs
-   clang's front end for gfx90a (the newest gfx9 that clang 14 knows), so
-   `#if defined(__gfx942__)` branches, register/LDS pressure, occupancy, and
-   the semantics of the builtins and of `s_getreg_b32 HW_REG_XCC_ID` are
-   still unverified. `setup_env.sh` compiles the microbench first so a failure
-   there is diagnosed as a toolchain problem, and prints
-   `-Rpass-analysis=kernel-resource-usage` for the kernel.
-3. **Attention lane mapping is specialised** to `kv_lora = 512`, `qk_rope = 64`
-   (one 16-byte load per lane per position). The launcher refuses other shapes.
-4. **`transformers` 5.x vs the vendored modeling file.** `modeling_deepseek.py`
-   imports `is_torch_fx_available`, removed in transformers 5. Locally this is
-   stubbed; `setup_env.sh` pins `transformers>=4.39,<5`.
-5. **The tiny-config comparison is structural, not numerical-at-scale.** It
-   cannot catch bf16 accumulation drift at 16 heads / 64 experts / 1024 context;
-   the golden-token comparison on device is what does.
-6. **Prefill is out of scope** per the task; the cache conversion is untested
-   against a real checkpoint until `kv_convert.py --verify` runs there.
+1. **The design target (2.5–3.5 ms) is not reached: 4.08 ms.** The trace
+   shows why, and it is not what the design assumed. Per MoE layer, 126 of
+   the 142 µs are the seven phases' slowest tasks added up (q/kv_a 21,
+   attention 21, merge 7.5, o_proj 8.4, router 9.3, gate_up 36, down 23);
+   events are ~15 µs. The token moves 4.94 GB in 4.08 ms = **1.21 TB/s**
+   against a measured 4.2 TB/s ceiling, so the loss is neither bandwidth nor
+   the protocol: the phases are fully serial and each task carries a fixed
+   cost that its few rows cannot amortise. §12's tile-granular
+   gate_up→down overlap, still unimplemented, is the single largest lever.
+2. **Bytes per token are not the 4.935 GB of §1.** Two redundancies added
+   with the three-event graph: every XCD recomputes all 576 kv_a rows
+   (8 × 2.36 MB/layer = 0.51 GB/token of HBM reads) and every q/kv_a and
+   lm_head worker reads the 8 expert partials itself (296 × 64 KB/layer,
+   mostly MALL/L2 hits, but 0.5 GB/token of traffic plus a redundant
+   RMSNorm per worker). `rocprofv3 --pmc FETCH_SIZE` has not been run yet;
+   until it is, the bandwidth-utilisation figures above use §1's byte count.
+3. **The expert GEMVs run 1.45× slower inside the kernel than the same code
+   in isolation** (36 vs 25 µs, `microbench (f)`), and (f) also shows the
+   handshake explains only a small part. The isolated benchmark *is* the
+   expert code compiled on its own; the difference is the union kernel's
+   register environment (253 VGPRs, 16 AGPRs, 274 SGPR spills). Not yet
+   attributed: sub-phase timestamps and the ISA are the next step.
+4. Attention's lane mapping is specialised to `kv_lora = 512`,
+   `qk_rope = 64`; the launcher refuses other shapes.
+5. `transformers` 5.x vs the vendored modeling file: pinned `<5` on the box;
+   the model's own modeling file also declares `import flash_attn` under a
+   guard that transformers' import check ignores — a stub package is
+   installed (`scripts/hotaisle_bootstrap.sh`), eager attention stays in use.
+6. Prefill is out of scope per the task; the cache conversion is verified
+   against HF's own cache (exact) on the real checkpoint.
 
 ## Next, in order
 
-1. `bash scripts/setup_env.sh` on the MI300X — environment, model, first real
-   `hipcc` compile, task graphs, and the **protocol smoke test** (`--smoke`):
-   cooperative launch at grid 304, XCD role discovery, all 805 events per
-   token, timed. This needs no weights and is the first number worth having.
-2. `bench/microbench.hip` — replaces the §9 synchronisation and bandwidth
-   estimates with measurements and decides the event scheme.
-3. HF reference run → golden tokens and the converted cache.
-4. `fleet_decode --teacher-force` — every step fed HF's token, so a mismatch
-   is isolated to the step it appears in; then free-running decode.
-5. The per-layer comparison runs on every non-smoke decode automatically: on
-   token 0 the kernel copies each layer's output out, and the launcher prints
-   max rel and cosine per layer against HF's first-decode-step states plus
-   the count of consecutive layers inside the §6 gate. **The required
-   milestone is one MoE layer (index ≥ 1) matching HF through the Fleet
-   path** — that count is the evidence, with the token comparison on top.
+1. `rocprofv3 --pmc FETCH_SIZE` on one token: the real byte count, so
+   every bandwidth claim rests on a measurement.
+2. Fold the expert partials once per layer: the last-arriving down worker
+   (the mechanism exists) folds the 8 partials and publishes the 8 KB
+   residual; q/kv_a and lm_head workers read it instead of each reading
+   64 KB and re-doing the sum. Expected 0.2–0.4 ms/token.
+3. §12 tile-granular gate_up→down: down accumulates over K-chunks of h as
+   they land (fixed chunk order, still deterministic) instead of waiting
+   for all 37 gate_up workers. Expected 0.3–0.4 ms/token.
+4. Attribute the in-kernel expert GEMV slowdown: timestamps around the
+   prologue vs the stream, then the ISA of the union kernel vs (f)'s;
+   decide between register pressure fixes and splitting the body out.
+5. Then the structural items: activations in uncached memory (no L2
+   writeback or invalidate anywhere), o_proj folded into merge (two global
+   events per layer), non-temporal weight streams so the KV cache and the
+   small tensors stay in the Infinity Cache, prefetch of routing-independent
+   weights by idle workers during the latency-bound phases.

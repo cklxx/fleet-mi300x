@@ -1,6 +1,6 @@
 # Fleet-style Batch-1 Decode for DeepSeek-Coder-V2-Lite-Base on MI300X — Technical Design
 
-Author: Kailun Chen · Status: v0.9 (pre-GPU; v0.8 is the submitted proposal, kept verbatim in `docs/task/`) · Target: single MI300X (gfx942), BF16, bs=1, 1024-token context, 32 greedy tokens
+Author: Kailun Chen · Status: v0.10 (measured on the MI300X; v0.8 is the submitted proposal, kept verbatim in `docs/task/`) · Target: single MI300X (gfx942), BF16, bs=1, 1024-token context, 32 greedy tokens
 
 ---
 
@@ -91,6 +91,8 @@ flowchart LR
 ```
 
 Task/event budget: **114 tasks (66 before split-KV), 6 global events + 24 XCD-local events per MoE layer** (16 attention→merge counters, 8 gate_up→down counters); 1,791 tasks (3,087 with split-KV) and 165 global events per token for the full model (27 layers, layer 0's dense gate_up→down needs the full h[10944] and is one extra global event, + embed + lm_head 8 Chiplet-tasks with final norm in prologue + argmax). Compare paper: 543 tasks/layer for dense Qwen3-8B.
+
+Implementation note (v0.10, what runs today): the graph above is the v0.9 one. The measured kernel runs a three-global-event variant (`src/host/taskgraph.py`): q/kv_a is head-aligned per XCD with kv_a replicated (attention waits XCD-locally), the router is a Chiplet-task per XCD (experts wait XCD-locally and pick top-k themselves), the merge + W_UV is spread over the head's kv_chunks tasks, and REDUCE is folded into the next layer's q/kv_a prologue. Global events per MoE layer: merge → o_proj, o_proj → router, down → next layer; 85 per token. The costs of that choice (kv_a replication 0.51 GB/token, the partial fold read by every worker) are itemised in STATUS.md.
 
 Implementation note (v0.9): a Chiplet-task is *executed* as one descriptor per worker of the XCD, 37 per XCD, each carrying its worker id; the row split is a pure function of (xcd, worker, wave) and the event it signals has 8 × 37 = 296 producers. Nothing on the device broadcasts a task. The 66/114 figures above count Chiplet-tasks once per XCD; `taskgraph.py --report` prints both that count and the descriptor count (1,218 per MoE layer, 33,183 per token).
 
@@ -204,7 +206,21 @@ Own runtime (~1k lines HIP). The public `ROCm/fleet-chiplet-megakernel` is the M
 
 ---
 
-## 9. Expected performance (falsifiable)
+## 9. Expected performance (falsifiable) — and what was measured
+
+Measured on 2026-09-14/15 (1×MI300X VM, ROCm 7.2; raw files in `results/`, narrative in STATUS.md):
+
+| Quantity | Estimated below | Measured |
+|---|---|---|
+| Achievable streaming bandwidth | 4.0 TB/s | 4.24 TB/s (`microbench (c)`, depth 8) |
+| Cross-XCD event, idle / under load | 2–4 µs (confidence L) | 1.44 µs / 6.76 µs at 1.64 TB/s of load (`microbench (e)`) |
+| Protocol only, per token | ~0.3–0.7 ms | 1.06 ms (`--smoke`, 1157 events) |
+| First correct e2e | 8–15 ms/token | 22.05 ms, then 4.08 ms after the trace-driven passes |
+| Tuned target | 2.5–3.5 ms/token | **4.08 ms (245 tok/s), 32/32 tokens, 27/27 layers** — 1.21 TB/s achieved; the loss is serial phases and per-task fixed cost, not bytes or events (STATUS.md) |
+| Launches/token | 1 → 1/32 | 1 launch per 32 tokens (v2 implemented) |
+
+The original estimates follow, unchanged, so they can be checked against the numbers above.
+
 
 | Quantity | Value | Basis |
 |---|---|---|

@@ -108,7 +108,7 @@ step with its trace attribution in [docs/STATUS.md](docs/STATUS.md).
 | Launches per 32 tokens | 1 (the argmax task feeds the next embed on the device) |
 | Global events per MoE layer / per token | 3 / 85 |
 | Protocol alone (`--smoke`, no task bodies) | 1.06 ms per token |
-| Cross-XCD event, idle / under a 1.46 TB/s stream | 1.44 µs / 6.0 µs |
+| Cross-XCD event, idle / under load (last full run, `results/microbench_summary.txt`) | 1.44 µs / 6.76 µs at 1.64 TB/s of streaming load; across the session's runs 5.9–6.8 µs at 1.5–2.2 TB/s (`microbench.json` is an earlier run: 5.88 µs at 2.20 TB/s) |
 | Payload visibility under the kernel's fence placement (37 producers, one last-arriver flush) | 0 stale words in 151 M, same-XCD and cross-XCD |
 | Streamed read bandwidth / byte floor at it | 4.2 TB/s / 1.17 ms per token |
 
