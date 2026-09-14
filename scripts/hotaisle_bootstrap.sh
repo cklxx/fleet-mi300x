@@ -54,6 +54,13 @@ cp build/compile.log results/kernel_resource_usage.txt
 hipcc --offload-arch=gfx942 -O3 -std=c++17 -DFLEET_NT_WEIGHTS=1 -Isrc \
   src/host/fleet_launch.hip src/kernels/fleet_kernel.hip -o build/fleet_decode_nt 2>&1 | grep -E "error"
 for c in 16 8 4 1; do python3 src/host/taskgraph.py --kv-chunks $c --emit build/taskgraph_d$c.bin | tail -1; done
+python3 src/host/taskgraph.py --kv-chunks 16 --k-chunk 512 --emit build/taskgraph_d16_k512.bin | tail -1
+python3 src/host/taskgraph.py --kv-chunks 16 --prefetch --emit build/taskgraph_d16_prefetch.bin | tail -1
+python3 src/host/taskgraph.py --kv-chunks 16 --kva-replicated --emit build/taskgraph_d16_kvarep.bin | tail -1
+python3 src/host/taskgraph.py --kv-chunks 16 --topk-published --emit build/taskgraph_d16_topkpub.bin | tail -1
+python3 src/host/taskgraph.py --kv-chunks 16 --split-workers 18 --k-chunk 512 --emit build/taskgraph_d16_split18_k512.bin | tail -1
+python3 src/host/taskgraph.py --kv-chunks 16 --split-workers 18 --emit build/taskgraph_d16_split18.bin | tail -1
+python3 src/host/taskgraph.py --kv-chunks 16 --split-workers 22 --k-chunk 512 --emit build/taskgraph_d16_split22_k512.bin | tail -1
 
 log "microbench"
 ./build/microbench --json results/microbench.json 2>&1 | tee results/microbench_summary.txt | grep -E "PASS|FAIL|INFO|median" | head -14
@@ -92,13 +99,6 @@ run_variant() {   # name binary graph extra-args...
   grep -E "^per-token" "results/decode_$name.log" | tail -1 | sed -E 's/per-token latency \(embed -> argmax on device\): //' | tr -d '\n'
   echo "   exit=$rc  $(grep -E '^tokens:' "results/decode_$name.log" | tail -1)  $(grep -E 'consecutive layers' "results/decode_$name.log" | tail -1)"
 }
-python3 src/host/taskgraph.py --kv-chunks 16 --k-chunk 512 --emit build/taskgraph_d16_k512.bin | tail -1
-python3 src/host/taskgraph.py --kv-chunks 16 --prefetch --emit build/taskgraph_d16_prefetch.bin | tail -1
-python3 src/host/taskgraph.py --kv-chunks 16 --kva-replicated --emit build/taskgraph_d16_kvarep.bin | tail -1
-python3 src/host/taskgraph.py --kv-chunks 16 --topk-published --emit build/taskgraph_d16_topkpub.bin | tail -1
-python3 src/host/taskgraph.py --kv-chunks 16 --split-workers 18 --k-chunk 512 --emit build/taskgraph_d16_split18_k512.bin | tail -1
-python3 src/host/taskgraph.py --kv-chunks 16 --split-workers 18 --emit build/taskgraph_d16_split18.bin | tail -1
-python3 src/host/taskgraph.py --kv-chunks 16 --split-workers 22 --k-chunk 512 --emit build/taskgraph_d16_split22_k512.bin | tail -1
 
 run_variant nt_d16_fenced    $BIN                 build/taskgraph_d16.bin
 run_variant nt_d16_coherent  $BIN                 build/taskgraph_d16_kvarep.bin   --coherent-acts

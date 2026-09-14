@@ -80,9 +80,10 @@ def main() -> int:
     a = ap.parse_args()
     rows: list[tuple[str, str, bool]] = []
 
-    def add(name, detail, ok):
-        rows.append((name, detail, ok))
-        print(f"  {'PASS' if ok else 'FAIL'}  {name:<34} {detail}", flush=True)
+    def add(name, detail, ok, status=None):
+        st = status or ("PASS" if ok else "FAIL")
+        rows.append((name, detail, st))
+        print(f"  {st:<4}  {name:<34} {detail}", flush=True)
 
     # 1. the memory model, measured rather than asserted
     if (BUILD / "microbench").exists():
@@ -101,7 +102,7 @@ def main() -> int:
 
     if not NT.exists() or not DEFAULT_GRAPH.exists():
         add("decode binaries", "build/fleet_decode_nt or taskgraph_d16.bin missing", False)
-        print(f"\n{sum(1 for r in rows if r[2])}/{len(rows)} gates passed")
+        print(f"\n{sum(1 for r in rows if r[2] == 'PASS')}/{len(rows)} gates passed")
         return 1
 
     # 2. placement: the design assumes one workgroup per CU on 8 XCDs
@@ -126,7 +127,9 @@ def main() -> int:
     for label, (graph, flags) in variants:
         g = BUILD / graph
         if not g.exists():
-            add(f"decode: {label}", f"{graph} not emitted", True)
+            # never green on a missing input: the bootstrap emits every
+            # variant before this runs, so absence means something failed
+            add(f"decode: {label}", f"{graph} not emitted", False, "SKIP")
             continue
         rc, out = run([NT, "--graph", g, "--tokens", a.tokens, *flags])
         ok, detail = decode_ok(out)
@@ -159,10 +162,12 @@ def main() -> int:
     add("abort path (tiny spin limit)", "reported" if aborted else "no abort reported",
         aborted and rc != 0)
 
-    good = sum(1 for r in rows if r[2])
+    good = sum(1 for r in rows if r[2] == "PASS")
+    bad = [n for n, _, st in rows if st == "FAIL"]
+    skipped = [n for n, _, st in rows if st == "SKIP"]
     print(f"\n{good}/{len(rows)} GPU gates passed"
-          + ("" if good == len(rows) else
-             " — failed: " + ", ".join(n for n, _, ok in rows if not ok)))
+          + (f" — failed: {', '.join(bad)}" if bad else "")
+          + (f" — skipped for missing inputs: {', '.join(skipped)}" if skipped else ""))
     return 0 if good == len(rows) else 1
 
 
