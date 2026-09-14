@@ -331,6 +331,66 @@ __global__ __launch_bounds__(kBlock, 1) void gemv_stream(
   if (acc == 1234.5678f) y[blockIdx.x] = acc + x[0];
 }
 
+// ---------------------------------------------------------------- (f) the expert phase, isolated
+//
+// The kernel's own gemv_gate_up_rows / gemv_rows (src/kernels/gemv.h) over
+// 27 layers of fake experts — 8 units of 17.3 MB per layer, 3.7 GB in all so
+// the 256 MB Infinity Cache cannot hide it — with the exact (xcd, worker)
+// row split the persistent kernel uses. If this reaches the streaming
+// ceiling of (c) the losses inside the kernel are interference; if it caps
+// lower, the bound is this code path's access pattern.
+
+#include "../src/kernels/gemv.h"
+
+constexpr int kHidden = 2048, kInter = 1408, kLayersF = 27, kUnits = 8;
+constexpr size_t kUnitElems = (size_t)3 * kInter * kHidden;   // gate/up interleaved + down
+
+__global__ __launch_bounds__(kBlock, 1) void expert_phase(
+    const __hip_bfloat16* __restrict__ experts, float* __restrict__ h,
+    float* __restrict__ out, int layers, int do_down) {
+  __shared__ float x[kHidden];
+  for (int i = threadIdx.x; i < kHidden; i += kBlock) x[i] = 0.001f * (i % 7);
+  __syncthreads();
+  const int xcd = blockIdx.x % kXCDs;           // which unit this block streams
+  const int worker = blockIdx.x / kXCDs;        // 0..37 (38 per unit here)
+  const int n_workers = kCUsPerXCD;
+  for (int L = 0; L < layers; ++L) {
+    const __hip_bfloat16* unit = experts + ((size_t)L * kUnits + xcd) * kUnitElems;
+    float* hx = h + (size_t)xcd * kInter;
+    fleet::gemv_gate_up_rows(unit, x, hx, kInter, kHidden, 0, 1, worker, n_workers);
+    if (do_down) {
+      __syncthreads();
+      fleet::gemv_rows(unit + (size_t)2 * kInter * kHidden, kInter, hx,
+                       out + (size_t)xcd * kHidden, nullptr, fleet::EPI_BF16, 1.f,
+                       kHidden, kInter, 0, 1, worker, n_workers);
+    }
+  }
+}
+
+static double run_expert_phase(int do_down) {
+  const size_t elems = (size_t)kLayersF * kUnits * kUnitElems;
+  __hip_bfloat16* w; float *h, *out;
+  HIP_CHECK(hipMalloc(&w, elems * sizeof(__hip_bfloat16)));
+  HIP_CHECK(hipMalloc(&h, kUnits * kInter * sizeof(float)));
+  HIP_CHECK(hipMalloc(&out, kUnits * kHidden * sizeof(float)));
+  HIP_CHECK(hipMemset(w, 0x3c, elems * sizeof(__hip_bfloat16)));   // ~1.0 in bf16
+  hipEvent_t a, b;
+  HIP_CHECK(hipEventCreate(&a)); HIP_CHECK(hipEventCreate(&b));
+  hipLaunchKernelGGL(expert_phase, dim3(kGrid), dim3(kBlock), 0, 0, w, h, out, kLayersF, do_down);
+  HIP_CHECK(hipDeviceSynchronize());
+  HIP_CHECK(hipEventRecord(a));
+  hipLaunchKernelGGL(expert_phase, dim3(kGrid), dim3(kBlock), 0, 0, w, h, out, kLayersF, do_down);
+  HIP_CHECK(hipEventRecord(b));
+  HIP_CHECK(hipEventSynchronize(b));
+  float ms = 0; HIP_CHECK(hipEventElapsedTime(&ms, a, b));
+  const double bytes = (double)kLayersF * kUnits * (do_down ? 3.0 : 2.0) * kInter * kHidden * 2;
+  std::printf("    %-22s %7.3f ms for %d layers = %6.1f us/layer, %.2f TB/s\n",
+              do_down ? "gate_up + down" : "gate_up only", ms, kLayersF, ms * 1e3 / kLayersF,
+              bytes / (ms * 1e-3) / 1e12);
+  HIP_CHECK(hipFree(w)); HIP_CHECK(hipFree(h)); HIP_CHECK(hipFree(out));
+  return bytes / (ms * 1e-3) / 1e12;
+}
+
 // ---------------------------------------------------------------- driver
 
 struct Stats {
@@ -564,6 +624,12 @@ int main(int argc, char** argv) {
   const double best = *std::max_element(bw, bw + 6);
   std::printf("    -> best %.2f TB/s = %.0f%% of 5.3 peak "
               "(design assumes 4.0 achievable)\n", best, best / 5.3 * 100);
+
+  std::printf("\n(f) the kernel's expert GEMVs in isolation (gemv.h, 8 x 17.3 MB units/layer, 27 layers)\n");
+  const double f_gu = run_expert_phase(0);
+  const double f_all = run_expert_phase(1);
+  std::printf("    -> %.0f%% of (c)'s streaming ceiling with gate_up alone, %.0f%% with down\n",
+              f_gu / best * 100, f_all / best * 100);
 
   if (json_path) {
     FILE* f = std::fopen(json_path, "w");

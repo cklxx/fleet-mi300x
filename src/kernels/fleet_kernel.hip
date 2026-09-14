@@ -338,7 +338,7 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
 // the cooperative launch removes that failure mode by construction rather than
 // by hoping the occupancy works out.
 
-extern "C" __global__ __launch_bounds__(kBlock, 1)
+extern "C" __global__ __launch_bounds__(kBlock, kBlocksPerCU)
 void fleet_decode_step(RuntimeState rt, ModelDims d, Weights w,
                        Activations act, KVCache kv) {
     __shared__ Scratch s;

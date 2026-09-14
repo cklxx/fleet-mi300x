@@ -31,10 +31,18 @@ namespace fleet {
 
 constexpr int kXCDs = 8;
 constexpr int kCUsPerXCD = 38;
-constexpr int kWorkersPerXCD = kCUsPerXCD - 1;   // one CU is the scheduler
-constexpr int kGrid = kXCDs * kCUsPerXCD;        // 304 workgroups, 1 per CU
-constexpr int kBlock = 256;                      // 4 waves, 1 wave/SIMD
-constexpr int kWaves = kBlock / 64;
+// Workgroups per CU. Two were tried (the kernel fits: 252 VGPRs, 24 KB LDS)
+// on the theory that one wave per SIMD leaves memory requests on the table;
+// measured 6.5 ms vs 5.4 ms per token — every GEMV task ran ~2x slower with
+// half the rows, so per-CU parallelism is not what bounds those phases.
+#ifndef FLEET_BLOCKS_PER_CU
+#define FLEET_BLOCKS_PER_CU 1
+#endif
+constexpr int kBlocksPerCU = FLEET_BLOCKS_PER_CU;
+constexpr int kBlocksPerXCD = kCUsPerXCD * kBlocksPerCU;
+constexpr int kWorkersPerXCD = kBlocksPerXCD - 1;   // one workgroup is the scheduler
+constexpr int kGrid = kXCDs * kBlocksPerXCD;        // 608 workgroups, 2 per CU
+constexpr int kBlock = 256;                         // 4 waves (kWaves lives in gemv.h)
 constexpr int kMaxEvents = 4096;
 
 // Task kinds — must match TaskKind in src/host/taskgraph.py.
@@ -219,7 +227,7 @@ __device__ __forceinline__ int claim_role(const RuntimeState& rt, int xcd,
             if (++spins > rt.spin_limit) { raise_abort(rt, kAbortBarrierTimeout); break; }
         }
         const uint32_t here = poll(&rt.xcd_arrivals[xcd]);
-        if (here != (uint32_t)kCUsPerXCD) {
+        if (here != (uint32_t)kBlocksPerXCD) {
             raise_abort(rt, kAbortXcdDistribution | ((uint32_t)xcd << 8) | (here & 0xff));
         }
     }

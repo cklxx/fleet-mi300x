@@ -35,6 +35,9 @@ namespace fleet {
 #endif
 constexpr int kStreamDepth = FLEET_STREAM_DEPTH;
 constexpr int kWaveLanes = 64;
+#ifndef FLEET_GEMV_WAVES
+constexpr int kWaves = 256 / kWaveLanes;   // waves per workgroup (= fleet_runtime.h's)
+#endif
 
 // bf16 pairs arrive as uint32; unpacking in registers costs no memory traffic.
 __device__ __forceinline__ void unpack_bf16x2(uint32_t p, float& lo, float& hi) {
@@ -96,39 +99,44 @@ __device__ __forceinline__ void wave_dot(const __hip_bfloat16* const* rows,
     // consecutive batches overlap their memory latency instead of paying it
     // serially (measured on the MI300X: with one buffer the expert GEMVs
     // streamed at ~2.4 TB/s against a 4.25 TB/s ceiling).
+    // Written as macros on purpose: passing the buffers to a lambda by array
+    // reference made the compiler put them in scratch memory (measured:
+    // 312 B/lane of scratch and every GEMV kind 1.5-3x slower), which defeats
+    // the whole point. Direct array access in fully unrolled loops stays in
+    // registers.
     uint4 bufA[R][D], bufB[R][D];
-    auto issue = [&](uint4 (&buf)[R][D], int i) {
-#pragma unroll
-        for (int d = 0; d < D; ++d) {
-            if (i + d * kWaveLanes < n4) {
-#pragma unroll
-                for (int r = 0; r < R; ++r) buf[r][d] = r4[r][i + d * kWaveLanes];
-            }
-        }
-    };
-    auto consume = [&](const uint4 (&buf)[R][D], int i) {
-#pragma unroll
-        for (int d = 0; d < D; ++d) {
-            if (i + d * kWaveLanes < n4) {
-                const float* x8 = x + (i + d * kWaveLanes) * 8;
-#pragma unroll
-                for (int r = 0; r < R; ++r) fma8(buf[r][d], x8, acc[r]);
-            }
-        }
-    };
+#define FLEET_ISSUE(BUF, I)                                                     \
+    _Pragma("unroll")                                                           \
+    for (int d = 0; d < D; ++d) {                                               \
+        if ((I) + d * kWaveLanes < n4) {                                        \
+            _Pragma("unroll")                                                   \
+            for (int r = 0; r < R; ++r) BUF[r][d] = r4[r][(I) + d * kWaveLanes]; \
+        }                                                                       \
+    }
+#define FLEET_CONSUME(BUF, I)                                                   \
+    _Pragma("unroll")                                                           \
+    for (int d = 0; d < D; ++d) {                                               \
+        if ((I) + d * kWaveLanes < n4) {                                        \
+            const float* x8 = x + ((I) + d * kWaveLanes) * 8;                   \
+            _Pragma("unroll")                                                   \
+            for (int r = 0; r < R; ++r) fma8(BUF[r][d], x8, acc[r]);            \
+        }                                                                       \
+    }
     const int step = D * kWaveLanes;
     int i = lane;
-    issue(bufA, i);
+    FLEET_ISSUE(bufA, i)
     while (true) {
         const int j = i + step;
-        if (j < n4) issue(bufB, j);
-        consume(bufA, i);
+        if (j < n4) { FLEET_ISSUE(bufB, j) }
+        FLEET_CONSUME(bufA, i)
         if (j >= n4) break;
         i = j + step;
-        if (i < n4) issue(bufA, i);
-        consume(bufB, j);
+        if (i < n4) { FLEET_ISSUE(bufA, i) }
+        FLEET_CONSUME(bufB, j)
         if (i >= n4) break;
     }
+#undef FLEET_ISSUE
+#undef FLEET_CONSUME
 #pragma unroll
     for (int r = 0; r < R; ++r) sums[r] = wave_sum(acc[r]);
 }
@@ -189,10 +197,90 @@ __device__ __forceinline__ RowSlice xcd_rows(int N, int xcd, int n_xcds) {
 //   EPI_RESIDUAL  y = bf16(residual + bf16(sum)) (o_proj, dense down)
 enum GemvEpilogue { EPI_NONE = 0, EPI_BF16 = 1, EPI_RESIDUAL = 2 };
 
-// y[n] = W[n, :] . x  for this (xcd, worker)'s rows of [0, N), with x already
-// wherever the caller wants it read from (LDS for the ≤ 2048-wide operands).
-// Each wave takes RPI of the worker's rows per iteration (a short row means
-// more rows per iteration, so the loads in flight stay at 8 per lane).
+// Software-pipelined row loop: the loads of the *next* group of RPI rows are
+// issued before the current group is reduced, so consecutive groups overlap
+// their memory latency. Preconditions: a row fits one buffer (K/8 <= D*64)
+// — true for every K here except the dense down's 10944, which takes the
+// unpipelined path — and every load is unconditional: out-of-range rows and
+// chunks are clamped to a valid address and their contribution is masked at
+// the FMA. Unconditional loads matter: a load inside an `if` splits the
+// basic block and the waitcnt pass then waits for *everything* before the
+// first use, which is exactly the serialisation this loop exists to remove.
+template <int RPI, int D>
+__device__ __forceinline__ void gemv_rows_pipelined(
+        const __hip_bfloat16* __restrict__ w, int ld,
+        const float* __restrict__ x, float* __restrict__ y,
+        const float* __restrict__ residual, GemvEpilogue epi, float scale,
+        int K, int first, int cnt, int n_workers) {
+    const int wave = threadIdx.x / kWaveLanes;
+    const int lane = threadIdx.x % kWaveLanes;
+    const int n4 = K / 8;
+    const int stride = RPI * kWaves;            // groups are interleaved over waves
+    int k = RPI * wave;
+    if (k >= cnt) return;
+
+    uint4 bufA[RPI][D], bufB[RPI][D];
+    // chunk index per lane per d, clamped into the row; valid[d] masks the FMA
+    int idx[D];
+    bool valid[D];
+#pragma unroll
+    for (int d = 0; d < D; ++d) {
+        valid[d] = lane + d * kWaveLanes < n4;
+        idx[d] = valid[d] ? lane + d * kWaveLanes : 0;
+    }
+#define FLEET_ROW(KK, R) (w + (int64_t)(first + min((KK) + (R), cnt - 1) * n_workers) * ld)
+#define FLEET_ISSUE_GROUP(BUF, KK)                                              \
+    _Pragma("unroll")                                                           \
+    for (int r = 0; r < RPI; ++r) {                                             \
+        const uint4* r4 = reinterpret_cast<const uint4*>(FLEET_ROW(KK, r));     \
+        _Pragma("unroll")                                                       \
+        for (int d = 0; d < D; ++d) BUF[r][d] = r4[idx[d]];                     \
+    }
+#define FLEET_REDUCE_GROUP(BUF, KK)                                             \
+    {                                                                           \
+        float sums[RPI];                                                        \
+        _Pragma("unroll")                                                       \
+        for (int r = 0; r < RPI; ++r) {                                         \
+            float acc = 0.f;                                                    \
+            _Pragma("unroll")                                                   \
+            for (int d = 0; d < D; ++d) {                                       \
+                if (valid[d]) fma8(BUF[r][d], x + idx[d] * 8, acc);             \
+            }                                                                   \
+            sums[r] = wave_sum(acc);                                            \
+        }                                                                       \
+        if (lane == 0) {                                                        \
+            _Pragma("unroll")                                                   \
+            for (int r = 0; r < RPI; ++r) {                                     \
+                if ((KK) + r < cnt) {                                           \
+                    const int n = first + ((KK) + r) * n_workers;               \
+                    const float v = sums[r];                                    \
+                    switch (epi) {                                              \
+                        case EPI_BF16:     y[n] = bf16_round(scale * bf16_round(v)); break; \
+                        case EPI_RESIDUAL: y[n] = bf16_round(residual[n] + bf16_round(v)); break; \
+                        default:           y[n] = v;                            \
+                    }                                                           \
+                }                                                               \
+            }                                                                   \
+        }                                                                       \
+    }
+    FLEET_ISSUE_GROUP(bufA, k)
+    while (true) {
+        const int k2 = k + stride;
+        FLEET_ISSUE_GROUP(bufB, k2)          // unconditional; clamped past the end
+        FLEET_REDUCE_GROUP(bufA, k)
+        if (k2 >= cnt) break;
+        const int k3 = k2 + stride;
+        FLEET_ISSUE_GROUP(bufA, k3)
+        FLEET_REDUCE_GROUP(bufB, k2)
+        if (k3 >= cnt) break;
+        k = k3;
+    }
+#undef FLEET_ROW
+#undef FLEET_ISSUE_GROUP
+#undef FLEET_REDUCE_GROUP
+}
+
+// Unpipelined fallback for rows longer than one buffer (dense down, K = 10944).
 template <int RPI, int D>
 __device__ __forceinline__ void gemv_rows_impl(
         const __hip_bfloat16* __restrict__ w, int ld,
@@ -237,16 +325,19 @@ __device__ inline void gemv_rows(
     if (first >= s.end) return;
     const int cnt = (s.end - first + n_workers - 1) / n_workers;   // rows owned
     const int n4 = K / 8;   // 16-byte chunks per row; 64 lanes take 64 at a time
-    // 16 loads in flight per lane (64 KB per workgroup) for every shape: the
-    // tasks own 7–350 rows each, so what they pay is round trips, not bytes.
+    // 8 chunks per lane per buffer, two buffers (wave_dot): 8 loads issued
+    // while the previous 8 are consumed. 16 per buffer put the kernel at the
+    // 256-VGPR cap and the buffers into scratch memory (measured: every GEMV
+    // kind 1.5-3x slower), so the batch stays at 8 and the overlap does the
+    // rest. The tasks own 7–350 rows each; they pay round trips, not bytes.
     if (n4 <= kWaveLanes) {             // K <= 512:  8 rows x 1 chunk  (merge W_UV)
-        gemv_rows_impl<8, 1>(w, ld, x, y, residual, epi, scale, K, first, cnt, n_workers);
-    } else if (n4 <= 2 * kWaveLanes) {  // K <= 1024: 8 rows x 2 chunks
-        gemv_rows_impl<8, 2>(w, ld, x, y, residual, epi, scale, K, first, cnt, n_workers);
-    } else if (n4 <= 4 * kWaveLanes) {  // K <= 2048: 4 rows x 4 chunks (q/kv_a, o_proj,
-        gemv_rows_impl<4, 4>(w, ld, x, y, residual, epi, scale, K, first, cnt, n_workers);  // down, lm_head)
-    } else {                            // longer rows: 2 rows x kStreamDepth
-        gemv_rows_impl<2, kStreamDepth>(w, ld, x, y, residual, epi, scale, K, first, cnt, n_workers);
+        gemv_rows_pipelined<8, 1>(w, ld, x, y, residual, epi, scale, K, first, cnt, n_workers);
+    } else if (n4 <= 2 * kWaveLanes) {  // K <= 1024: 4 rows x 2 chunks
+        gemv_rows_pipelined<4, 2>(w, ld, x, y, residual, epi, scale, K, first, cnt, n_workers);
+    } else if (n4 <= 4 * kWaveLanes) {  // K = 1408, 2048: 2 rows x 4 chunks
+        gemv_rows_pipelined<2, 4>(w, ld, x, y, residual, epi, scale, K, first, cnt, n_workers);
+    } else {                            // K = 10944: rows do not fit a buffer
+        gemv_rows_impl<2, 4>(w, ld, x, y, residual, epi, scale, K, first, cnt, n_workers);
     }
 }
 
@@ -267,23 +358,56 @@ __device__ inline void gemv_gate_up_rows(
     const int wave = threadIdx.x / kWaveLanes;
     const int lane = threadIdx.x % kWaveLanes;
 
-    // Two (gate, up) pairs per wave iteration: 4 rows x 4 chunks = 16 loads
-    // in flight per lane, the same depth as gemv_rows.
-    for (int k = 2 * wave; k < cnt; k += 2 * kWaves) {
-        const int n0 = first + k * n_workers;
-        const bool two = (k + 1) < cnt;
-        const int n1 = two ? n0 + n_workers : n0;
-        const __hip_bfloat16* rows[4] = {gate_up + (int64_t)(2 * n0) * K,
-                                         gate_up + (int64_t)(2 * n0 + 1) * K,
-                                         gate_up + (int64_t)(2 * n1) * K,
-                                         gate_up + (int64_t)(2 * n1 + 1) * K};
-        float sums[4];
-        wave_dot<4, 4>(rows, x, K, sums);
-        if (lane == 0) {
-            h[n0] = bf16_round(bf16_round(silu(bf16_round(sums[0]))) * bf16_round(sums[1]));
-            if (two) h[n1] = bf16_round(bf16_round(silu(bf16_round(sums[2]))) * bf16_round(sums[3]));
-        }
+    // One (gate, up) pair per wave iteration, software-pipelined across
+    // pairs exactly like gemv_rows_pipelined (unconditional, clamped loads).
+    const int n4 = K / 8;   // 256 for hidden = 2048: one buffer of 4 chunks
+    constexpr int D = 4;
+    int idx[D];
+    bool valid[D];
+#pragma unroll
+    for (int d = 0; d < D; ++d) {
+        valid[d] = lane + d * kWaveLanes < n4;
+        idx[d] = valid[d] ? lane + d * kWaveLanes : 0;
     }
+    int k = wave;
+    if (k >= cnt) return;
+    uint4 bufA[2][D], bufB[2][D];
+#define FLEET_PAIR_ROW(KK, R) (gate_up + (int64_t)(2 * (first + min(KK, cnt - 1) * n_workers) + (R)) * K)
+#define FLEET_ISSUE_PAIR(BUF, KK)                                               \
+    _Pragma("unroll")                                                           \
+    for (int r = 0; r < 2; ++r) {                                               \
+        const uint4* r4 = reinterpret_cast<const uint4*>(FLEET_PAIR_ROW(KK, r)); \
+        _Pragma("unroll")                                                       \
+        for (int d = 0; d < D; ++d) BUF[r][d] = r4[idx[d]];                     \
+    }
+#define FLEET_REDUCE_PAIR(BUF, KK)                                              \
+    {                                                                           \
+        float g = 0.f, u = 0.f;                                                 \
+        _Pragma("unroll")                                                       \
+        for (int d = 0; d < D; ++d) {                                           \
+            if (valid[d]) { fma8(BUF[0][d], x + idx[d] * 8, g); fma8(BUF[1][d], x + idx[d] * 8, u); } \
+        }                                                                       \
+        g = wave_sum(g); u = wave_sum(u);                                       \
+        if (lane == 0 && (KK) < cnt) {                                          \
+            h[first + (KK) * n_workers] =                                       \
+                bf16_round(bf16_round(silu(bf16_round(g))) * bf16_round(u));    \
+        }                                                                       \
+    }
+    FLEET_ISSUE_PAIR(bufA, k)
+    while (true) {
+        const int k2 = k + kWaves;
+        FLEET_ISSUE_PAIR(bufB, k2)
+        FLEET_REDUCE_PAIR(bufA, k)
+        if (k2 >= cnt) break;
+        const int k3 = k2 + kWaves;
+        FLEET_ISSUE_PAIR(bufA, k3)
+        FLEET_REDUCE_PAIR(bufB, k2)
+        if (k3 >= cnt) break;
+        k = k3;
+    }
+#undef FLEET_PAIR_ROW
+#undef FLEET_ISSUE_PAIR
+#undef FLEET_REDUCE_PAIR
 }
 
 }  // namespace fleet

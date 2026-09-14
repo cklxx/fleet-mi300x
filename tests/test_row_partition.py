@@ -13,8 +13,12 @@ up as a compile error or a hang.
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
-XCDS, WORKERS, WAVES = 8, 37, 4
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src" / "host"))
+from taskgraph import WORKERS_PER_XCD, XCDS  # noqa: E402
+
+WORKERS, WAVES = WORKERS_PER_XCD, 4
 
 
 def rows_of(N: int, n_xcds: int, n_workers: int, xcd: int, worker: int,

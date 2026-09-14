@@ -40,8 +40,10 @@ from enum import IntEnum, IntFlag
 from pathlib import Path
 
 XCDS = 8              # MI300X chiplets
-CUS_PER_XCD = 38      # 1 scheduler + 37 workers
-WORKERS_PER_XCD = CUS_PER_XCD - 1
+CUS_PER_XCD = 38
+BLOCKS_PER_CU = 1     # must match FLEET_BLOCKS_PER_CU in fleet_runtime.h
+BLOCKS_PER_XCD = CUS_PER_XCD * BLOCKS_PER_CU
+WORKERS_PER_XCD = BLOCKS_PER_XCD - 1   # 1 scheduler + 75 workers
 DESCRIPTOR_BYTES = 64
 # Must match struct TaskDescriptor in src/runtime/fleet_runtime.h field for
 # field; tests/test_descriptor_layout.py checks that it does.

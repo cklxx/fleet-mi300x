@@ -284,7 +284,7 @@ static void describe_abort(uint32_t code, const std::map<int, std::string>& labe
         std::fprintf(stderr, "abort: XCD %u received %u workgroups, expected %d — "
                      "the round-robin placement assumption in design.md §4 does "
                      "not hold on this device/partition mode\n",
-                     (code >> 8) & 0xff, code & 0xff, kCUsPerXCD);
+                     (code >> 8) & 0xff, code & 0xff, kBlocksPerXCD);
     } else if (kind == kAbortWaitTimeout) {
         const int ev = (int)(code & 0xffff);
         auto it = labels.find(ev);
@@ -615,7 +615,10 @@ int main(int argc, char** argv) {
     HIP_CHECK(fleet_occupancy(&blocks_per_cu));
     std::printf("occupancy: %d workgroup(s)/CU at %d threads (need >= 1 for grid %d)\n",
                 blocks_per_cu, kBlock, kGrid);
-    if (blocks_per_cu < 1) die("the kernel does not fit one workgroup per CU (-Rpass-analysis=kernel-resource-usage)");
+    if (blocks_per_cu < kBlocksPerCU) {
+        die("the kernel does not fit " + std::to_string(kBlocksPerCU) +
+            " workgroup(s) per CU (-Rpass-analysis=kernel-resource-usage)");
+    }
 
     hipStream_t stream;
     HIP_CHECK(hipStreamCreate(&stream));
@@ -629,9 +632,9 @@ int main(int argc, char** argv) {
         bool ok = true;
         for (int x = 0; x < 16; ++x) {
             if (hist[x] || x < kXCDs) std::printf(" [%d]=%u", x, hist[x]);
-            if (x < kXCDs ? hist[x] != (uint32_t)kCUsPerXCD : hist[x] != 0) ok = false;
+            if (x < kXCDs ? hist[x] != (uint32_t)kBlocksPerXCD : hist[x] != 0) ok = false;
         }
-        std::printf("%s\n", ok ? "  (8 x 38, as assumed)" : "");
+        std::printf("%s\n", ok ? "  (8 XCDs x 38 CUs x blocks/CU, as assumed)" : "");
         if (!ok) die("workgroups are not placed 38 per XCD on this device/partition mode");
         HIP_CHECK(hipFree(d_hist));
     }

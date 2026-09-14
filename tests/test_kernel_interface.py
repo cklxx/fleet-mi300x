@@ -119,7 +119,7 @@ def main() -> int:
     #    makes the scheduler/worker wait safe (design.md §4). The call must be
     #    real code, not a comment.
     results.append(check("grid constants consistent",
-                         "kGrid = kXCDs * kCUsPerXCD" in r and "kXCDs = 8" in r))
+                         "kGrid = kXCDs * kBlocksPerXCD" in r and "kXCDs = 8" in r))
     results.append(check("cooperative launch is real code",
                          "hipLaunchCooperativeKernel(" in kc))
 

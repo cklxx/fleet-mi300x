@@ -187,12 +187,9 @@ __device__ inline void attention_chunk(
     const uint4* cache4 = reinterpret_cast<const uint4*>(cache);
     const int row4 = row_elems / 8;   // 72 uint4 per position
 
-    // One position's contribution to this wave's running (m, l, acc).
-    auto update = [&](const float* c, const float* kp) {
-        float part = 0.f;
-#pragma unroll
-        for (int j = 0; j < 8; ++j) part += qc[j] * c[j] + qp[j] * kp[j];
-        const float s = wave_sum(part) * scale;
+    // One position's contribution to this wave's running (m, l, acc), given
+    // its already-reduced score s.
+    auto update = [&](const float* c, float s) {
         const float m_new = fmaxf(m, s);
         const float rescale = __expf(m - m_new);   // exp(-inf) = 0 on the first step
         const float p = __expf(s - m_new);
@@ -202,10 +199,13 @@ __device__ inline void attention_chunk(
         for (int j = 0; j < 8; ++j) acc[j] = acc[j] * rescale + p * c[j];
     };
 
-    // Cached positions in batches of kAttnBatch per wave: all loads of the
-    // batch are issued before any is consumed, so the loop pays one memory
-    // round trip per batch rather than per position (measured: the
-    // one-position loop cost ~1 us per position, 296 us per task).
+    // Cached positions in batches of kAttnBatch per wave. All loads of the
+    // batch are issued first (unconditional: positions past the end are
+    // clamped to the last valid row and masked afterwards, so the waitcnt
+    // pass never has to wait for everything), then the 8 scores are reduced
+    // *together* — 8 independent shuffle trees instead of 8 dependent ones,
+    // which was the serial cost per position — and only then the online
+    // softmax runs over the 8 results.
     constexpr int kAttnBatch = 8;
     const int t_cached = min(t_end, t_new);        // rows that live in the cache
     for (int base = t_begin + wave * kAttnBatch; base < t_cached;
@@ -213,26 +213,32 @@ __device__ inline void attention_chunk(
         uint4 vc[kAttnBatch], vr[kAttnBatch];
 #pragma unroll
         for (int k = 0; k < kAttnBatch; ++k) {
-            const int t = base + k;
-            if (t < t_cached) {                     // wave-uniform
-                vc[k] = cache4[(int64_t)t * row4 + lane];
-                if (rope_lane) vr[k] = cache4[(int64_t)t * row4 + kMaxKvLora / 8 + lane];
-            }
+            const int t = min(base + k, t_cached - 1);
+            vc[k] = cache4[(int64_t)t * row4 + lane];
+            vr[k] = cache4[(int64_t)t * row4 + kMaxKvLora / 8 + (lane & 7)];
+        }
+        float c[kAttnBatch][8];
+        float s[kAttnBatch];
+#pragma unroll
+        for (int k = 0; k < kAttnBatch; ++k) {
+            unpack_bf16x2(vc[k].x, c[k][0], c[k][1]); unpack_bf16x2(vc[k].y, c[k][2], c[k][3]);
+            unpack_bf16x2(vc[k].z, c[k][4], c[k][5]); unpack_bf16x2(vc[k].w, c[k][6], c[k][7]);
+            float kp[8];
+            unpack_bf16x2(vr[k].x, kp[0], kp[1]); unpack_bf16x2(vr[k].y, kp[2], kp[3]);
+            unpack_bf16x2(vr[k].z, kp[4], kp[5]); unpack_bf16x2(vr[k].w, kp[6], kp[7]);
+            float part = 0.f;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) part += qc[j] * c[k][j] + qp[j] * kp[j];   // qp = 0 off rope lanes
+            s[k] = part;
+        }
+#pragma unroll
+        for (int off = kWaveLanes / 2; off; off >>= 1) {   // 8 trees, interleaved
+#pragma unroll
+            for (int k = 0; k < kAttnBatch; ++k) s[k] += __shfl_xor(s[k], off, kWaveLanes);
         }
 #pragma unroll
         for (int k = 0; k < kAttnBatch; ++k) {
-            if (base + k >= t_cached) break;        // wave-uniform
-            float c[8], kp[8];
-            unpack_bf16x2(vc[k].x, c[0], c[1]); unpack_bf16x2(vc[k].y, c[2], c[3]);
-            unpack_bf16x2(vc[k].z, c[4], c[5]); unpack_bf16x2(vc[k].w, c[6], c[7]);
-            if (rope_lane) {
-                unpack_bf16x2(vr[k].x, kp[0], kp[1]); unpack_bf16x2(vr[k].y, kp[2], kp[3]);
-                unpack_bf16x2(vr[k].z, kp[4], kp[5]); unpack_bf16x2(vr[k].w, kp[6], kp[7]);
-            } else {
-#pragma unroll
-                for (int j = 0; j < 8; ++j) kp[j] = 0.f;
-            }
-            update(c, kp);
+            if (base + k < t_cached) update(c[k], s[k] * scale);   // wave-uniform
         }
     }
 
@@ -245,7 +251,10 @@ __device__ inline void attention_chunk(
             c[j] = row_new[8 * lane + j];
             kp[j] = rope_lane ? row_new[kMaxKvLora + 8 * lane + j] : 0.f;
         }
-        update(c, kp);
+        float part = 0.f;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) part += qc[j] * c[j] + qp[j] * kp[j];
+        update(c, wave_sum(part) * scale);
     }
 
     // Publish the wave partials, then merge them in wave order.
