@@ -86,7 +86,7 @@ struct TaskDescriptor {
     int16_t  signal_scope;    // EventScope of signal_event
     int16_t  n_split;         // task-kind specific: kv_chunks for attention/merge
     int16_t  head;            // attention / merge, else -1
-    int16_t  kv_chunk;        // split-KV index, else -1
+    int16_t  kv_chunk;        // split-KV index; experts: number of K chunks
     int16_t  expert_slot;     // >=0 routed slot k, <0 shared half, else -1
     int16_t  wait_scope;      // EventScope of wait_event
     int16_t  wait_count;      // producers of wait_event (per epoch)
@@ -105,6 +105,12 @@ enum TaskFlags : int16_t {
     FLAG_FOLD_ON_LAST = 4,    // the globally last of n_split producers of
                               // signal_event folds the expert partials into x,
                               // publishes, and adds the event's final +1
+    FLAG_CHUNK_SIGNAL = 8,    // gate_up: each wave bumps XCD-local counter
+                              // local_event + c when its rows of K-chunk c are
+                              // stored; kv_chunk = number of chunks
+    FLAG_CHUNK_WAIT = 16,     // down: waits local_event + c (c >= 1) in the
+                              // body before consuming chunk c; chunk 0 is the
+                              // descriptor's wait_event
 };
 
 // Device-side state, allocated once by the host.

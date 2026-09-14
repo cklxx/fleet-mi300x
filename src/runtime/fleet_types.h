@@ -17,6 +17,7 @@ namespace fleet {
 // launcher refuses to run a model whose dims exceed them (fleet_launch.hip),
 // so the kernel never has to check.
 constexpr int kMaxHidden = 2048;   // x / x_norm / o staged in LDS
+constexpr int kExpertKChunk = 512; // rows of h per gate_up→down tile (taskgraph EXPERT_K_CHUNK)
 constexpr int kMaxKvLora = 512;    // q_c, cache row, merge scratch
 constexpr int kMaxQkRope = 64;     // q_pe, k_pe
 constexpr int kMaxMoeInter = 1408; // expert h staged in LDS for down

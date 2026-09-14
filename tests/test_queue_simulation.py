@@ -26,7 +26,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src" / "host"))
 
-from taskgraph import (PACK_FIELDS, PACK_FORMAT, WORKERS_PER_XCD, XCDS,  # noqa: E402
+from taskgraph import (PACK_FIELDS, PACK_FORMAT, WAVES, WORKERS_PER_XCD, XCDS,  # noqa: E402
                        Flags, Scope, TaskKind, build, load_cfg)
 
 CONFIG = ROOT / "reference" / "dsv2lite_config.json"
@@ -56,7 +56,8 @@ def simulate(tasks: list[dict], epochs: int, order: str, seed: int = 0,
         queues.setdefault((t["xcd"], t["worker"]), []).append(t)
     workers = sorted(queues)
     rng = random.Random(seed)
-    n_events = 1 + max(max(t["signal_event"], t["local_event"]) for t in tasks)
+    n_events = 1 + max(max(t["signal_event"], t["local_event"] + max(t["kv_chunk"], 0))
+                       for t in tasks)
     done_event = tasks[-1]["signal_event"]
     glob = [0] * n_events
     local = [[0] * n_events for _ in range(XCDS)]
@@ -97,6 +98,15 @@ def simulate(tasks: list[dict], epochs: int, order: str, seed: int = 0,
                                else mirror[t["xcd"]])
                         if arr[t["wait_event"]] < target:
                             break
+                        # CHUNK_WAIT: the body also waits chunks 1.. (same
+                        # scope and count); modelled as all-before-start
+                        if t["flags"] & Flags.CHUNK_WAIT and any(
+                                arr[t["local_event"] + c] < target
+                                for c in range(1, t["kv_chunk"])):
+                            break
+                    if t["flags"] & Flags.CHUNK_SIGNAL:
+                        for c in range(t["kv_chunk"]):     # every wave, in-body
+                            local[t["xcd"]][t["local_event"] + c] += WAVES
                     do_signal = True
                     if t["flags"] & Flags.SIGNAL_LAST:
                         local[t["xcd"]][t["local_event"]] += 1

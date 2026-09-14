@@ -14,7 +14,8 @@
 //
 //   * gate_up -> down is XCD-local (§3): h[1408] is written by the XCD's 37
 //     gate_up workers and read by its 37 down workers after one XCD-local
-//     event, never crossing a chiplet. §12 refines this to tile granularity.
+//     event per K-chunk of h, never crossing a chiplet (§12 tile granularity:
+//     the down of chunk c overlaps the gate_up of chunk c+1).
 #pragma once
 
 #include <hip/hip_runtime.h>
@@ -71,22 +72,44 @@ __device__ inline ExpertUnit resolve_unit(
 
 // h[n] = SiLU(gate_n . x) * (up_n . x) over this worker's share of the unit's
 // rows; x is the post-attention normed vector, staged in LDS by the caller.
+// chunk_counters (or nullptr): the XCD-local event counters of the unit's
+// n_chunks K-chunks of chunk_rows rows, signalled per wave as the rows of
+// each chunk land (gemv_gate_up_rows).
 __device__ inline void expert_gate_up(
         const ExpertUnit& u, const float* __restrict__ x_lds,
-        float* __restrict__ h, int hidden, int worker, int n_workers) {
+        float* __restrict__ h, int hidden, int worker, int n_workers,
+        uint32_t* __restrict__ chunk_counters = nullptr, int chunk_rows = 0,
+        int n_chunks = 0) {
     gemv_gate_up_rows(u.gate_up, x_lds, h, u.inter, hidden,
-                      /*xcd=*/0, /*n_xcds=*/1, worker, n_workers);
+                      /*xcd=*/0, /*n_xcds=*/1, worker, n_workers,
+                      chunk_counters, chunk_rows, n_chunks);
 }
 
 // out[n] = bf16(weight * bf16(down_n . h)): this XCD's partial of the layer
 // output, with HF's roundings (down_proj yields bf16, then `mul_(weight)` in
-// bf16). The reduce task later sums the 8 partials in a fixed order — no
-// float atomics, so the result is bitwise reproducible (§4).
+// bf16). The layer's last down worker sums the 8 partials in a fixed order —
+// no float atomics, so the result is bitwise reproducible (§4).
+//
+// K-chunked: one call per chunk [col0, col0 + kc) of h, in order, with the
+// chunk staged in h_lds and fp32 partial sums kept in acc_lds[hidden] between
+// calls; the last call applies the bf16 epilogue into out. The chunk
+// boundaries are multiples of 8 (16-byte weight loads).
+__device__ inline void expert_down_chunk(
+        const ExpertUnit& u, const float* __restrict__ h_lds,
+        float* __restrict__ acc_lds, float* __restrict__ out, int hidden,
+        int worker, int n_workers, int col0, int kc, bool first, bool last) {
+    const GemvEpilogue epi = first ? (last ? EPI_BF16 : EPI_NONE)
+                                   : (last ? EPI_BF16_ACC : EPI_ACC);
+    gemv_rows(u.down + col0, u.down_ld, h_lds, last ? out : acc_lds,
+              (last && !first) ? acc_lds : nullptr,   // residual = the accumulator
+              epi, u.weight, hidden, kc, /*xcd=*/0, /*n_xcds=*/1, worker, n_workers);
+}
+
 __device__ inline void expert_down(
         const ExpertUnit& u, const float* __restrict__ h_lds,
         float* __restrict__ out, int hidden, int worker, int n_workers) {
-    gemv_rows(u.down, u.down_ld, h_lds, out, nullptr, EPI_BF16, u.weight,
-              hidden, u.inter, /*xcd=*/0, /*n_xcds=*/1, worker, n_workers);
+    expert_down_chunk(u, h_lds, nullptr, out, hidden, worker, n_workers,
+                      0, u.inter, true, true);
 }
 
 // Layer 0's dense MLP reuses the same machinery, but h is 10944 wide and does

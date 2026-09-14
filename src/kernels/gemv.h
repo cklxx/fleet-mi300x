@@ -195,7 +195,10 @@ __device__ __forceinline__ RowSlice xcd_rows(int N, int xcd, int n_xcds) {
 //   EPI_NONE      y = sum                       (router: HF's gate runs in fp32)
 //   EPI_BF16      y = bf16(scale * sum)         (every other linear output)
 //   EPI_RESIDUAL  y = bf16(residual + bf16(sum)) (o_proj, dense down)
-enum GemvEpilogue { EPI_NONE = 0, EPI_BF16 = 1, EPI_RESIDUAL = 2 };
+// K-chunked GEMVs (expert down) keep fp32 partial sums across chunks:
+//   EPI_ACC       y += sum                      (middle chunks; y is the accumulator)
+//   EPI_BF16_ACC  y = bf16(scale * bf16(residual + sum))  (last chunk; residual = accumulator)
+enum GemvEpilogue { EPI_NONE = 0, EPI_BF16 = 1, EPI_RESIDUAL = 2, EPI_ACC = 3, EPI_BF16_ACC = 4 };
 
 // Software-pipelined row loop: the loads of the *next* group of RPI rows are
 // issued before the current group is reduced, so consecutive groups overlap
@@ -257,6 +260,8 @@ __device__ __forceinline__ void gemv_rows_pipelined(
                     switch (epi) {                                              \
                         case EPI_BF16:     y[n] = bf16_round(scale * bf16_round(v)); break; \
                         case EPI_RESIDUAL: y[n] = bf16_round(residual[n] + bf16_round(v)); break; \
+                        case EPI_ACC:      y[n] += v; break;                    \
+                        case EPI_BF16_ACC: y[n] = bf16_round(scale * bf16_round(residual[n] + v)); break; \
                         default:           y[n] = v;                            \
                     }                                                           \
                 }                                                               \
@@ -307,6 +312,8 @@ __device__ __forceinline__ void gemv_rows_impl(
                     switch (epi) {
                         case EPI_BF16:     y[n] = bf16_round(scale * bf16_round(v)); break;
                         case EPI_RESIDUAL: y[n] = bf16_round(residual[n] + bf16_round(v)); break;
+                        case EPI_ACC:      y[n] += v; break;
+                        case EPI_BF16_ACC: y[n] = bf16_round(scale * bf16_round(residual[n] + v)); break;
                         default:           y[n] = v;
                     }
                 }
@@ -347,16 +354,40 @@ __device__ inline void gemv_rows(
 // gate/up rows are interleaved offline (§12): row 2n is gate_n, row 2n+1 is
 // up_n, so the pair is exactly what one wave streams together and the product
 // is formed in registers with no shuffle or LDS round trip.
+// Tile granularity (§12): with chunk_counters != nullptr, h is treated as
+// n_chunks K-chunks of chunk_rows rows and every wave adds 1 to
+// chunk_counters[c] (an XCD-local event counter) once its rows of chunk c
+// are stored — after the wave's next row is past the chunk's end, or at the
+// end of the task for whatever remains — so a chunk's consumer starts while
+// the later chunks are still streaming. The wave drains its own stores first
+// (gfx9 tracks loads and stores in issue order, so this also waits for the
+// group of loads just issued: two such stalls per wave per task). Every wave
+// signals every chunk exactly once, rows or no rows.
 __device__ inline void gemv_gate_up_rows(
         const __hip_bfloat16* __restrict__ gate_up, const float* __restrict__ x,
         float* __restrict__ h, int inter, int K, int xcd, int n_xcds,
-        int worker, int n_workers) {
+        int worker, int n_workers,
+        uint32_t* __restrict__ chunk_counters = nullptr, int chunk_rows = 0,
+        int n_chunks = 0) {
     const RowSlice s = xcd_rows(inter, xcd, n_xcds);
     const int first = s.begin + worker;
-    if (first >= s.end) return;
-    const int cnt = (s.end - first + n_workers - 1) / n_workers;
+    const int cnt = first < s.end ? (s.end - first + n_workers - 1) / n_workers : 0;
     const int wave = threadIdx.x / kWaveLanes;
     const int lane = threadIdx.x % kWaveLanes;
+    int next_chunk = 0;
+#define FLEET_CHUNKS_DONE(NEXT_J)                                                \
+    if (chunk_counters != nullptr) {                                            \
+        const int next_row = (NEXT_J) < cnt ? first + (NEXT_J) * n_workers : inter; \
+        while (next_chunk < n_chunks &&                                         \
+               next_row >= min(inter, (next_chunk + 1) * chunk_rows)) {         \
+            if (lane == 0) {                                                    \
+                __builtin_amdgcn_s_waitcnt(0);                                  \
+                __hip_atomic_fetch_add(chunk_counters + next_chunk, 1u,         \
+                                       __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT); \
+            }                                                                   \
+            ++next_chunk;                                                       \
+        }                                                                       \
+    }
 
     // One (gate, up) pair per wave iteration, software-pipelined across
     // pairs exactly like gemv_rows_pipelined (unconditional, clamped loads).
@@ -370,8 +401,8 @@ __device__ inline void gemv_gate_up_rows(
         idx[d] = valid[d] ? lane + d * kWaveLanes : 0;
     }
     int k = wave;
-    if (k >= cnt) return;
-    uint4 bufA[2][D], bufB[2][D];
+    if (k < cnt) {
+        uint4 bufA[2][D], bufB[2][D];
 #define FLEET_PAIR_ROW(KK, R) (gate_up + (int64_t)(2 * (first + min(KK, cnt - 1) * n_workers) + (R)) * K)
 #define FLEET_ISSUE_PAIR(BUF, KK)                                               \
     _Pragma("unroll")                                                           \
@@ -393,21 +424,26 @@ __device__ inline void gemv_gate_up_rows(
                 bf16_round(bf16_round(silu(bf16_round(g))) * bf16_round(u));    \
         }                                                                       \
     }
-    FLEET_ISSUE_PAIR(bufA, k)
-    while (true) {
-        const int k2 = k + kWaves;
-        FLEET_ISSUE_PAIR(bufB, k2)
-        FLEET_REDUCE_PAIR(bufA, k)
-        if (k2 >= cnt) break;
-        const int k3 = k2 + kWaves;
-        FLEET_ISSUE_PAIR(bufA, k3)
-        FLEET_REDUCE_PAIR(bufB, k2)
-        if (k3 >= cnt) break;
-        k = k3;
-    }
+        FLEET_ISSUE_PAIR(bufA, k)
+        while (true) {
+            const int k2 = k + kWaves;
+            FLEET_ISSUE_PAIR(bufB, k2)
+            FLEET_REDUCE_PAIR(bufA, k)
+            FLEET_CHUNKS_DONE(k2)
+            if (k2 >= cnt) break;
+            const int k3 = k2 + kWaves;
+            FLEET_ISSUE_PAIR(bufA, k3)
+            FLEET_REDUCE_PAIR(bufB, k2)
+            FLEET_CHUNKS_DONE(k3)
+            if (k3 >= cnt) break;
+            k = k3;
+        }
 #undef FLEET_PAIR_ROW
 #undef FLEET_ISSUE_PAIR
 #undef FLEET_REDUCE_PAIR
+    }
+    FLEET_CHUNKS_DONE(cnt)      // whatever is left, including waves with no rows
+#undef FLEET_CHUNKS_DONE
 }
 
 }  // namespace fleet

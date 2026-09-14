@@ -26,13 +26,17 @@ namespace fleet {
 
 // Per-workgroup LDS. Every task body that needs scratch gets it here, never
 // from a global buffer another workgroup might be using at the same time.
+// The expert down reuses s.part as its fp32 accumulator over K-chunks.
+static_assert(kWaves * kPartialStride >= kMaxHidden, "s.part must hold hidden floats");
+
 struct Scratch {
     float smem[kBlock];                          // block reductions
     float vec[kMaxHidden];                       // staged GEMV operand / folded x
     float row[kMaxKvLora + kMaxQkRope];          // this token's cache row
     float q_c[kMaxKvLora];                       // q_c, then the merge's o_c
     float q_pe[kMaxQkRope];
-    float part[kWaves * kPartialStride];         // per-wave attention partials
+    float part[kWaves * kPartialStride];         // per-wave attention partials;
+                                                 // expert down: fp32 accumulator
     float logits[kMaxRouted];
     int   ids[kMaxTopK];                         // this XCD's routing choice
     float ws[kMaxTopK];
@@ -96,9 +100,10 @@ __device__ inline void stage_x(const ModelDims& d, const Activations& act, int l
     }
 }
 
-// The retired REDUCE task, done once per layer by the globally last down
-// worker while every other worker waits on the down event: x = bf16(x +
-// bf16(sum of the 8 partials)) — HF's bf16 MoE output and bf16 residual add.
+// The retired REDUCE task, done once per fold point (o_proj, expert down) by
+// the globally last worker while every other worker waits on the event:
+// x = bf16(x + bf16(sum of the 8 partials in expert_out)) — HF's bf16 linear
+// output and bf16 residual add.
 // The partials came from other XCDs: acquire first (their XCDs' last
 // arrivals flushed them before adding their shares).
 __device__ inline void fold_partials(const ModelDims& d, const Activations& act) {
@@ -272,12 +277,18 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
 
         // o_proj needs all 16 heads, so it is the layer's one unavoidable
         // global event; the residual add is folded into its epilogue.
-        case TASK_O_PROJ:
-            stage_vector(act.o, s.vec, d.heads * d.v_head);
-            gemv_rows(w.layer_o_proj[L], d.heads * d.v_head, s.vec, act.x,
-                      act.x, EPI_RESIDUAL, 1.f, d.hidden, d.heads * d.v_head,
-                      xcd, kNumXCDs, worker, nw);
+        // K-split (§12): this XCD's heads' 256 columns of W_o against its own
+        // o slice, all 2048 output rows over the 37 workers, fp32 partial into
+        // expert_out[xcd]; the globally last o_proj worker folds the 8
+        // partials into x (bf16(x + bf16(sum)) — HF's o_proj + residual).
+        case TASK_O_PROJ: {
+            const int kc = d.heads * d.v_head / kNumXCDs;
+            stage_vector(act.o + (int64_t)xcd * kc, s.vec, kc);
+            gemv_rows(w.layer_o_proj[L] + (int64_t)xcd * kc, d.heads * d.v_head, s.vec,
+                      act.expert_out + (int64_t)xcd * d.hidden, nullptr, EPI_NONE, 1.f,
+                      d.hidden, kc, /*xcd=*/0, /*n_xcds=*/1, worker, nw);
             break;
+        }
 
         case TASK_EXPERT_GATE_UP: {
             select_experts(d, act.router_logits + (int64_t)xcd * d.n_routed, s.ids, s.ws);
@@ -286,8 +297,11 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
                 s.ids, s.ws, d.routed_scaling, d.hidden, d.moe_inter, d.moe_inter * 2,
                 w.expert_stride);
             stage_vector(act.x_norm + (int64_t)xcd * d.hidden, s.vec, d.hidden);
+            uint32_t* chunk_counters = (t.flags & FLAG_CHUNK_SIGNAL)
+                ? rt.xcd_counters + (int64_t)xcd * kMaxEvents + t.local_event : nullptr;
             expert_gate_up(u, s.vec, act.expert_h + (int64_t)xcd * d.moe_inter,
-                           d.hidden, worker, nw);
+                           d.hidden, worker, nw, chunk_counters, kExpertKChunk,
+                           t.kv_chunk);
             break;
         }
 
@@ -297,9 +311,28 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
                 t.expert_slot, w.layer_experts[L], w.layer_shared[L],
                 s.ids, s.ws, d.routed_scaling, d.hidden, d.moe_inter, d.moe_inter * 2,
                 w.expert_stride);
-            stage_vector(act.expert_h + (int64_t)xcd * d.moe_inter, s.vec, u.inter);
-            expert_down(u, s.vec, act.expert_out + (int64_t)xcd * d.hidden,
-                        d.hidden, worker, nw);
+            // K-chunked (§12): chunk c of h is consumed as soon as this XCD's
+            // gate_up waves have stored it. Chunk 0 was the descriptor's
+            // wait; chunks 1.. are waited here. Partial sums live in s.part.
+            const int n_chunks = (t.flags & FLAG_CHUNK_WAIT) ? max(1, (int)t.kv_chunk) : 1;
+            const float* h = act.expert_h + (int64_t)xcd * d.moe_inter;
+            float* out = act.expert_out + (int64_t)xcd * d.hidden;
+            __shared__ int chunk_ok;
+            for (int c = 0; c < n_chunks; ++c) {
+                const int col0 = c * kExpertKChunk;
+                const int kc = n_chunks == 1 ? u.inter : min(kExpertKChunk, u.inter - col0);
+                if (c > 0) {
+                    if (threadIdx.x == 0) {
+                        chunk_ok = wait_event(rt, tc.epoch, t.local_event + c, SCOPE_XCD_LOCAL,
+                                              xcd, t.wait_count) ? 1 : 0;
+                    }
+                    __syncthreads();              // also: everyone is done with s.vec
+                    if (!chunk_ok) return false;
+                }
+                stage_vector(h + col0, s.vec, kc);
+                expert_down_chunk(u, s.vec, s.part, out, d.hidden, worker, nw,
+                                  col0, kc, c == 0, c + 1 == n_chunks);
+            }
             break;
         }
 
@@ -391,6 +424,15 @@ void fleet_decode_step(RuntimeState rt, ModelDims d, Weights w,
             bool do_signal = true;
             if (!rt.smoke) {
                 do_signal = run_task(*t, rt, d, w, act, kv, s, tc, xcd, worker);
+            } else if (t->flags & FLAG_CHUNK_SIGNAL) {
+                // no body: stand in for the 4 waves' per-chunk arrivals
+                if (threadIdx.x == 0) {
+                    for (int c = 0; c < t->kv_chunk; ++c) {
+                        __hip_atomic_fetch_add(
+                            rt.xcd_counters + (int64_t)xcd * kMaxEvents + t->local_event + c,
+                            (uint32_t)kWaves, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+                    }
+                }
             } else if (t->flags & FLAG_SIGNAL_LAST) {
                 __shared__ int last_smem2;
                 if (threadIdx.x == 0) {
