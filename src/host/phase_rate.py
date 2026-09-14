@@ -173,6 +173,12 @@ def parse_fetch_size(path: Path, tokens: int) -> dict:
             if parts[ni].replace(".kd", "").split(" [")[0].strip() == "fleet_decode_step":
                 kernel_kb += kb
                 sig = " ".join(f"{k} {parts[i]}" for k, i in reg.items())
+                if "arch_vgpr" in reg and "accum_vgpr" in reg:
+                    arch, accum = parts[reg["arch_vgpr"]], parts[reg["accum_vgpr"]]
+                    sig = (f"{arch}+{accum} vgpr/agpr = "
+                           f"{int(arch) + int(accum)}, "
+                           + " ".join(f"{k} {parts[i]}" for k, i in reg.items()
+                                      if k not in ("arch_vgpr", "accum_vgpr")))
     if kernel_kb == 0.0:
         raise SystemExit(f"{path}: no fleet_decode_step dispatch in this profile")
     return {"kernel_gb": kernel_kb / 1e6, "total_gb": total_kb / 1e6,
@@ -363,9 +369,11 @@ def main() -> None:
               f"{measured['tokens']} tokens)")
         if measured["sig"]:
             print(f"    dispatch footprint: {measured['sig']}")
-            print("    (compare with results/isa_summary.txt: two profiles with "
-                  "different\n     footprints are two different binaries, and "
-                  "the older one is stale)")
+            print("    (tie it to a build with results/isa_summary.txt. Two "
+                  "profiles in")
+            print("     results/ share scr and lds and differ only in the "
+                  "register sum:")
+            print("     344 for the v0.16 build, 352 for the one before it)")
         print(f"    model {hbm/1e3 - have:+.2f} GB "
               f"({100 * (hbm/1e3 / have - 1):+.1f}%)")
 
