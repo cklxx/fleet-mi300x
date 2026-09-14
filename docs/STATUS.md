@@ -159,6 +159,56 @@ Sources: [ROCm occupancy math on CDNA](https://rocm.blogs.amd.com/software-tools
 Raw numbers for the occupancy test are in
 [`results/microbench_f_occupancy.txt`](../results/microbench_f_occupancy.txt).
 
+### AOT, JIT and graphs: two were already done, the third has no mechanism
+
+Three things get proposed whenever a kernel looks slow, and it is worth
+writing down where each one landed here.
+
+**Ahead-of-time is the design premise**, in a stronger form than the phrase
+usually means. The task graph is built on the host into 54,946 immutable
+64-byte descriptors, pre-assigned to 296 per-worker queues; the weights are
+packed into one flat blob with a manifest; the kernel is compiled to gfx942.
+Nothing is decided at run time except routing.
+
+**Graphs have nothing to recover.** HIP and CUDA graphs exist to remove
+launch overhead, and one launch per token measured 3.665 ms against 3.660
+for one launch per 32 tokens, so all 32 launches together cost about
+0.005 ms. vLLM needs graphs because it issues hundreds of kernels per token;
+this megakernel already is the graph, executed on device by the event
+protocol.
+
+**Specialising the shapes at compile time looked promising and is dead.**
+The model dimensions arrive as runtime fields of `ModelDims`, referenced 73
+times in the task bodies, so no loop bound or stride is known to the
+compiler, and the kernel carries 723 SGPR spills. The proposed mechanism was
+that constant bounds would fold the integer divisions out of the hot path.
+Local codegen says there is nothing to fold:
+
+| | baseline | constant worker count |
+|---|---|---|
+| integer divide sequences | 76 | 73 |
+| instructions | 29,925 | 29,733 |
+| VGPR / SGPR spills | 92 / 36 | 91 / 36 |
+
+and of those 76 divides, **none is executed per iteration**: zero sit in a
+block that is a backward-branch target, 70 sit in blocks with no wide load
+at all, and the remaining 6 sit in an unrolled streaming block that is not a
+loop header. Setup arithmetic run once per task, roughly 180 tasks per
+worker per token, is far below the 1% run-to-run spread a change would have
+to clear to be visible.
+
+The shapes themselves line up cleanly, which is why this was worth checking:
+hidden 2048 over 8 XCDs, kv_lora 512 as exactly 64 uint4 across a wave's 64
+lanes, heads 16 over 8 XCDs, qk_nope 128 over 2 publishers and over the
+8-row load batch, v_head 128 over 16 KV chunks, dense_inter and vocab over 8,
+all exact. The only quantity that never divides is the 37 workers per XCD,
+which is 38 CUs minus the scheduler.
+
+Caveat on method: this codegen was produced locally for gfx90a, which emits
+flat addressing where the gfx942 build emits global. The conclusion rests on
+structure, that divides are absent from loop bodies, which is not a property
+that changes with the target.
+
 ### One probe, two optimisations closed
 
 `microbench (g)` streams a single buffer from 1, 37, 148 and 296 workgroups
