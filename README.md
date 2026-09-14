@@ -107,7 +107,7 @@ step with its trace attribution in [docs/STATUS.md](docs/STATUS.md).
 | Greedy tokens matching HF, free-running / teacher-forced | 32/32 and 32/32 |
 | Layers inside the §6 gate on the first decode step | 27 of 27 (layer 1: max rel 3.1e-3, cosine 0.999993) |
 | Per-token latency, median / p95, one cooperative launch for all 32 tokens | **3.66 ms / 3.67 ms (273 tok/s)**, three runs within 3.661–3.665; first correct version was 22.05 ms |
-| Bytes per token, measured (`rocprofv3 FETCH_SIZE`, before kv_a stopped being replicated) | 5.67 GB; ~5.2 GB now → ~1.4 TB/s of the 4.2 TB/s streaming ceiling |
+| Bytes per token, measured (`rocprofv3 FETCH_SIZE`, before kv_a stopped being replicated) | **5.20 GB** on the shipped graph, measured; ~1.4 TB/s of the 4.2 TB/s streaming ceiling |
 | **vLLM 0.11.2 on the same VM** (AITER MLA backend, CUDA graphs, bf16, batch 1, same prompt; `bench/vllm_decode_timing.py`) | 4.52 ms (220 tok/s), same 32 tokens |
 | HF transformers eager on the same VM | 54.4 ms |
 | Launches per 32 tokens | 1 (the argmax task feeds the next embed on the device) |

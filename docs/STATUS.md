@@ -39,7 +39,7 @@ single launch) as well. Raw numbers: [`results/`](../results/).
 | Cross-XCD event, idle / under load (`results/microbench_summary.txt`) | 1.36 µs / 5.88 µs at 1.59 TB/s of streaming load |
 | Payload visibility (`microbench (d)(d')(d''')`) | fenced protocol 0 stale in 16.4 M; 37 producers + last-arriver flush 0 stale in 151 M each; agent-scope atomic payload without fences 0 stale in 16.4 M. MTYPE-UC memory without fences (d''): 12.3 M of 16.4 M stale — not usable on this VM |
 | Streamed read bandwidth, best depth | 4.2 TB/s (79% of peak) |
-| **Bytes per token, measured** (`rocprofv3 --pmc FETCH_SIZE`, 4 teacher-forced tokens, v0.14 graph, `results/rocprofv3_fetch_size.csv`) | 22.66 GB for 4 tokens = **5.67 GB/token**, 15% above §1's 4.94 GB (kv_a replicated per XCD — now removed, −0.51 GB —, the partial folds, L2 misses); at 3.63 ms and ~5.2 GB that is ~**1.4 TB/s** of the 4.2 TB/s ceiling |
+| **Bytes per token, measured** (`rocprofv3 --pmc FETCH_SIZE`, 4 teacher-forced tokens, **the shipped graph**, `results/rocprofv3_fetch_size_d16_shared.csv`) | 20.80 GB for 4 tokens = **5.20 GB/token**. Two profilers agree to five digits (20,799,909 KB and 20,805,896 KB). The byte model's 4.90 GB of HBM traffic is 5.8% under it, which is the reconciliation the phase-rate tool reports. Earlier runs measured 5.67 GB on the graph that still replicated kv_a; the 5.20 figure was an estimate until this session and is now measured |
 | Protocol only (`--smoke`, 1157 events, no task bodies) | 3.01 ms per token: with no bodies every wait is back-to-back, so this is the protocol's worst case, not its share of the 3.63 |
 | Kernel resources (`results/kernel_resource_usage.txt`, `results/isa_summary.txt`) | 256 VGPRs + 72 AGPRs (VGPR spill space), 472 SGPR spills, 112 B of stack (4 scratch instructions, none in a GEMV loop), 25 KB LDS, 1 wave/SIMD. The weight-streaming basic blocks (16–18 `global_load_dwordx4` each) carry 0 scratch and 2 AGPR moves: **the in-kernel vs isolated GEMV gap is not register pressure** |
 | KV-cache conversion vs HF's own cache | K_nope, K_rope, V all exactly 0 error, 27 layers |
@@ -75,6 +75,7 @@ the decode kernel is written before the crash; both tools agree
 | **v0.15** — down reuses the routing its own worker's gate_up left in LDS (`ROUTING_CACHED`, the validator checks the queue order); kv_a computed once, split over the 8 XCDs behind one global event instead of replicated (`--kva-replicated` restores the old graph) | **3.63 ms** | down's prologue 5.7 → 1.6 µs (−2.2%); q/kv_a 23.2 → 18.6 µs but attention's kv_post now reads kv_a from another XCD's write (+2 µs), net −0.6%, and 0.51 GB/token fewer bytes |
 | expert phase on two worker groups so the K-chunk tiling can overlap gate_up and down | 4.15–4.83 ms (**slower**) | 18 CUs stream gate_up in 44 µs where 37 take 33: an XCD's share of HBM needs every CU issuing; the tiling on top makes it worse again |
 | **v0.16** — three more candidates, all measured, all rejected: publish the top-k once per XCD instead of per task; prefetch the next task's first rows across its event wait; re-test `--coherent-acts` on an equal graph | 3.661–3.665 ms, i.e. unchanged | the publication trades 4 µs of gate_up prologue for 6 µs of serialised router tail — the same shape as the v0.11 one-writer fold; the prefetch's 8 held loads cost 4%; the coherent protocol is within noise of the fenced one. The kernel keeps all three behind flags and ships none |
+| **v0.17** — the expert partials stored as bf16 | **3.643 ms** vs 3.652–3.659 over three alternating pairs, about 0.4% | the fold reads 72 KB per worker in 4.8 µs, which is 15 GB/s against a 14.2 GB/s per-worker ceiling: bandwidth-bound, and that is why vectorising it to float4 earlier changed nothing. The partials are bf16-valued already (EPI_BF16), so storing them narrower is bit-exact — 32/32 tokens and 27/27 layers unchanged. Predicted 1.5%, measured 0.4%; the rest of the fold's cost is not bytes |
 
 Tried and rejected by measurement: two workgroups per CU (6.5 ms: the
 kernel's 256 VGPRs leave no room for a second wave per SIMD); workers polling
@@ -245,6 +246,7 @@ overwritten by the 36 that followed it and never reported.
 |---|---|---|
 | `tests/run_all.py` | every gate that runs without a GPU, one exit code | 18 gates |
 | `tests/mutate.py` | breaks the code on purpose, requires the suite to notice | 12 mutations |
+| `tests/run_gpu.py` | every gate that needs 304 resident workgroups | 18 gates + 1 informational |
 | `tests/test_queue_simulation.py` | the event protocol executed on the CPU over five graph variants | 30 |
 | `tests/test_kernel_interface.py` | kernel, runtime header and launcher cross-checks, including the fences | 19 |
 | `tests/test_validator.py` | the graph validator against nine sabotages | 16 |
@@ -253,6 +255,25 @@ overwritten by the 36 that followed it and never reported.
 | `tests/test_reference_vs_hf.py` | the NumPy reference against HuggingFace | 8 boundaries |
 | `tests/test_descriptor_layout.py` | host packer and device struct, byte for byte | 6 |
 | `tests/test_absorbed_equivalence.py` | absorbed MLA equals the materialised path | 4 |
+
+`tests/run_gpu.py` is the other half, for what only 304 resident
+workgroups can exercise: the payload-visibility proofs, the 8x38 placement
+probe, a full 32-token decode on every graph the builder emits, teacher
+forcing, the plain-loads build, bitwise determinism (the same decode twice,
+layer dumps compared byte for byte), and the abort path. The sweep earned
+itself on its first real run: storing the expert partials as bf16 left a
+null destination on the EPI_BF16_ACC path, which only the tiled graphs take,
+so the default decode and every local gate stayed green while two variant
+decodes died. Before that run the sweep had been scoring those variants
+PASS with the detail "not emitted", which is why a missing input is now a
+skip that counts against the exit code.
+
+The abort gate was wrong in concept at first: it lowered the spin limit and
+expected a timeout, but lowering the limit does not create a stuck wait, and
+the wait loop only evaluates the limit every 1024 polls. It now writes a
+graph with a wait count no number of producers can reach; the launcher
+reports the event it timed out on and exits non-zero, and a normal decode
+straight afterwards returns 3.646 ms and 32/32.
 
 Two mutation rows are marked redundant on purpose: the validator carries two
 overlapping XCD-locality checks, and deleting either alone is invisible
