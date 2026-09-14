@@ -138,6 +138,29 @@ def main() -> int:
             mismatched.append(f"{py_name}={py and py.group(1)} vs {c_name}={c_val}")
     results.append(check("graph/kernel constants agree", not mismatched, ", ".join(mismatched)))
 
+    # 4c. the memory model. Deleting either fence leaves every other gate
+    #     green and yields a kernel that reads stale activations on the
+    #     machine; the microbench measures them, nothing else checks that
+    #     they are still called.
+    def body(src, name):
+        i = src.find(name + "(")
+        while i > 0 and src[i - 1] != chr(10):
+            i -= 1
+        j = src.find(chr(10) + "}", i)
+        return src[i:j] if i >= 0 and j > i else ""
+
+    sig, wait = body(r, "signal_event"), body(r, "wait_event")
+    results.append(check("signal_event releases before publishing",
+                         "fence_release()" in sig and "__hip_atomic_fetch_add" in sig))
+    results.append(check("wait_event acquires on both scopes",
+                         "fence_acquire_local()" in wait and "fence_acquire()" in wait))
+    results.append(check("the XCD-local acquire is the L1-only one",
+                         "buffer_inv sc0" in r))
+    # measured: dropping the producer-side writeback made 10 of 18 launches
+    # produce wrong tokens even though the fence-free bench passes (STATUS.md)
+    results.append(check("the producer writeback is unconditional",
+                         "return true;" in body(r, "event_release_fenced")))
+
     # 4b. the epoch is what makes any wait target non-zero; the launcher must
     #     set it from the token index before each launch.
     results.append(check("launcher sets rt.epoch0 and n_tokens",

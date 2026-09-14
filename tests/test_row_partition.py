@@ -12,6 +12,7 @@ up as a compile error or a hang.
 """
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -19,6 +20,28 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src" / "host"))
 from taskgraph import WORKERS_PER_XCD, XCDS  # noqa: E402
 
 WORKERS, WAVES = WORKERS_PER_XCD, 4
+
+ROOT = Path(__file__).resolve().parents[1]
+RUNTIME = (ROOT / "src" / "runtime" / "fleet_runtime.h").read_text()
+GEMV = (ROOT / "src" / "kernels" / "gemv.h").read_text()
+
+
+def cxx_int(src, name):
+    # constexpr int <name> = <n>, or = <MACRO> with a #define above it
+    m = re.search(rf"constexpr int {name} = ([A-Za-z_0-9]+)", src)
+    if not m:
+        return None
+    tok = m.group(1)
+    if tok.isdigit():
+        return int(tok)
+    d = re.search(rf"#define {tok} (\d+)", src)
+    return int(d.group(1)) if d else None
+
+
+def has_line(src, text):
+    # is this statement still in the header, ignoring whitespace?
+    squash = lambda t: re.sub(r"\s+", " ", t).strip()
+    return squash(text) in squash(src)
 
 
 def rows_of(N: int, n_xcds: int, n_workers: int, xcd: int, worker: int,
@@ -79,6 +102,28 @@ def main() -> int:
         ("fewer rows than workers: 5 over 8 XCDs", 5, XCDS, WORKERS, True),
     ]
     results = []
+
+    # Everything below is a Python mirror of gemv.h, and a mirror only proves
+    # the kernel right if it is pinned to the kernel. These five fail if the
+    # constants or the split formula in the headers move.
+    xcds, cus, per_cu = (cxx_int(RUNTIME, n) for n in ("kXCDs", "kCUsPerXCD", "kBlocksPerCU"))
+    results.append(check("kXCDs in the header matches the builder",
+                         xcds == XCDS, f"header {xcds}, taskgraph {XCDS}"))
+    hdr_workers = (cus * per_cu - 1) if cus and per_cu else None
+    results.append(check("workers per XCD match the header",
+                         hdr_workers == WORKERS_PER_XCD,
+                         f"header {hdr_workers}, taskgraph {WORKERS_PER_XCD}"))
+    results.append(check("kWaves in gemv.h matches this mirror",
+                         "kWaves = 256 / kWaveLanes" in GEMV and 256 // 64 == WAVES))
+    results.append(check("xcd_rows splits the way this mirror does",
+                         all(has_line(GEMV, t) for t in (
+                             "const int per = (N + n_xcds - 1) / n_xcds;",
+                             "s.begin = xcd * per;",
+                             "s.end = min(N, s.begin + per);"))))
+    results.append(check("the worker stride is still interleaved",
+                         all(has_line(GEMV, t) for t in (
+                             "const int first = s.begin + worker;",
+                             "const int cnt = (s.end - first + n_workers - 1) / n_workers;"))))
     for label, N, nx, nw, pairs in cases:
         ok, detail = covered_once(N, nx, nw, pairs)
         results.append(check(label, ok, detail))

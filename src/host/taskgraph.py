@@ -522,15 +522,24 @@ def validate(g: Graph) -> list[str]:
                           f"signal it, event table says {want} — kernel would hang")
     # Per-XCD shares of each global event must add up to its producer count:
     # the kernel adds a share to the global counter once per XCD.
-    shares: dict[int, dict[int, int]] = {}
+    # A set per (event, xcd): every descriptor of a chiplet task carries the
+    # same share, and one that disagrees used to be hidden by the 36 after it.
+    shares: dict[int, dict[int, set]] = {}
     for t in g.tasks:
         if t.signal_event is not None and t.signal_scope == Scope.GLOBAL:
-            shares.setdefault(t.signal_event, {})[t.xcd] = t.signal_xcd_count
+            shares.setdefault(t.signal_event, {}).setdefault(t.xcd, set()).add(
+                t.signal_xcd_count)
     for e, by_xcd in shares.items():
+        label = g.events[e]["label"]
+        for xcd, vals in sorted(by_xcd.items()):
+            if len(vals) > 1:
+                errors.append(f"event {e} ({label}): XCD {xcd} descriptors disagree "
+                              f"on their per-XCD share {sorted(vals)}")
+        got = {x: max(v) for x, v in by_xcd.items()}
         want = g.events[e]["producers"]
-        if sum(by_xcd.values()) != want:
-            errors.append(f"event {e} ({g.events[e]['label']}): per-XCD shares "
-                          f"{by_xcd} do not sum to {want}")
+        if sum(got.values()) != want:
+            errors.append(f"event {e} ({label}): per-XCD shares "
+                          f"{got} do not sum to {want}")
 
     prev_in_queue: dict[tuple[int, int], Task] = {}
     for t in g.tasks:

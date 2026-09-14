@@ -17,6 +17,7 @@ fail, or the test proves nothing.
 """
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -131,6 +132,17 @@ def main() -> int:
         shared_down=f(hidden, 2 * moe_inter),
     )
     results = []
+
+    # resolve_unit() above mirrors expert.h. Pin the four addresses that the
+    # review got wrong once already, so the mirror cannot drift into agreeing
+    # with itself.
+    EH = re.sub(r"\s+", " ", (ROOT / "src" / "kernels" / "expert.h").read_text())
+    for label, frag in (
+            ("shared half keeps the x2 for interleaved rows", "half * 2 * rows * hidden"),
+            ("shared down is strided by the full shared_inter", "u.down_ld = shared_inter;"),
+            ("a routed expert is base + id * stride", "(int64_t)id * expert_stride"),
+            ("routed down follows the gate/up block", "base + (int64_t)2 * moe_inter * hidden")):
+        results.append(check(label, frag in EH, "" if frag in EH else frag))
     for trial in range(3):
         x = R(rng.normal(0, 0.5, size=hidden).astype(np.float32))
         x_n = ref.rms_norm(x, w.post_attention_layernorm, cfg.rms_eps, bf16=True)
