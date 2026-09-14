@@ -358,6 +358,19 @@ def main() -> None:
           f"{sum(r['recover_ms'] for r in top):.3f} ms/token over {len(top)} kinds")
     print("  (aggregate worker-time / 296 workers: an upper bound, since a phase")
     print("   only pays out if it is on the critical path)")
+    busy = sum(r["busy_ms"] for r in rows) / 1e3
+    all_gb = (hbm + l2) / 1e3
+    at_ref = all_gb / (ref * WORKERS) * 1e3
+    print(f"\nall traffic at the reference rate: {all_gb:.2f} GB / "
+          f"({ref:.2f} GB/s x {WORKERS}) = {at_ref:.2f} ms/token")
+    if busy:
+        print(f"  this run moves it at {all_gb / busy:.2f} GB/s per worker, "
+              f"{100 * (all_gb / busy) / ref:.0f}% of the reference")
+    if token_ms:
+        print(f"  measured span {token_ms:.2f} ms -> {token_ms - at_ref:.2f} ms "
+              f"is above the byte time, so that is the size of the remaining")
+        print("  working set: phases below the reference rate, phase tails and "
+              "events")
     print(f"\nbyte model per token: {hbm/1e3:.2f} GB from HBM "
           f"+ {l2/1e3:.2f} GB served from the L2")
     print("  (the L2 side costs worker time but no HBM bandwidth, and FETCH_SIZE")
