@@ -19,8 +19,9 @@ per-layer states. The required milestone (one MoE layer through the Fleet
 path) holds for every MoE layer and the stretch goal (full model, e2e,
 single launch) as well. Raw numbers: [`results/`](../results/).
 
-| Measured (v0.16: `fleet_decode_nt`, `taskgraph_d16.bin`; session 6 on a fresh VM) | Value |
+| Measured (`fleet_decode_nt`, `taskgraph_d16.bin`) | Value |
 |---|---|
+| **Per-token latency, the shipped build (v0.18)** | **3.593, 3.595, 3.596 ms (278 tok/s)**. The rows below are v0.16 on session 6 and are kept because every rejection in this table was measured against that build; the v0.18 row in the history table has the paired comparison |
 | Tokens matching HF greedy, free-running / teacher-forced | 32/32 and 32/32 (`results/decode_final_r*.json`, `decode_final_teacher.json`) |
 | Layers inside the §6 gate on step 0 | 27 of 27 |
 | Per-token latency, median / p95, **one launch for 32 tokens** | **3.661–3.665 / 3.670–3.673 ms (273 tok/s)** over three runs; teacher-forced 3.654 ms. (Session 5 measured 3.624–3.628 for the same graph on a different VM instance: the ~1% is between-VM, not a regression) |
@@ -416,12 +417,12 @@ overwritten by the 36 that followed it and never reported.
 
 | file | what it is | count |
 |---|---|---|
-| `tests/run_all.py` | every gate that runs without a GPU, one exit code | 18 gates |
-| `tests/mutate.py` | breaks the code on purpose, requires the suite to notice | 12 mutations |
-| `tests/run_gpu.py` | every gate that needs 304 resident workgroups | 18 gates + 1 informational |
+| `tests/run_all.py` | every gate that runs without a GPU, one exit code | 19 gates, 20 with `--mutate` |
+| `tests/mutate.py` | breaks the code on purpose, requires the suite to notice | 13 mutations |
+| `tests/run_gpu.py` | every gate that needs 304 resident workgroups | 19 gates + 1 informational |
 | `tests/test_queue_simulation.py` | the event protocol executed on the CPU over five graph variants | 30 |
 | `tests/test_kernel_interface.py` | kernel, runtime header and launcher cross-checks, including the fences | 19 |
-| `tests/test_validator.py` | the graph validator against nine sabotages | 16 |
+| `tests/test_validator.py` | the graph validator against ten sabotages | 18 |
 | `tests/test_row_partition.py` | every GEMV row owned once, pinned to the headers | 17 |
 | `tests/test_expert_addressing.py` | packed expert layout and slot resolution, pinned to `expert.h` | 11 |
 | `tests/test_reference_vs_hf.py` | the NumPy reference against HuggingFace | 8 boundaries |
