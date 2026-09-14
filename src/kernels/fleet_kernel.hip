@@ -100,36 +100,26 @@ __device__ inline void rms_norm_lds(const ModelDims& d,
 // parallel with 295 others) and worker (0,0) publishes vec to dst, which is
 // never the buffer being read. The partials came from other XCDs: the
 // global wait that released this task acquired them.
-__device__ inline void stage_residual(const ModelDims& d, const float* __restrict__ src,
-                                      const float* __restrict__ partials,
-                                      float* __restrict__ dst, float* __restrict__ vec,
-                                      int xcd, int worker, bool coh) {
+// o_proj's partials are fp32 partial sums: they must be added before the
+// single bf16 rounding, so unlike the expert partials they cannot be stored
+// narrower without changing the arithmetic.
+__device__ inline void stage_residual_f32(const ModelDims& d, const float* __restrict__ src,
+                                          const float* __restrict__ partials,
+                                          float* __restrict__ dst, float* __restrict__ vec,
+                                          int xcd, int worker, bool coh) {
     if (coh) {
-        // coherent mode: per-element agent-scope atomic loads (no 16-byte form)
-        if (partials == nullptr) {
-#pragma unroll 8
-            for (int i = threadIdx.x; i < d.hidden; i += kBlockThreads) vec[i] = ld_coh(src + i, true);
-        } else {
 #pragma unroll 4
-            for (int i = threadIdx.x; i < d.hidden; i += kBlockThreads) {
-                float acc = 0.f;
+        for (int i = threadIdx.x; i < d.hidden; i += kBlockThreads) {
+            float acc = 0.f;
 #pragma unroll
-                for (int x = 0; x < kNumXCDs; ++x) acc += ld_coh(partials + x * d.hidden + i, true);
-                vec[i] = bf16_round(ld_coh(src + i, true) + bf16_round(acc));
-            }
+            for (int x = 0; x < kNumXCDs; ++x) acc += ld_coh(partials + x * d.hidden + i, true);
+            vec[i] = bf16_round(ld_coh(src + i, true) + bf16_round(acc));
         }
-        __syncthreads();
-    } else if (partials == nullptr) {
-        stage_vector(src, vec, d.hidden);
     } else {
-        // 16-byte loads: 2 x (8 partials + x) = 18 loads per thread, all in
-        // flight — one round trip under load (the scalar version's 72 loads
-        // took two, ~7 us, and fully unrolled they spilled).
         const int n4 = d.hidden >> 2;
         const float4* s4 = reinterpret_cast<const float4*>(src);
         const float4* p4 = reinterpret_cast<const float4*>(partials);
         float4* v4 = reinterpret_cast<float4*>(vec);
-#pragma unroll
         for (int i = threadIdx.x; i < n4; i += kBlockThreads) {
             float4 acc = p4[i];
 #pragma unroll
@@ -144,6 +134,63 @@ __device__ inline void stage_residual(const ModelDims& d, const float* __restric
             r.z = bf16_round(xs.z + bf16_round(acc.z));
             r.w = bf16_round(xs.w + bf16_round(acc.w));
             v4[i] = r;
+        }
+    }
+    __syncthreads();
+    if (dst != nullptr && xcd == 0 && worker == 0) {
+        for (int i = threadIdx.x; i < d.hidden; i += blockDim.x) st_coh(dst + i, vec[i], coh);
+    }
+}
+
+__device__ inline void stage_residual(const ModelDims& d, const float* __restrict__ src,
+                                      const __hip_bfloat16* __restrict__ partials,
+                                      float* __restrict__ dst, float* __restrict__ vec,
+                                      int xcd, int worker, bool coh) {
+    if (coh) {
+        // coherent mode: per-element agent-scope atomic loads (no 16-byte form)
+        if (partials == nullptr) {
+#pragma unroll 8
+            for (int i = threadIdx.x; i < d.hidden; i += kBlockThreads) vec[i] = ld_coh(src + i, true);
+        } else {
+#pragma unroll 4
+            for (int i = threadIdx.x; i < d.hidden; i += kBlockThreads) {
+                float acc = 0.f;
+#pragma unroll
+                for (int x = 0; x < kNumXCDs; ++x) {
+                    acc += __bfloat162float(partials[x * d.hidden + i]);
+                }
+                vec[i] = bf16_round(ld_coh(src + i, true) + bf16_round(acc));
+            }
+        }
+        __syncthreads();
+    } else if (partials == nullptr) {
+        stage_vector(src, vec, d.hidden);
+    } else {
+        // The partials are bf16, so one 16-byte load covers eight of this
+        // thread's hidden indices per XCD: 8 loads for the 8 partials plus 2
+        // for x, all in flight, and half the bytes the fp32 version moved.
+        const int n8 = d.hidden >> 3;
+        const uint4* p4 = reinterpret_cast<const uint4*>(partials);
+        const float4* s4 = reinterpret_cast<const float4*>(src);
+        for (int i = threadIdx.x; i < n8; i += kBlockThreads) {
+            uint4 v[kNumXCDs];
+#pragma unroll
+            for (int x = 0; x < kNumXCDs; ++x) v[x] = p4[x * n8 + i];
+            float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+            for (int x = 0; x < kNumXCDs; ++x) {
+                float a, b;
+                unpack_bf16x2(v[x].x, a, b); acc[0] += a; acc[1] += b;
+                unpack_bf16x2(v[x].y, a, b); acc[2] += a; acc[3] += b;
+                unpack_bf16x2(v[x].z, a, b); acc[4] += a; acc[5] += b;
+                unpack_bf16x2(v[x].w, a, b); acc[6] += a; acc[7] += b;
+            }
+            const float4 lo = s4[2 * i], hi = s4[2 * i + 1];
+            const float xs[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                vec[8 * i + k] = bf16_round(xs[k] + bf16_round(acc[k]));
+            }
         }
         __syncthreads();
     }
@@ -303,7 +350,7 @@ __device__ void task_norm_router(const ModelDims& d, const Weights& w,
                                  int xcd, int worker, bool moe, const TokenCtx& tc, bool coh,
                                  const TaskDescriptor& t, const RuntimeState& rt) {
     // x[1] = bf16(x[0] + bf16(o_proj)) from the 8 K-split partials
-    stage_residual(d, act.x[0], act.oproj_partial, act.x[1], s.vec, xcd, worker, coh);
+    stage_residual_f32(d, act.x[0], act.oproj_partial, act.x[1], s.vec, xcd, worker, coh);
     FLEET_STAMP_STAGE();
     rms_norm_lds(d, w.layer_norm_post[layer], s.vec, s.smem);
     FLEET_STAMP();
@@ -541,7 +588,7 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
             // layer input: embed's x[0] for layer 0; else the previous layer's
             // x[1] (+ its expert partials if it was MoE), published to x[0]
             const float* src = (L == 0) ? act.x[0] : act.x[1];
-            const float* parts = (t.flags & FLAG_FOLD_PARTIALS) ? act.expert_out : nullptr;
+            const __hip_bfloat16* parts = (t.flags & FLAG_FOLD_PARTIALS) ? act.expert_out : nullptr;
             stage_residual(d, src, parts, (L == 0) ? nullptr : act.x[0], s.vec, xcd, worker, coh);
             dump_layer(d, act, L - 1, s.vec, xcd, worker, tc);
             FLEET_STAMP_STAGE();
@@ -653,7 +700,7 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
             // wait; chunks 1.. are waited here. Partial sums live in s.part.
             const int n_chunks = (t.flags & FLAG_CHUNK_WAIT) ? max(1, (int)t.kv_chunk) : 1;
             const float* h = act.expert_h + (int64_t)xcd * d.moe_inter;
-            float* out = act.expert_out + (int64_t)xcd * d.hidden;
+            __hip_bfloat16* out = act.expert_out + (int64_t)xcd * d.hidden;
             __shared__ int chunk_ok;
             for (int c = 0; c < n_chunks; ++c) {
                 const int col0 = c * kExpertKChunk;

@@ -96,20 +96,21 @@ __device__ inline void expert_gate_up(
 // boundaries are multiples of 8 (16-byte weight loads).
 __device__ inline void expert_down_chunk(
         const ExpertUnit& u, const float* __restrict__ h_lds,
-        float* __restrict__ acc_lds, float* __restrict__ out, int hidden,
+        float* __restrict__ acc_lds, __hip_bfloat16* __restrict__ out, int hidden,
         int worker, int n_workers, int col0, int kc, bool first, bool last,
         bool coh = false) {
     const GemvEpilogue epi = first ? (last ? EPI_BF16 : EPI_NONE)
                                    : (last ? EPI_BF16_ACC : EPI_ACC);
-    gemv_rows(u.down + col0, u.down_ld, h_lds, last ? out : acc_lds,
+    gemv_rows(u.down + col0, u.down_ld, h_lds, last ? nullptr : acc_lds,
               (last && !first) ? acc_lds : nullptr,   // residual = the accumulator
               epi, u.weight, hidden, kc, /*xcd=*/0, /*n_xcds=*/1, worker, n_workers,
-              last && coh);   // the partial crosses XCDs; the accumulator is LDS
+              last && coh,    // the partial crosses XCDs; the accumulator is LDS
+              last ? out : nullptr);
 }
 
 __device__ inline void expert_down(
         const ExpertUnit& u, const float* __restrict__ h_lds,
-        float* __restrict__ out, int hidden, int worker, int n_workers) {
+        __hip_bfloat16* __restrict__ out, int hidden, int worker, int n_workers) {
     expert_down_chunk(u, h_lds, nullptr, out, hidden, worker, n_workers,
                       0, u.inter, true, true);
 }

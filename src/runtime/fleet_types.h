@@ -76,7 +76,9 @@ struct Activations {
     float* __restrict__ attn_partial;  // [heads][chunks][2 + kv_lora] m, l, acc
     float* __restrict__ o;             // [heads * v_head]
     float* __restrict__ expert_h;      // [kNumXCDs][moe_inter], or [dense_inter]
-    float* __restrict__ expert_out;    // [kNumXCDs][hidden] expert partials, folded by the next q/kv_a
+    __hip_bfloat16* __restrict__ expert_out;  // [kNumXCDs][hidden] expert partials. The
+                                       // values are bf16 already (EPI_BF16), so half the
+                                       // bytes of the fold are pure waste; folded by the next q/kv_a
     float* __restrict__ oproj_partial; // [kNumXCDs][hidden] o_proj K-split partials, folded by the router
     float* __restrict__ logits;        // [vocab]
     float* __restrict__ argmax_val;    // [kNumXCDs * workers] per-worker best logit

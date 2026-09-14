@@ -586,7 +586,7 @@ int main(int argc, char** argv) {
         act.attn_partial = dev_alloc<float>((size_t)d.heads * kv_chunks * kPartialStride);
         act.o = dev_alloc<float>((size_t)d.heads * d.v_head);
         act.expert_h = dev_alloc<float>(std::max((size_t)kNumXCDs * d.moe_inter, (size_t)d.dense_inter));
-        act.expert_out = dev_alloc<float>((size_t)kNumXCDs * d.hidden);
+        act.expert_out = dev_alloc<__hip_bfloat16>((size_t)kNumXCDs * d.hidden);
         act.oproj_partial = dev_alloc<float>((size_t)kNumXCDs * d.hidden);
         act.logits = dev_alloc<float>(d.vocab);
         act.argmax_val = dev_alloc<float>((size_t)kNumXCDs * kWorkersPerXCD);
