@@ -70,6 +70,10 @@ python3 src/host/reference_run.py --model "$MODEL" --out build/golden.npz 2>&1 |
 log "pack weights"
 python3 src/host/pack_weights.py --model "$MODEL" --out build/weights.bin 2>&1 | tail -2
 
+log "gpu test suite (correctness before any timing)"
+python3 tests/run_gpu.py | tail -26
+
+
 BIN=./build/fleet_decode_nt      # non-temporal weight loads: the headline binary
 log "decode: teacher-forced, one launch for all tokens (fenced protocol)"
 $BIN --graph $GRAPH --teacher-force --repeat 2 --json results/decode_teacher.json 2>&1 | grep -vE "^  layer" | tail -6
