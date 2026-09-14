@@ -65,14 +65,14 @@ python3 -m venv .venv && .venv/bin/pip install numpy torch transformers
 .venv/bin/python tests/run_all.py
 ```
 
-That is 19 checks: the maths against HuggingFace, the host/device wire format,
+That is 18 checks: the maths against HuggingFace, the host/device wire format,
 the task graph validator on all seven variants, the event protocol simulated
 for three tokens, and the kernel parsed by a real compiler in both passes.
 
 Two extra commands, both optional:
 
 ```bash
-.venv/bin/python tests/run_all.py --mutate   # breaks the code on purpose, 12 ways
+.venv/bin/python tests/run_all.py --mutate   # adds a 19th gate: 12 injected bugs
 .venv/bin/python src/host/model_analysis.py  # where the 5 GB per token goes
 ```
 
@@ -96,7 +96,7 @@ minutes.
 To run pieces by hand afterwards:
 
 ```bash
-# 19 GPU checks: memory model, placement, decode on every graph variant,
+# memory model, placement, a decode on every graph variant, bitwise
 # determinism, and the abort path
 python3 tests/run_gpu.py
 
