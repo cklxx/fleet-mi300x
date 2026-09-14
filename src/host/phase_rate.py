@@ -151,12 +151,17 @@ def parse_fetch_size(path: Path, tokens: int) -> dict:
     """rocprofv3 --pmc FETCH_SIZE. Counter_Value is KB, summed over the whole
     dispatch, and one dispatch is every token because the token loop is inside
     the kernel — hence --tokens."""
+    sig = ""
     with path.open() as f:
         cols = [c.strip('"') for c in f.readline().rstrip("\n").split(",")]
         # Counter_Name/Counter_Value (per-counter) or a FETCH_SIZE column
         name_col = "Kernel_Name" if "Kernel_Name" in cols else "KernelName"
         val_col = "Counter_Value" if "Counter_Value" in cols else "FETCH_SIZE"
         ni, vi = cols.index(name_col), cols.index(val_col)
+        # the dispatch row carries the register/scratch footprint, which is how
+        # a profile is tied to the binary that produced it (results/isa_summary.txt)
+        reg = {c: cols.index(c) for c in ("arch_vgpr", "accum_vgpr", "sgpr",
+                                          "scr", "lds") if c in cols}
         kernel_kb, total_kb = 0.0, 0.0
         for line in f:
             parts = [p.strip('"') for p in line.rstrip("\n").split(",")]
@@ -167,10 +172,12 @@ def parse_fetch_size(path: Path, tokens: int) -> dict:
             # rocprof appends .kd and [clone .kd] to the symbol
             if parts[ni].replace(".kd", "").split(" [")[0].strip() == "fleet_decode_step":
                 kernel_kb += kb
+                sig = " ".join(f"{k} {parts[i]}" for k, i in reg.items())
     if kernel_kb == 0.0:
         raise SystemExit(f"{path}: no fleet_decode_step dispatch in this profile")
     return {"kernel_gb": kernel_kb / 1e6, "total_gb": total_kb / 1e6,
-            "gb_per_token": kernel_kb / 1e6 / tokens, "tokens": tokens}
+            "gb_per_token": kernel_kb / 1e6 / tokens, "tokens": tokens,
+            "file": path.name, "sig": sig}
 
 
 # --------------------------------------------------------------- byte model
@@ -202,8 +209,12 @@ def byte_model(cfg: dict, kva_shared: bool, fold_sites: set[str]) -> dict[str, d
                       * BF16 * m,
                       "l2": fold if "QKV_FUSED" in fold_sites else 0.0,
                       "runs": layers},
-        "ATTENTION": {"hbm": 0.0,   # one row per layer, written once, read 16x
-                      "l2": heads * SEQ_LEN * (lora + qk_rope) * BF16 * m,
+        # W_UK is read by every chunk task of the head — the same 131 KB again
+        # per chunk — so the first read is HBM and the other KV_CHUNKS-1 are L2
+        # hits. The shared cache row is one write and 16 head reads, all L2.
+        "ATTENTION": {"hbm": heads * qk_nope * lora * BF16 * m,
+                      "l2": (heads * SEQ_LEN * (lora + qk_rope) * BF16
+                             + heads * (KV_CHUNKS - 1) * qk_nope * lora * BF16) * m,
                       "runs": layers},
         "MERGE_UV": {"hbm": heads * v_head * lora * BF16 * m,
                      # every merge task rescans all chunks' (m, l, acc[512])
@@ -347,9 +358,16 @@ def main() -> None:
     print("   — an L2-fill count — does not see it)")
     if measured:
         have = measured["gb_per_token"]
-        print(f"  measured FETCH_SIZE {have:.2f} GB/token "
-              f"({measured['kernel_gb']:.2f} GB over {measured['tokens']} tokens)"
-              f"   model {hbm/1e3 - have:+.2f} GB ({100 * (hbm/1e3 / have - 1):+.1f}%)")
+        print(f"  measured FETCH_SIZE {have:.2f} GB/token from "
+              f"{measured['file']} ({measured['kernel_gb']:.2f} GB over "
+              f"{measured['tokens']} tokens)")
+        if measured["sig"]:
+            print(f"    dispatch footprint: {measured['sig']}")
+            print("    (compare with results/isa_summary.txt: two profiles with "
+                  "different\n     footprints are two different binaries, and "
+                  "the older one is stale)")
+        print(f"    model {hbm/1e3 - have:+.2f} GB "
+              f"({100 * (hbm/1e3 / have - 1):+.1f}%)")
 
     if timeline:
         print(f"\nlayer {timeline['layer']} critical path {timeline['span_us']:.1f} us")

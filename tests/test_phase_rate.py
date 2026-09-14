@@ -171,6 +171,16 @@ def main() -> int:
                                  - units * 2 * moe_i * h * pr.BF16 / 1e6) < 1e-6,
                              f"{rep['EXPERT_GATE_UP']['hbm']:.1f} MB/layer, "
                              f"{units} units"))
+        heads, qk_nope, lora = (cfg["num_attention_heads"], cfg["qk_nope_head_dim"],
+                                cfg["kv_lora_rank"])
+        want_wuk = (heads * (pr.KV_CHUNKS - 1) * qk_nope * lora * pr.BF16
+                    + heads * pr.SEQ_LEN * (lora + cfg["qk_rope_head_dim"]) * pr.BF16) / 1e6
+        results.append(check("W_UK is charged to the head's chunk tasks",
+                             abs(rep["ATTENTION"]["l2"] - want_wuk) < 1e-6
+                             and abs(rep["ATTENTION"]["hbm"]
+                                     - heads * qk_nope * lora * pr.BF16 / 1e6) < 1e-6,
+                             f"{rep['ATTENTION']['l2']:.1f} MB/layer from L2, "
+                             f"{rep['ATTENTION']['hbm']:.1f} from HBM"))
         want_fold = (h * 4 + pr.XCDS * h * 4) * pr.WORKERS / 1e6
         results.append(check("fold term = x + 8 partials, once per worker",
                              abs(rep["NORM_ROUTER"]["l2"] - want_fold) < 1e-6,
@@ -196,6 +206,15 @@ def main() -> int:
                              l2 > 1.0,
                              f"{l2:.2f} GB/token served from L2, invisible to "
                              f"FETCH_SIZE"))
+        # two profiles in results/ are two different binaries, so the footprint
+        # of the dispatch has to travel with the number
+        if prof.exists():
+            real = pr.parse_fetch_size(prof, tokens=4)
+            results.append(check("the profile carries the dispatch footprint",
+                                 "scr" in real["sig"] and "lds" in real["sig"],
+                                 f"{real['file']}: {real['sig']}"))
+        results.append(check("a profile without those columns has no footprint",
+                             pr.parse_fetch_size(csv, tokens=4)["sig"] == ""))
 
         # ---- the rate and recover arithmetic
         one = {"LM_HEAD": {"tasks": 296, "busy_ms": 40.0, "avg_busy_us": 135.1,
