@@ -56,15 +56,15 @@ struct Weights {
 
 // Per-token activations, allocated once (docs/design.md §5).
 //
-// The residual stream is double-buffered by layer parity: layer L's q/kv_a
-// prologue reads x[(L-1)&1] (plus the 8 expert partials of layer L-1, if it
-// was MoE) and one worker writes the folded value to x[L&1], which o_proj
-// then updates in place. Anything an XCD produces for its own consumption
+// The residual stream x is one buffer: embed writes it, o_proj and the dense
+// down update it in place (each worker its own rows), and the globally last
+// down worker of a MoE layer folds the 8 expert partials into it while every
+// other worker is still waiting on the down event. Anything an XCD produces for its own consumption
 // (kv_a, the normed vector, the routing choice) is per XCD, so those
 // handoffs are XCD-local events and identical values are never written to
 // the same line from two chiplets.
 struct Activations {
-    float* __restrict__ x[2];          // [hidden] each, bf16-valued
+    float* __restrict__ x;             // [hidden], bf16-valued
     float* __restrict__ x_norm;        // [kNumXCDs][hidden] post-attention norm
     float* __restrict__ q;             // [heads * q_head_dim]; XCD k writes its heads'
     float* __restrict__ kv_a;          // [kNumXCDs][kv_lora + qk_rope] raw, pre-norm

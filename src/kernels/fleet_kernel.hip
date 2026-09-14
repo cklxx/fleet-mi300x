@@ -59,9 +59,8 @@ __device__ void task_embed(const ModelDims& d, const Weights& w,
     }
     const int token = act.token_in[tc.tok];
     const __hip_bfloat16* row = w.embed + (int64_t)token * d.hidden;
-    float* x0 = act.x[0];                        // layer 0 reads x[0]
     for (int i = threadIdx.x; i < d.hidden; i += blockDim.x) {
-        x0[i] = __bfloat162float(row[i]);
+        act.x[i] = __bfloat162float(row[i]);
     }
 }
 
@@ -84,37 +83,34 @@ __device__ inline void rms_norm_lds(const ModelDims& d,
 }
 
 // The residual stream at the entry of layer `layer` (or of lm_head when
-// layer == d.layers), into LDS: x of the previous layer plus, if that layer
-// was MoE, the 8 expert partials (HF: bf16 MoE output, bf16 residual add —
-// the retired REDUCE task's arithmetic, now in the consumer's prologue).
-// One worker per layer publishes the folded x to x[layer & 1] for o_proj's
-// residual and the router; every other worker only reads.
-__device__ inline void fold_x(const ModelDims& d, const Activations& act,
-                              const TaskDescriptor& t, int layer, int xcd, int worker,
-                              float* __restrict__ vec, const TokenCtx& tc) {
-    const int src_par = layer == 0 ? 0 : (layer - 1) & 1;
-    const int dst_par = layer & 1;
-    const float* src = act.x[src_par];
-    const bool fold = (t.flags & FLAG_FOLD_PARTIALS) != 0;
-    const bool publish = xcd == 0 && worker == 0 && layer < d.layers && dst_par != src_par;
-    float* dst = act.x[dst_par];
-#pragma unroll 8
-    for (int i = threadIdx.x; i < d.hidden; i += kBlockThreads) {
-        float v = src[i];
-        if (fold) {
-            float acc = 0.f;
-            for (int x = 0; x < kNumXCDs; ++x) acc += act.expert_out[x * d.hidden + i];
-            v = bf16_round(v + bf16_round(acc));
-        }
-        vec[i] = v;
-        if (publish) dst[i] = v;
-    }
-    __syncthreads();
-    // Layer-boundary capture (§6): vec now holds the output of layer-1.
+// layer == d.layers), staged into LDS. x is already folded: the globally
+// last down worker of the previous MoE layer did that (fold_partials).
+__device__ inline void stage_x(const ModelDims& d, const Activations& act, int layer,
+                               int xcd, int worker, float* __restrict__ vec,
+                               const TokenCtx& tc) {
+    stage_vector(act.x, vec, d.hidden);
+    // Layer-boundary capture (§6): vec holds the output of layer-1.
     if (tc.dump && xcd == 0 && worker == 0 && layer > 0) {
         float* out = act.layer_dump + (int64_t)(layer - 1) * d.hidden;
         for (int i = threadIdx.x; i < d.hidden; i += blockDim.x) out[i] = vec[i];
     }
+}
+
+// The retired REDUCE task, done once per layer by the globally last down
+// worker while every other worker waits on the down event: x = bf16(x +
+// bf16(sum of the 8 partials)) — HF's bf16 MoE output and bf16 residual add.
+// The partials came from other XCDs: acquire first (their XCDs' last
+// arrivals flushed them before adding their shares).
+__device__ inline void fold_partials(const ModelDims& d, const Activations& act) {
+    if (threadIdx.x == 0) fence_acquire();
+    __syncthreads();
+#pragma unroll 8
+    for (int i = threadIdx.x; i < d.hidden; i += kBlockThreads) {
+        float acc = 0.f;
+        for (int x = 0; x < kNumXCDs; ++x) acc += act.expert_out[x * d.hidden + i];
+        act.x[i] = bf16_round(act.x[i] + bf16_round(acc));
+    }
+    __syncthreads();
 }
 
 // RMSNorm over the full hidden vector, then this worker's rows of the router
@@ -124,7 +120,7 @@ __device__ inline void fold_x(const ModelDims& d, const Activations& act,
 __device__ void task_norm_router(const ModelDims& d, const Weights& w,
                                  Activations& act, Scratch& s, int layer,
                                  int xcd, int worker, bool moe) {
-    stage_vector(act.x[layer & 1], s.vec, d.hidden);
+    stage_vector(act.x, s.vec, d.hidden);
     rms_norm_lds(d, w.layer_norm_post[layer], s.vec, s.smem);
     if (worker == 0) {
         float* x_norm = act.x_norm + (int64_t)xcd * d.hidden;
@@ -240,7 +236,7 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
         // [3072 + 576, hidden] matrix. RMSNorm (and the fold of the previous
         // layer's expert partials) is recomputed per worker in the prologue.
         case TASK_QKV_FUSED: {
-            fold_x(d, act, t, L, xcd, worker, s.vec, tc);
+            stage_x(d, act, L, xcd, worker, s.vec, tc);
             rms_norm_lds(d, w.layer_norm_in[L], s.vec, s.smem);
             const int q_rows = heads_per_xcd * d.q_head_dim;                // 384
             const int q0 = xcd * q_rows;
@@ -278,8 +274,8 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
         // global event; the residual add is folded into its epilogue.
         case TASK_O_PROJ:
             stage_vector(act.o, s.vec, d.heads * d.v_head);
-            gemv_rows(w.layer_o_proj[L], d.heads * d.v_head, s.vec, act.x[L & 1],
-                      act.x[L & 1], EPI_RESIDUAL, 1.f, d.hidden, d.heads * d.v_head,
+            gemv_rows(w.layer_o_proj[L], d.heads * d.v_head, s.vec, act.x,
+                      act.x, EPI_RESIDUAL, 1.f, d.hidden, d.heads * d.v_head,
                       xcd, kNumXCDs, worker, nw);
             break;
 
@@ -316,13 +312,13 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
         // h is 10944 wide here: read from L2 rather than staged.
         case TASK_DENSE_DOWN:
             gemv_rows(w.layer_dense[L] + (int64_t)2 * d.dense_inter * d.hidden,
-                      d.dense_inter, act.expert_h, act.x[L & 1], act.x[L & 1],
+                      d.dense_inter, act.expert_h, act.x, act.x,
                       EPI_RESIDUAL, 1.f, d.hidden, d.dense_inter, xcd, kNumXCDs,
                       worker, nw);
             break;
 
         case TASK_LM_HEAD:
-            fold_x(d, act, t, d.layers, xcd, worker, s.vec, tc);
+            stage_x(d, act, d.layers, xcd, worker, s.vec, tc);
             rms_norm_lds(d, w.final_norm, s.vec, s.smem);
             gemv_rows(w.lm_head, d.hidden, s.vec, act.logits, nullptr, EPI_BF16,
                       1.f, d.vocab, d.hidden, xcd, kNumXCDs, worker, nw);
@@ -406,11 +402,28 @@ void fleet_decode_step(RuntimeState rt, ModelDims d, Weights w,
             }
             __syncthreads();
 
+            __shared__ uint32_t total_smem;
             if (threadIdx.x == 0) {
+                total_smem = 0;
                 if (do_signal) {
-                    signal_event(rt, tc.epoch, t->signal_event, (EventScope)t->signal_scope,
-                                 xcd, t->signal_xcd_count);
+                    total_smem = signal_event(rt, tc.epoch, t->signal_event,
+                                              (EventScope)t->signal_scope, xcd,
+                                              t->signal_xcd_count);
                 }
+            }
+            __syncthreads();
+            // FOLD_ON_LAST: this workgroup completed the epoch's producer count
+            // (all of them minus the fold's own +1): fold, publish, add the +1.
+            if ((t->flags & FLAG_FOLD_ON_LAST) &&
+                total_smem == tc.epoch * (uint32_t)t->n_split + (tc.epoch - 1)) {
+                if (!rt.smoke) fold_partials(d, act);
+                if (threadIdx.x == 0) {
+                    fence_release();
+                    __hip_atomic_fetch_add(&rt.global_events[t->signal_event], 1u,
+                                           __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+                }
+            }
+            if (threadIdx.x == 0) {
                 if (tc.trace) {
                     uint64_t* tr = rt.trace + (int64_t)t->index * 4;
                     tr[0] = t_start;                                  // began waiting

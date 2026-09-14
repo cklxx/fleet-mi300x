@@ -99,9 +99,12 @@ struct TaskDescriptor {
 static_assert(sizeof(TaskDescriptor) == 64, "descriptor must stay 64 B");
 
 enum TaskFlags : int16_t {
-    FLAG_FOLD_PARTIALS = 1,   // prologue adds the 8 expert partials to the residual
+    FLAG_FOLD_PARTIALS = 1,   // retired
     FLAG_SIGNAL_LAST = 2,     // signal signal_event only as the last of n_split
                               // arrivals on local_event (the merging KV chunk)
+    FLAG_FOLD_ON_LAST = 4,    // the globally last of n_split producers of
+                              // signal_event folds the expert partials into x,
+                              // publishes, and adds the event's final +1
 };
 
 // Device-side state, allocated once by the host.
@@ -298,20 +301,25 @@ __device__ __forceinline__ bool arrive_last(
 // the last-arriver flush 6 us (bench/microbench.hip (f)); the payload test
 // (d) checks the scheme publishes every word. Scheme (ii) (uncached
 // counters) uses the same code path.
-__device__ __forceinline__ void signal_event(
+// Returns the global counter's value after this XCD's share was added, if
+// this call added it; else 0. A caller that sees the epoch's full producer
+// count knows it is the globally last producer (FLAG_FOLD_ON_LAST).
+__device__ __forceinline__ uint32_t signal_event(
         const RuntimeState& rt, uint32_t epoch, int event, EventScope scope,
         int xcd, int xcd_count) {
-    if (event < 0) return;
+    if (event < 0) return 0;
     drain_stores();
     uint32_t* local = &rt.xcd_counters[xcd * kMaxEvents + event];
     const uint32_t old = __hip_atomic_fetch_add(local, 1u, __ATOMIC_RELAXED,
                                                 __HIP_MEMORY_SCOPE_AGENT);
-    if (scope == SCOPE_XCD_LOCAL) return;
+    if (scope == SCOPE_XCD_LOCAL) return 0;
     if (old + 1 == epoch * (uint32_t)xcd_count) {        // last of this XCD's share
         fence_release();
-        __hip_atomic_fetch_add(&rt.global_events[event], (uint32_t)xcd_count,
-                               __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        const uint32_t g = __hip_atomic_fetch_add(&rt.global_events[event], (uint32_t)xcd_count,
+                                                  __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        return g + (uint32_t)xcd_count;
     }
+    return 0;
 }
 
 // wait_event: block until the event has `producers` signals for this epoch.

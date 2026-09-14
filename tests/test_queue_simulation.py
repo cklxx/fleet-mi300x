@@ -108,6 +108,10 @@ def simulate(tasks: list[dict], epochs: int, order: str, seed: int = 0,
                             # the last arrival of this XCD's share adds the share
                             if local[t["xcd"]][e] == epoch * t["signal_xcd_count"]:
                                 glob[e] += t["signal_xcd_count"]
+                                # ...and the globally last one folds x and adds 1
+                                if t["flags"] & Flags.FOLD_ON_LAST and \
+                                        glob[e] == epoch * t["n_split"] + (epoch - 1):
+                                    glob[e] += 1
                     head[w] += 1
                     ran += 1
                     progressed = True
@@ -126,8 +130,13 @@ def simulate(tasks: list[dict], epochs: int, order: str, seed: int = 0,
         for ev in events or []:
             e, want = ev["id"], epoch * ev["producers"]
             got = glob[e] if ev["scope"] == Scope.GLOBAL else max(local[x][e] for x in range(XCDS))
-            if ev["scope"] == Scope.GLOBAL and sum(local[x][e] for x in range(XCDS)) != want:
-                return f"epoch {epoch}: event {e} local arrivals {sum(local[x][e] for x in range(XCDS))} != {want}"
+            if ev["scope"] == Scope.GLOBAL:
+                # the fold's +1 (FOLD_ON_LAST) never touches the local counters
+                fold = any(t["signal_event"] == e and t["flags"] & Flags.FOLD_ON_LAST
+                           for t in tasks)
+                arrivals = sum(local[x][e] for x in range(XCDS))
+                if arrivals != want - (epoch if fold else 0):
+                    return f"epoch {epoch}: event {e} local arrivals {arrivals} != {want}"
             if got != want:
                 return (f"epoch {epoch}: event {e} ({ev['label']}) count {got}, expected {want} "
                         f"— {'over' if got > want else 'under'}-signalled")

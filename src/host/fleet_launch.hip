@@ -548,8 +548,7 @@ int main(int argc, char** argv) {
         }
 
         // activations (§5)
-        act.x[0] = dev_alloc<float>(d.hidden);
-        act.x[1] = dev_alloc<float>(d.hidden);
+        act.x = dev_alloc<float>(d.hidden);
         act.x_norm = dev_alloc<float>((size_t)kNumXCDs * d.hidden);
         act.q = dev_alloc<float>((size_t)d.heads * d.q_head_dim);
         act.kv_a = dev_alloc<float>((size_t)kNumXCDs * (d.kv_lora + d.qk_rope));
@@ -671,8 +670,7 @@ int main(int argc, char** argv) {
             rt.dump_layers = (!smoke && last && i0 == 0) ? 1 : 0;
             rt.trace = (d_trace && last && i0 == 0) ? d_trace : nullptr;
             rt.trace_token = (n > 1) ? 1 : 0;
-            // the launch's activations must not be read from a stale x[]:
-            // every token starts with embed, which writes x[0]
+            // every token starts with embed, which rewrites x
             act.token_in += i0;   act.token_out += i0;   act.token_time += (size_t)2 * i0;
             d.context = context + i0;
             HIP_CHECK(hipMemsetAsync(misc, 0, 16 * sizeof(uint32_t), stream));

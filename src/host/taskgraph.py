@@ -9,8 +9,7 @@ synchronisation.
 Per MoE layer the graph (v0.10, three global events) is
 
     QKV[x] ──xcd──▶ AT[x] ──xcd──▶ MG[x] ──global──▶ OP ──global──▶ RT[x]
-    RT[x] ──xcd──▶ GU[x] ──xcd──▶ DN[x] ──global──▶ next layer's QKV
-                                                     (which folds the 8 partials)
+    RT[x] ──xcd──▶ GU[x] ──xcd──▶ DN[x] (last one folds x) ──global──▶ next QKV
 
 Compared with the v0.9 graph (six global events) the differences are:
   * q/kv_a is head-aligned: XCD k computes the q rows of heads 2k, 2k+1 and
@@ -20,8 +19,9 @@ Compared with the v0.9 graph (six global events) the differences are:
   * the router runs once per XCD as a Chiplet-task (256 KB of weights,
     replicated 8x, spread over 37 CUs), so the experts wait on an XCD-local
     event and pick the top-k themselves;
-  * there is no REDUCE task: the next layer's q/kv_a prologue (and lm_head's)
-    folds the 8 expert partials into the residual stream.
+  * there is no REDUCE task: the globally last down worker of the layer folds
+    the 8 expert partials into x once and publishes it (FOLD_ON_LAST), so x
+    needs no double buffering and no consumer re-reads the partials.
 
 Two granularities are reported. A *logical task* is a node of the graph above.
 A *descriptor* is what a worker dequeues: a CU-task is one descriptor, a
@@ -75,9 +75,12 @@ class TaskKind(IntEnum):
 class Flags(IntFlag):
     """Descriptor flags (TaskDescriptor.flags)."""
     NONE = 0
-    FOLD_PARTIALS = 1   # prologue adds the 8 expert partials to the residual
+    FOLD_PARTIALS = 1   # (retired: the fold is done once, by FOLD_ON_LAST)
     SIGNAL_LAST = 2     # signal signal_event only if this task is the last of
                         # n_split to bump local_event (XCD-local counter)
+    FOLD_ON_LAST = 4    # the globally last of n_split producers of signal_event
+                        # folds the 8 expert partials into x, then adds one more
+                        # to the event (its producer count includes that +1)
 
 
 # Implementation status per task kind, reported because the task spec asks for
@@ -182,16 +185,14 @@ def chiplet_producers(n_xcds: int = XCDS) -> int:
     return n_xcds * WORKERS_PER_XCD
 
 
-def build_qkv(g: Graph, layer: int, prev_event: int | None, fold: bool) -> list[int]:
+def build_qkv(g: Graph, layer: int, prev_event: int | None) -> list[int]:
     """Head-aligned q rows + this XCD's kv_a copy, one Chiplet-task per XCD,
     each signalling its own XCD-local event. Returns the 8 events."""
     events = []
     for xcd in range(XCDS):
         e = g.new_event(Scope.XCD_LOCAL, WORKERS_PER_XCD, f"L{layer}.qkv.x{xcd}")
         g.chiplet_task(Task(TaskKind.QKV_FUSED, layer, xcd, prev_event, e,
-                            Scope.XCD_LOCAL,
-                            flags=Flags.FOLD_PARTIALS if fold else Flags.NONE),
-                       [xcd])
+                            Scope.XCD_LOCAL), [xcd])
         events.append(e)
     return events
 
@@ -221,11 +222,11 @@ def build_attention(g: Graph, layer: int, e_qkv: list[int], cfg: dict) -> int:
 
 
 def build_moe_layer(g: Graph, layer: int, prev_event: int | None,
-                    cfg: dict, fold: bool) -> int:
+                    cfg: dict) -> int:
     """Emit one MoE layer; returns the event the next layer must wait on."""
     top_k = cfg["top_k"]
 
-    e_qkv = build_qkv(g, layer, prev_event, fold)
+    e_qkv = build_qkv(g, layer, prev_event)
     e_merge = build_attention(g, layer, e_qkv, cfg)
 
     # o_proj + residual — needs all 16 heads, so this one is global.
@@ -248,7 +249,10 @@ def build_moe_layer(g: Graph, layer: int, prev_event: int | None,
     # experts: 8 balanced units = top_k routed + shared split in two.
     e_gate_up = [g.new_event(Scope.XCD_LOCAL, WORKERS_PER_XCD,
                              f"L{layer}.gate_up.x{x}") for x in range(XCDS)]
-    e_down = g.new_event(Scope.GLOBAL, chiplet_producers(), f"L{layer}.down")
+    # down: 296 producers plus one — the globally last down worker folds the
+    # 8 partials into x (the retired REDUCE, done once instead of by every
+    # consumer) and adds the +1 after publishing it.
+    e_down = g.new_event(Scope.GLOBAL, chiplet_producers() + 1, f"L{layer}.down")
     for xcd in range(XCDS):
         slot = xcd if xcd < top_k else -(xcd - top_k + 1)  # <0 marks shared half
         g.chiplet_task(Task(TaskKind.EXPERT_GATE_UP, layer, xcd, e_router[xcd],
@@ -257,17 +261,18 @@ def build_moe_layer(g: Graph, layer: int, prev_event: int | None,
     for xcd in range(XCDS):
         slot = xcd if xcd < top_k else -(xcd - top_k + 1)
         g.chiplet_task(Task(TaskKind.EXPERT_DOWN, layer, xcd, e_gate_up[xcd],
-                            e_down, Scope.GLOBAL, expert_slot=slot), [xcd])
-    # The 8 partials are folded by whoever consumes x next (FOLD_PARTIALS).
+                            e_down, Scope.GLOBAL, expert_slot=slot,
+                            n_split=chiplet_producers(), flags=Flags.FOLD_ON_LAST),
+                       [xcd])
     return e_down
 
 
 def build_dense_layer(g: Graph, layer: int, prev_event: int | None,
-                      cfg: dict, fold: bool) -> int:
+                      cfg: dict) -> int:
     """Layer 0: same attention path, dense MLP instead of experts. The dense
     gate_up → down boundary needs the full h[10944], so it is global; the
     residual add is done in place by dense_down, so nothing to fold after."""
-    e_qkv = build_qkv(g, layer, prev_event, fold)
+    e_qkv = build_qkv(g, layer, prev_event)
     e_merge = build_attention(g, layer, e_qkv, cfg)
 
     e_oproj = g.new_event(Scope.GLOBAL, chiplet_producers(), f"L{layer}.o_proj")
@@ -297,18 +302,14 @@ def build_graph(cfg: dict) -> Graph:
     e = g.new_event(Scope.GLOBAL, 1, "embed")
     g.cu_task(Task(TaskKind.EMBED, -1, 0, None, e, Scope.GLOBAL))
 
-    prev_moe = False
     for layer in range(cfg["layers"]):
         if layer < cfg["first_k_dense"]:
-            e = build_dense_layer(g, layer, e, cfg, fold=prev_moe)
-            prev_moe = False
+            e = build_dense_layer(g, layer, e, cfg)
         else:
-            e = build_moe_layer(g, layer, e, cfg, fold=prev_moe)
-            prev_moe = True
+            e = build_moe_layer(g, layer, e, cfg)
 
     e_lm = g.new_event(Scope.GLOBAL, chiplet_producers(), "lm_head")
-    g.chiplet_task(Task(TaskKind.LM_HEAD, -1, -1, e, e_lm, Scope.GLOBAL,
-                        flags=Flags.FOLD_PARTIALS if prev_moe else Flags.NONE),
+    g.chiplet_task(Task(TaskKind.LM_HEAD, -1, -1, e, e_lm, Scope.GLOBAL),
                    range(XCDS))
     e_arg = g.new_event(Scope.GLOBAL, 1, "argmax")
     g.cu_task(Task(TaskKind.ARGMAX, -1, 0, e_lm, e_arg, Scope.GLOBAL))
@@ -358,6 +359,15 @@ def validate(g: Graph) -> list[str]:
             signalled[t.local_event] = signalled.get(t.local_event, 0) + 1
         else:
             signalled[t.signal_event] = signalled.get(t.signal_event, 0) + 1
+    fold_events: set[int] = set()
+    for t in g.tasks:
+        if t.signal_event is not None and t.flags & Flags.FOLD_ON_LAST:
+            if t.n_split != g.events[t.signal_event]["producers"] - 1:
+                errors.append(f"task {t.index}: FOLD_ON_LAST n_split {t.n_split} != "
+                              f"producers - 1 of event {t.signal_event}")
+            fold_events.add(t.signal_event)
+    for e in fold_events:
+        signalled[e] = signalled.get(e, 0) + 1          # the fold's own +1
     for (sig, loc), members in last_groups.items():
         # the group counts as ONE producer of the global event, and its size
         # must equal the local counter's producer count and each member's n_split
@@ -385,9 +395,10 @@ def validate(g: Graph) -> list[str]:
         if t.signal_event is not None and t.signal_scope == Scope.GLOBAL:
             shares.setdefault(t.signal_event, {})[t.xcd] = t.signal_xcd_count
     for e, by_xcd in shares.items():
-        if sum(by_xcd.values()) != g.events[e]["producers"]:
+        want = g.events[e]["producers"] - (1 if e in fold_events else 0)
+        if sum(by_xcd.values()) != want:
             errors.append(f"event {e} ({g.events[e]['label']}): per-XCD shares "
-                          f"{by_xcd} do not sum to {g.events[e]['producers']}")
+                          f"{by_xcd} do not sum to {want}")
 
     for t in g.tasks:
         if t.wait_event is not None:
