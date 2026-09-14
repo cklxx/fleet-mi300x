@@ -313,15 +313,21 @@ __device__ inline void merge_and_uv(
     }
     const float inv_l = 1.f / gl;
 
+    // Partials in batches of 8 chunks: 16 live loads per thread put the
+    // kernel into scratch (48 B/lane); two batches of 8 do not, and the
+    // partials are in this XCD's L2 anyway.
     for (int j = threadIdx.x; j < kv_lora; j += blockDim.x) {
-        float a[kMaxChunks];
-#pragma unroll
-        for (int c = 0; c < kMaxChunks; ++c) {
-            a[c] = c < n_chunks ? partials[c * kPartialStride + 2 + j] : 0.f;
-        }
         float v = 0.f;
 #pragma unroll
-        for (int c = 0; c < kMaxChunks; ++c) v += a[c] * scale_c[c];
+        for (int c0 = 0; c0 < kMaxChunks; c0 += 8) {
+            float a[8];
+#pragma unroll
+            for (int c = 0; c < 8; ++c) {
+                a[c] = c0 + c < n_chunks ? partials[(c0 + c) * kPartialStride + 2 + j] : 0.f;
+            }
+#pragma unroll
+            for (int c = 0; c < 8; ++c) v += a[c] * scale_c[c0 + c];
+        }
         o_c_lds[j] = v * inv_l;
     }
     __syncthreads();

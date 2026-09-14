@@ -182,10 +182,17 @@ __device__ __forceinline__ float block_reduce_ordered(float v, float* smem) {
 // all in flight together instead of paying one round trip each.
 constexpr int kBlockThreads = 256;
 
+// 16-byte loads: 2048 floats are 2 float4 per thread, in flight together —
+// one round trip under load instead of the 8 scalar loads' two. Every
+// staged buffer here is a multiple of 4 floats at a 16-byte offset.
 __device__ __forceinline__ void stage_vector(const float* __restrict__ src,
                                              float* __restrict__ dst, int n) {
-#pragma unroll 8
-    for (int i = threadIdx.x; i < n; i += kBlockThreads) dst[i] = src[i];
+    const int n4 = n >> 2;
+    const float4* s4 = reinterpret_cast<const float4*>(src);
+    float4* d4 = reinterpret_cast<float4*>(dst);
+#pragma unroll 4
+    for (int i = threadIdx.x; i < n4; i += kBlockThreads) d4[i] = s4[i];
+    for (int i = (n4 << 2) + threadIdx.x; i < n; i += kBlockThreads) dst[i] = src[i];
     __syncthreads();
 }
 

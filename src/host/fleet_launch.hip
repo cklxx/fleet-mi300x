@@ -225,17 +225,6 @@ static T* dev_alloc(size_t n) {
     return p;
 }
 
-// Uncached (MTYPE UC) device memory: no L2 on any XCD ever holds a line of
-// it, so a cross-XCD handshake over it needs no writeback or invalidate.
-template <typename T>
-static T* dev_alloc_uc(size_t n, bool uncached) {
-    if (!uncached) return dev_alloc<T>(n);
-    T* p = nullptr;
-    HIP_CHECK(hipExtMallocWithFlags((void**)&p, std::max<size_t>(1, n) * sizeof(T),
-                                    hipDeviceMallocUncached));
-    HIP_CHECK(hipMemset(p, 0, std::max<size_t>(1, n) * sizeof(T)));
-    return p;
-}
 
 template <typename T>
 static T* dev_upload(const std::vector<T>& v) {
@@ -504,9 +493,9 @@ int main(int argc, char** argv) {
     d.layers = 1;   // smoke mode: harmless defaults
 
     // Token arrays exist in every mode; the smoke run just never reads them.
-    act.token_in = dev_alloc_uc<int32_t>(tokens + 1, false);
-    act.token_out = dev_alloc_uc<int32_t>(tokens, false);
-    act.token_time = dev_alloc_uc<uint64_t>((size_t)tokens * 2, false);
+    act.token_in = dev_alloc<int32_t>(tokens + 1);
+    act.token_out = dev_alloc<int32_t>(tokens);
+    act.token_time = dev_alloc<uint64_t>((size_t)tokens * 2);
 
     if (!smoke) {
         const Manifest m = load_manifest(weights_path + ".manifest");
@@ -580,21 +569,19 @@ int main(int argc, char** argv) {
         }
 
         // activations (§5)
-        // (dev_alloc_uc's MTYPE-UC path is kept for experiments only: bench
-        // (d'') showed it is not fence-free here; --coherent-acts uses atomics)
-        act.x[0] = dev_alloc_uc<float>(d.hidden, false);
-        act.x[1] = dev_alloc_uc<float>(d.hidden, false);
+        act.x[0] = dev_alloc<float>(d.hidden);
+        act.x[1] = dev_alloc<float>(d.hidden);
         act.x_norm = dev_alloc<float>((size_t)kNumXCDs * d.hidden);
         act.q = dev_alloc<float>((size_t)d.heads * d.q_head_dim);
         act.kv_a = dev_alloc<float>((size_t)kNumXCDs * (d.kv_lora + d.qk_rope));
         act.attn_partial = dev_alloc<float>((size_t)d.heads * kv_chunks * kPartialStride);
         act.o = dev_alloc<float>((size_t)d.heads * d.v_head);
         act.expert_h = dev_alloc<float>(std::max((size_t)kNumXCDs * d.moe_inter, (size_t)d.dense_inter));
-        act.expert_out = dev_alloc_uc<float>((size_t)kNumXCDs * d.hidden, false);
-        act.oproj_partial = dev_alloc_uc<float>((size_t)kNumXCDs * d.hidden, false);
-        act.logits = dev_alloc_uc<float>(d.vocab, false);
-        act.argmax_val = dev_alloc_uc<float>((size_t)kNumXCDs * kWorkersPerXCD, false);
-        act.argmax_idx = dev_alloc_uc<int32_t>((size_t)kNumXCDs * kWorkersPerXCD, false);
+        act.expert_out = dev_alloc<float>((size_t)kNumXCDs * d.hidden);
+        act.oproj_partial = dev_alloc<float>((size_t)kNumXCDs * d.hidden);
+        act.logits = dev_alloc<float>(d.vocab);
+        act.argmax_val = dev_alloc<float>((size_t)kNumXCDs * kWorkersPerXCD);
+        act.argmax_idx = dev_alloc<int32_t>((size_t)kNumXCDs * kWorkersPerXCD);
         act.router_logits = dev_alloc<float>((size_t)kNumXCDs * d.n_routed);
         act.layer_dump = dev_alloc<float>((size_t)d.layers * d.hidden);
 

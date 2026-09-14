@@ -109,7 +109,6 @@ enum TaskFlags : int16_t {
     FLAG_FOLD_PARTIALS = 1,   // prologue folds the 8 expert partials into the residual
     FLAG_SIGNAL_LAST = 2,     // signal signal_event only as the last of n_split
                               // arrivals on local_event (the merging KV chunk)
-    FLAG_FOLD_ON_LAST = 4,    // retired (one-writer fold measured slower, STATUS.md)
     FLAG_CHUNK_SIGNAL = 8,    // gate_up: each wave bumps XCD-local counter
                               // local_event + c when its rows of K-chunk c are
                               // stored; kv_chunk = number of chunks
@@ -357,7 +356,7 @@ __device__ __forceinline__ bool arrive_last(
 // counters) uses the same code path.
 // Returns the global counter's value after this XCD's share was added, if
 // this call added it; else 0. A caller that sees the epoch's full producer
-// count knows it is the globally last producer (FLAG_FOLD_ON_LAST).
+// count knows it is the globally last producer (unused today; kept for diagnostics).
 __device__ __forceinline__ uint32_t signal_event(
         const RuntimeState& rt, uint32_t epoch, int event, EventScope scope,
         int xcd, int xcd_count) {

@@ -29,7 +29,7 @@ namespace fleet {
 // The expert down reuses s.part as its fp32 accumulator over K-chunks.
 static_assert(kWaves * kPartialStride >= kMaxHidden, "s.part must hold hidden floats");
 
-struct Scratch {
+struct __attribute__((aligned(16))) Scratch {
     float smem[kBlock];                          // block reductions
     float vec[kMaxHidden];                       // staged GEMV operand / folded x
     float row[kMaxKvLora + kMaxQkRope];          // this token's cache row
@@ -102,20 +102,46 @@ __device__ inline void stage_residual(const ModelDims& d, const float* __restric
                                       const float* __restrict__ partials,
                                       float* __restrict__ dst, float* __restrict__ vec,
                                       int xcd, int worker, bool coh) {
-    if (partials == nullptr) {
+    if (coh) {
+        // coherent mode: per-element agent-scope atomic loads (no 16-byte form)
+        if (partials == nullptr) {
 #pragma unroll 8
-        for (int i = threadIdx.x; i < d.hidden; i += kBlockThreads) vec[i] = ld_coh(src + i, coh);
-        __syncthreads();
-    } else {
-        // 36 independent loads per thread in flight (unroll 4 of 9 loads):
-        // two round trips under load, ~7 us. Fully unrolling the 72 loads
-        // to make it one round trip spilled 48 B/lane and cost 0.1 ms/token.
+            for (int i = threadIdx.x; i < d.hidden; i += kBlockThreads) vec[i] = ld_coh(src + i, true);
+        } else {
 #pragma unroll 4
-        for (int i = threadIdx.x; i < d.hidden; i += kBlockThreads) {
-            float acc = 0.f;
+            for (int i = threadIdx.x; i < d.hidden; i += kBlockThreads) {
+                float acc = 0.f;
 #pragma unroll
-            for (int x = 0; x < kNumXCDs; ++x) acc += ld_coh(partials + x * d.hidden + i, coh);
-            vec[i] = bf16_round(ld_coh(src + i, coh) + bf16_round(acc));
+                for (int x = 0; x < kNumXCDs; ++x) acc += ld_coh(partials + x * d.hidden + i, true);
+                vec[i] = bf16_round(ld_coh(src + i, true) + bf16_round(acc));
+            }
+        }
+        __syncthreads();
+    } else if (partials == nullptr) {
+        stage_vector(src, vec, d.hidden);
+    } else {
+        // 16-byte loads: 2 x (8 partials + x) = 18 loads per thread, all in
+        // flight — one round trip under load (the scalar version's 72 loads
+        // took two, ~7 us, and fully unrolled they spilled).
+        const int n4 = d.hidden >> 2;
+        const float4* s4 = reinterpret_cast<const float4*>(src);
+        const float4* p4 = reinterpret_cast<const float4*>(partials);
+        float4* v4 = reinterpret_cast<float4*>(vec);
+#pragma unroll
+        for (int i = threadIdx.x; i < n4; i += kBlockThreads) {
+            float4 acc = p4[i];
+#pragma unroll
+            for (int x = 1; x < kNumXCDs; ++x) {
+                const float4 q = p4[x * n4 + i];
+                acc.x += q.x; acc.y += q.y; acc.z += q.z; acc.w += q.w;
+            }
+            const float4 xs = s4[i];
+            float4 r;
+            r.x = bf16_round(xs.x + bf16_round(acc.x));
+            r.y = bf16_round(xs.y + bf16_round(acc.y));
+            r.z = bf16_round(xs.z + bf16_round(acc.z));
+            r.w = bf16_round(xs.w + bf16_round(acc.w));
+            v4[i] = r;
         }
         __syncthreads();
     }

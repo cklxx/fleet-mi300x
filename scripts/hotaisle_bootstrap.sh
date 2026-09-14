@@ -56,14 +56,12 @@ cp build/compile.log results/kernel_resource_usage.txt
 hipcc --offload-arch=gfx942 -O3 -std=c++17 -DFLEET_NT_WEIGHTS=1 -Isrc \
   src/host/fleet_launch.hip src/kernels/fleet_kernel.hip -o build/fleet_decode_nt 2>&1 | grep -E "error"
 for c in 16 8 4 1; do python3 src/host/taskgraph.py --kv-chunks $c --emit build/taskgraph_d$c.bin | tail -1; done
-python3 src/host/taskgraph.py --kv-chunks 8 --prefetch --emit build/taskgraph_d8_prefetch.bin | tail -1
 
 log "microbench"
-./build/microbench --json results/microbench.json 2>&1 | tee results/microbench_summary.txt | grep -E "PASS|FAIL|median" | head -12
+./build/microbench --json results/microbench.json 2>&1 | tee results/microbench_summary.txt | grep -E "PASS|FAIL|INFO|median" | head -14
 
-log "smoke"
+log "smoke (protocol only)"
 ./build/fleet_decode --graph $GRAPH --smoke --tokens 8 2>&1 | grep -E "placement|launch of|per-token|abort|error"
-./build/fleet_decode --graph build/taskgraph_d8_prefetch.bin --smoke --tokens 8 2>&1 | grep -E "per-token|abort|error"
 ./build/fleet_decode --graph $GRAPH --smoke --tokens 8 --coherent-acts 2>&1 | grep -E "per-token|abort|error"
 
 log "waiting for the model"
@@ -74,46 +72,45 @@ python3 src/host/reference_run.py --model "$MODEL" --out build/golden.npz 2>&1 |
 log "pack weights"
 python3 src/host/pack_weights.py --model "$MODEL" --out build/weights.bin 2>&1 | tail -2
 
-log "decode: teacher-forced, one launch for all tokens"
-./build/fleet_decode --graph $GRAPH --teacher-force --repeat 2 --json results/decode_d8_teacher.json 2>&1 | grep -vE "^  layer" | tail -12
-log "decode: free-running, one launch, with trace"
-./build/fleet_decode --graph $GRAPH --repeat 2 --json results/decode_d8_free.json --trace results/trace_d8.bin 2>&1 | grep -vE "^  layer" | tail -30
+BIN=./build/fleet_decode_nt      # non-temporal weight loads: the headline binary
+log "decode: teacher-forced, one launch for all tokens (fenced protocol)"
+$BIN --graph $GRAPH --teacher-force --repeat 2 --json results/decode_teacher.json 2>&1 | grep -vE "^  layer" | tail -6
+log "decode: free-running, one launch, with trace (fenced protocol) -- the headline run"
+$BIN --graph $GRAPH --repeat 3 --json results/decode_free.json --trace results/trace_free.bin 2>&1 | grep -vE "^  layer" | tail -22 | tee results/trace_free_summary.txt
+python3 scripts/trace_timeline.py results/trace_free.bin $GRAPH --layer 5 | tee results/timeline_free_L5.txt
 
-# ---- the §12 matrix: every variant is a full 32-token free-running decode
-# checked against the golden tokens and the 27 layer boundaries (exit 0 only
-# if all match). Columns: binary x graph x --coherent-acts x prefetch loads.
-log "matrix"
+# ---- variants: each a full 32-token free-running decode checked against
+# the golden tokens and the 27 layer boundaries (exit 0 only if all match)
+log "variants"
 run_variant() {   # name binary graph extra-args...
   local name=$1 bin=$2 graph=$3; shift 3
-  printf '%-22s ' "$name"
-  "$bin" --graph "$graph" --repeat 2 --json "results/decode_v11_$name.json" "$@" > "results/decode_v11_$name.log" 2>&1
+  printf '%-18s ' "$name"
+  "$bin" --graph "$graph" --repeat 2 --json "results/decode_$name.json" "$@" > "results/decode_$name.log" 2>&1
   local rc=$?
-  grep -E "^per-token" "results/decode_v11_$name.log" | tail -1 | sed -E 's/per-token latency \(embed -> argmax on device\): //' | tr -d '\n'
-  echo "   exit=$rc  $(grep -E '^tokens:' "results/decode_v11_$name.log" | tail -1)  $(grep -cE '^  layer.* ok' "results/decode_v11_$name.log") layers ok"
+  grep -E "^per-token" "results/decode_$name.log" | tail -1 | sed -E 's/per-token latency \(embed -> argmax on device\): //' | tr -d '\n'
+  echo "   exit=$rc  $(grep -E '^tokens:' "results/decode_$name.log" | tail -1)  $(grep -E 'consecutive layers' "results/decode_$name.log" | tail -1)"
 }
-run_variant base        ./build/fleet_decode    build/taskgraph_d8.bin
-run_variant coherent    ./build/fleet_decode    build/taskgraph_d8.bin          --coherent-acts
-run_variant nt          ./build/fleet_decode_nt build/taskgraph_d8.bin
-run_variant prefetch    ./build/fleet_decode    build/taskgraph_d8_prefetch.bin
-FLEET_PREFETCH_NT=1 run_variant prefetch_ntload ./build/fleet_decode build/taskgraph_d8_prefetch.bin
-run_variant nt_prefetch ./build/fleet_decode_nt build/taskgraph_d8_prefetch.bin
-run_variant all         ./build/fleet_decode_nt build/taskgraph_d8_prefetch.bin --coherent-acts
-run_variant coherent_nt ./build/fleet_decode_nt build/taskgraph_d8.bin          --coherent-acts
+python3 src/host/taskgraph.py --kv-chunks 16 --k-chunk 512 --emit build/taskgraph_d16_k512.bin | tail -1
+python3 src/host/taskgraph.py --kv-chunks 16 --prefetch --emit build/taskgraph_d16_prefetch.bin | tail -1
+run_variant nt_d16_fenced    $BIN                 build/taskgraph_d16.bin
+run_variant nt_d16_coherent  $BIN                 build/taskgraph_d16.bin          --coherent-acts
+run_variant nt_d16_fenced_b  $BIN                 build/taskgraph_d16.bin
+run_variant nt_d16_coherent_b $BIN                build/taskgraph_d16.bin          --coherent-acts
+run_variant plain_d16        ./build/fleet_decode build/taskgraph_d16.bin
+run_variant nt_d8            $BIN                 build/taskgraph_d8.bin
+run_variant nt_d16_kchunk512 $BIN                 build/taskgraph_d16_k512.bin
+run_variant nt_d16_prefetch  $BIN                 build/taskgraph_d16_prefetch.bin
+run_variant nt_d16_v1        $BIN                 build/taskgraph_d16.bin          --tokens-per-launch 1
 
-log "trace of the base and the all-in variant"
-./build/fleet_decode --graph $GRAPH --repeat 1 --trace results/trace_v11_base.bin 2>&1 | grep -vE "^  layer" | tail -22 > results/trace_v11_base_summary.txt
-./build/fleet_decode_nt --graph build/taskgraph_d8_prefetch.bin --coherent-acts --repeat 1 --trace results/trace_v11_all.bin 2>&1 | grep -vE "^  layer" | tail -22 > results/trace_v11_all_summary.txt
-tail -18 results/trace_v11_base_summary.txt
-
-log "bytes actually fetched (rocprofv3 FETCH_SIZE, 4 tokens, base binary)"
+log "bytes actually fetched (rocprof, 4 tokens, teacher-forced): best effort, rocprofv3 --kernel-trace segfaulted on ROCm 7.2.4"
 if command -v rocprofv3 >/dev/null 2>&1; then
-  rocprofv3 --pmc FETCH_SIZE --kernel-trace -d results/prof_base -o base --output-format csv -- \
-    ./build/fleet_decode --graph $GRAPH --tokens 4 --teacher-force > results/prof_base.log 2>&1
-  find results/prof_base -name "*counter_collection.csv" | head -1 | xargs -I{} sh -c "head -3 {}; grep -c fleet_decode_step {}"
-else
-  echo "rocprofv3 not installed"
+  timeout 600 rocprofv3 --pmc FETCH_SIZE -d results/prof -o fetch --output-format csv -- \
+    $BIN --graph $GRAPH --tokens 4 --teacher-force > results/prof_fetch.log 2>&1 && \
+    find results/prof -name "*counter_collection.csv" | head -1 | xargs -I{} sh -c 'grep fleet_decode_step {} | head -3 | cut -c1-200' || echo "rocprofv3 failed (see results/prof_fetch.log)"
 fi
-
-log "decode: free-running, one launch per token (v1, for the comparison)"
-./build/fleet_decode --graph $GRAPH --tokens-per-launch 1 --repeat 2 --json results/decode_d8_v1.json 2>&1 | grep -E "per-token|wall time|tokens:"
+if command -v rocprof >/dev/null 2>&1; then
+  printf 'pmc : FETCH_SIZE\n' > /tmp/fetch.txt
+  timeout 600 rocprof -i /tmp/fetch.txt -o results/prof_fetch_v1.csv $BIN --graph $GRAPH --tokens 4 --teacher-force > results/prof_fetch_v1.log 2>&1 && \
+    grep -i fleet_decode_step results/prof_fetch_v1.csv | head -3 | cut -c1-200 || echo "rocprof v1 failed (see results/prof_fetch_v1.log)"
+fi
 echo "BOOTSTRAP-DONE"

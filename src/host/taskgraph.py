@@ -87,8 +87,6 @@ class Flags(IntFlag):
     FOLD_PARTIALS = 1   # prologue folds the 8 expert partials into the residual
     SIGNAL_LAST = 2     # signal signal_event only if this task is the last of
                         # n_split to bump local_event (XCD-local counter)
-    FOLD_ON_LAST = 4    # retired: one-writer fold by the last arriver (measured
-                        # slower than every consumer folding in parallel)
     CHUNK_SIGNAL = 8    # gate_up: every wave bumps local_event + c as soon as
                         # its rows of K-chunk c are stored (kv_chunk chunks)
     CHUNK_WAIT = 16     # down: waits local_event + c (c >= 1) inside the body,
