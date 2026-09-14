@@ -166,6 +166,9 @@ struct RuntimeState {
                             //     invalidate except for done_event and
                             //     fenced_events (producers still write back)
     int32_t  prefetch_nt;   // 1 = TASK_PREFETCH uses non-temporal loads
+    int32_t  prefetch_next; // 1 = before waiting on a task's event, touch the
+                            //     first 32 KB of the weights it will stream
+                            //     (cross-task prefetch, design.md §12)
     int32_t  fenced_events[4];  // events whose payload is cached and cross-XCD
                                 // even with coherent_acts (dense gate_up); -1 = none
 

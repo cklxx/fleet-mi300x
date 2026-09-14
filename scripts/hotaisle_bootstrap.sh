@@ -107,6 +107,8 @@ run_variant nt_d16_kchunk512 $BIN                 build/taskgraph_d16_k512.bin
 run_variant nt_d16_prefetch  $BIN                 build/taskgraph_d16_prefetch.bin
 run_variant nt_d16_v1        $BIN                 build/taskgraph_d16.bin          --tokens-per-launch 1
 run_variant nt_d16_kvarep    $BIN                 build/taskgraph_d16_kvarep.bin
+run_variant nt_d16_pfnext    $BIN                 build/taskgraph_d16.bin          --prefetch-next
+run_variant nt_d16_pfnext_b  $BIN                 build/taskgraph_d16.bin          --prefetch-next
 run_variant nt_d16_split18_k512 $BIN              build/taskgraph_d16_split18_k512.bin
 run_variant nt_d16_split18   $BIN                 build/taskgraph_d16_split18.bin
 run_variant nt_d16_split22_k512 $BIN              build/taskgraph_d16_split22_k512.bin

@@ -361,7 +361,7 @@ int main(int argc, char** argv) {
     std::string hidden_path = "build/golden_hidden.bin";
     std::string json_path, dump_path, trace_path;
     int tokens = 32, context = 1024, first_token = -1, per_launch = 0, repeat = 1;
-    bool smoke = false, teacher = false, coherent_acts = false;
+    bool smoke = false, teacher = false, coherent_acts = false, prefetch_next = false;
     uint32_t spin_limit = 1u << 22;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -383,6 +383,7 @@ int main(int argc, char** argv) {
         else if (a == "--smoke") smoke = true;
         else if (a == "--teacher-force") teacher = true;
         else if (a == "--coherent-acts") coherent_acts = true;
+        else if (a == "--prefetch-next") prefetch_next = true;
         else die("unknown argument " + a);
     }
     if (per_launch <= 0 || per_launch > tokens) per_launch = tokens;
@@ -480,6 +481,7 @@ int main(int argc, char** argv) {
         }
     }
     rt.prefetch_nt = std::getenv("FLEET_PREFETCH_NT") != nullptr ? 1 : 0;
+    rt.prefetch_next = prefetch_next ? 1 : 0;
     rt.epoch0 = 1;
     rt.n_tokens = per_launch;
     uint64_t* d_trace = trace_path.empty() ? nullptr : dev_alloc<uint64_t>(tasks.size() * 4);

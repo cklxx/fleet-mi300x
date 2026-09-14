@@ -162,6 +162,112 @@ __device__ inline void dump_layer(const ModelDims& d, const Activations& act, in
     }
 }
 
+// Cross-task prefetch (design.md §12): the weights a task streams do not
+// depend on the event it waits for (except a routed expert's), so before
+// the wait every thread issues 8 x 16 B loads of the task's first rows —
+// 32 KB per workgroup, this worker's own first rows in the row partition —
+// keeps them in registers across the wait and consumes them after it. The
+// task's first loads then hit L2 (or the Infinity Cache if the wait was
+// long). Rows are described as (base, bytes per row, stride between this
+// worker's rows, row count); chunk c of the 2048 touches row c / per_row.
+struct PrefetchPlan { const char* base; int64_t row_bytes, stride, rows; };
+
+__device__ inline PrefetchPlan prefetch_plan(const TaskDescriptor& t, const ModelDims& d,
+                                            const Weights& w, int xcd, int worker) {
+    PrefetchPlan p;
+    p.base = reinterpret_cast<const char*>(w.embed);   // harmless default (0 rows)
+    p.row_bytes = 16; p.stride = 0; p.rows = 0;
+    const int L = t.layer;
+    const int nw = kWorkersPerXCD;
+    const int64_t hb = (int64_t)d.hidden * 2;          // bytes of a K = hidden row
+    switch (t.kind) {
+        case TASK_QKV_FUSED: {
+            const int q0 = xcd * (d.heads / kNumXCDs) * d.q_head_dim;
+            p.base = reinterpret_cast<const char*>(w.layer_qkv[L]) + (int64_t)(q0 + worker) * hb;
+            p.row_bytes = hb; p.stride = (int64_t)nw * hb; p.rows = 8;
+            break;
+        }
+        case TASK_ATTENTION: {   // W_UK of the head: 32 of its 128 rows
+            const int64_t rs = (int64_t)(d.qk_nope + d.v_head) * d.kv_lora * 2;
+            p.base = reinterpret_cast<const char*>(w.layer_kv_b[L]) + (int64_t)t.head * rs;
+            p.row_bytes = (int64_t)d.kv_lora * 2; p.stride = p.row_bytes; p.rows = 32;
+            break;
+        }
+        case TASK_MERGE_UV: {    // this task's W_UV rows
+            const int rows = d.v_head / max(1, (int)t.n_split);
+            const int64_t rs = (int64_t)(d.qk_nope + d.v_head) * d.kv_lora * 2;
+            p.base = reinterpret_cast<const char*>(w.layer_kv_b[L]) + (int64_t)t.head * rs
+                     + (int64_t)(d.qk_nope + t.kv_chunk * rows) * d.kv_lora * 2;
+            p.row_bytes = (int64_t)d.kv_lora * 2; p.stride = p.row_bytes; p.rows = rows;
+            break;
+        }
+        case TASK_O_PROJ: {      // K-split: 512 B of each of this worker's rows
+            const int kc = d.heads * d.v_head / kNumXCDs;
+            p.base = reinterpret_cast<const char*>(w.layer_o_proj[L])
+                     + (int64_t)worker * d.heads * d.v_head * 2 + (int64_t)xcd * kc * 2;
+            p.row_bytes = (int64_t)kc * 2; p.stride = (int64_t)nw * d.heads * d.v_head * 2; p.rows = 64;
+            break;
+        }
+        case TASK_NORM_ROUTER: {
+            if (L >= d.first_k_dense) {
+                p.base = reinterpret_cast<const char*>(w.layer_router[L]) + (int64_t)worker * hb;
+                p.row_bytes = hb; p.stride = (int64_t)nw * hb; p.rows = 2;
+            }
+            break;
+        }
+        case TASK_EXPERT_GATE_UP:
+        case TASK_EXPERT_DOWN: {  // only the shared halves have a static address
+            if (t.expert_slot < 0) {
+                const int half = -t.expert_slot - 1;
+                const int shared_inter = 2 * d.moe_inter, rows = d.moe_inter;
+                const char* sh = reinterpret_cast<const char*>(w.layer_shared[L]);
+                if (t.kind == TASK_EXPERT_GATE_UP) {
+                    p.base = sh + (int64_t)half * 2 * rows * hb + (int64_t)2 * worker * hb;
+                    p.row_bytes = 2 * hb; p.stride = (int64_t)2 * nw * hb; p.rows = 4;
+                } else {
+                    p.base = sh + (int64_t)2 * shared_inter * hb + (int64_t)half * rows * 2
+                             + (int64_t)worker * shared_inter * 2;
+                    p.row_bytes = (int64_t)rows * 2; p.stride = (int64_t)nw * shared_inter * 2; p.rows = 12;
+                }
+            }
+            break;
+        }
+        case TASK_DENSE_GATE_UP: {
+            const RowSlice sl = xcd_rows(d.dense_inter, xcd, kNumXCDs);
+            p.base = reinterpret_cast<const char*>(w.layer_dense[L]) + (int64_t)2 * (sl.begin + worker) * hb;
+            p.row_bytes = 2 * hb; p.stride = (int64_t)2 * nw * hb; p.rows = 4;
+            break;
+        }
+        case TASK_DENSE_DOWN: {
+            const RowSlice sl = xcd_rows(d.hidden, xcd, kNumXCDs);
+            p.base = reinterpret_cast<const char*>(w.layer_dense[L]) + (int64_t)2 * d.dense_inter * hb
+                     + (int64_t)(sl.begin + worker) * d.dense_inter * 2;
+            p.row_bytes = 4096; p.stride = (int64_t)nw * d.dense_inter * 2; p.rows = 8;
+            break;
+        }
+        case TASK_LM_HEAD: {
+            const RowSlice sl = xcd_rows(d.vocab, xcd, kNumXCDs);
+            p.base = reinterpret_cast<const char*>(w.lm_head) + (int64_t)(sl.begin + worker) * hb;
+            p.row_bytes = hb; p.stride = (int64_t)nw * hb; p.rows = 8;
+            break;
+        }
+        default: break;
+    }
+    return p;
+}
+
+// Issue this thread's 8 touch loads for the plan (unconditional, clamped).
+__device__ __forceinline__ void prefetch_issue(const PrefetchPlan& p, uint4* pf) {
+    const int64_t per_row = max((int64_t)1, p.row_bytes / 16);
+#pragma unroll
+    for (int u = 0; u < 8; ++u) {
+        const int64_t c = (int64_t)u * kBlockThreads + threadIdx.x;
+        int64_t row = c / per_row, col = c - row * per_row;
+        if (row >= p.rows) { row = 0; col = 0; }   // clamped: touches the first chunk again
+        pf[u] = *reinterpret_cast<const uint4*>(p.base + row * p.stride + col * 16);
+    }
+}
+
 // Touch [p, p + bytes) with 16-byte loads, 8 in flight per thread, results
 // folded into a value the asm sink keeps alive (nothing else does).
 __device__ inline void prefetch_bytes(const void* p, int64_t bytes, bool nt) {
@@ -210,12 +316,17 @@ __device__ void task_norm_router(const ModelDims& d, const Weights& w,
 // lane (max, sum and each argmax pick are shuffle reductions), into LDS.
 // Run by every expert task of the XCD: 64 floats, deterministic, and it
 // saves a task and an event. Ties go to the lower index (torch.topk order).
-__device__ inline void select_experts(const ModelDims& d, const float* __restrict__ logits,
-                                      int* __restrict__ ids, float* __restrict__ ws) {
+__device__ inline float load_logit(const ModelDims& d, const float* __restrict__ logits) {
+    const int lane = threadIdx.x;
+    return (lane < kWaveLanes && lane < d.n_routed) ? logits[lane] : -INFINITY;
+}
+
+// `v`: this lane's logit (wave 0), from load_logit.
+__device__ inline void select_experts_from(const ModelDims& d, float v,
+                                           int* __restrict__ ids, float* __restrict__ ws) {
     if (threadIdx.x < kWaveLanes) {
         const int lane = threadIdx.x;
         const bool valid = lane < d.n_routed;
-        float v = valid ? logits[lane] : -INFINITY;
         float mx = v;
 #pragma unroll
         for (int off = kWaveLanes / 2; off; off >>= 1) mx = fmaxf(mx, __shfl_xor(mx, off, kWaveLanes));
@@ -236,6 +347,11 @@ __device__ inline void select_experts(const ModelDims& d, const float* __restric
         }
     }
     __syncthreads();
+}
+
+__device__ inline void select_experts(const ModelDims& d, const float* __restrict__ logits,
+                                      int* __restrict__ ids, float* __restrict__ ws) {
+    select_experts_from(d, load_logit(d, logits), ids, ws);
 }
 
 // Greedy pick over the bf16 logits (lm_head writes them bf16-rounded, as HF's
@@ -466,12 +582,17 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
         }
 
         case TASK_EXPERT_GATE_UP: {
-            select_experts(d, act.router_logits + (int64_t)xcd * d.n_routed, s.ids, s.ws);
+            {   // the 64-logit read from this XCD's L2 measured ~5 us under full
+                // streaming load; the stage stamp brackets the load alone
+                const float v = load_logit(d, act.router_logits + (int64_t)xcd * d.n_routed);
+                __builtin_amdgcn_s_waitcnt(0);
+                FLEET_STAMP_STAGE();
+                select_experts_from(d, v, s.ids, s.ws);
+            }
             const ExpertUnit u = resolve_unit(
                 t.expert_slot, w.layer_experts[L], w.layer_shared[L],
                 s.ids, s.ws, d.routed_scaling, d.hidden, d.moe_inter, d.moe_inter * 2,
                 w.expert_stride);
-            FLEET_STAMP_STAGE();   // after routing + resolve, before the 8 KB stage
             stage_vector(act.x_norm + (int64_t)xcd * d.hidden, s.vec, d.hidden);
             FLEET_STAMP();
             uint32_t* chunk_counters = (t.flags & FLAG_CHUNK_SIGNAL)
@@ -591,6 +712,10 @@ void fleet_decode_step(RuntimeState rt, ModelDims d, Weights w,
             const TaskDescriptor* t = fetch_task(rt, xcd, worker, slot);
             if (t == nullptr) break;
 
+            // cross-task prefetch: in flight across the wait, consumed after
+            uint4 pf[8];
+            if (rt.prefetch_next) prefetch_issue(prefetch_plan(*t, d, w, xcd, worker), pf);
+
             uint64_t t_start = 0, t_ready = 0;
             if (threadIdx.x == 0) {
                 if (tc.trace) t_start = __builtin_amdgcn_s_memrealtime();
@@ -608,6 +733,12 @@ void fleet_decode_step(RuntimeState rt, ModelDims d, Weights w,
                 if (tc.trace) t_ready = __builtin_amdgcn_s_memrealtime();
             }
             __syncthreads();
+            if (rt.prefetch_next) {
+                uint32_t sink = 0;
+#pragma unroll
+                for (int u = 0; u < 8; ++u) sink ^= pf[u].x;
+                asm volatile("" :: "v"(sink));
+            }
             if (!ok_smem) { stop = true; break; }   // abort raised somewhere
 
             bool do_signal = true;
