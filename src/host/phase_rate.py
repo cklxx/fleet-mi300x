@@ -9,35 +9,44 @@ divides one by the other and ranks the phases by the time still on the table.
 
 Three numbers come out of it, and they answer different questions:
 
-    worker GB/s    bytes / aggregate worker-time for that kind. Compare with
-                   the same code in isolation (bench/microbench.hip (f)); a
-                   phase far below the ceiling loses time inside the task
+    worker GB/s    bytes moved / aggregate worker-time for that kind. Compare
+                   with the same code in isolation (bench/microbench.hip (f));
+                   a phase far below the ceiling loses time inside the task
                    body, not in the schedule.
 
-    phase TB/s     this kind's bytes for one layer / the time the layer spent
-                   in that phase (needs --timeline). This is the rate the
-                   phase actually delivers while every other phase waits.
+    phase TB/s     this kind's HBM bytes for one layer / the time the layer
+                   spent in that phase (needs --timeline).
 
     recover ms     aggregate worker-time that would disappear if this kind
                    reached the reference rate, divided by the 296 workers that
-                   share it — i.e. an upper bound on the token time it can
-                   give back. Upper bound, because a phase only pays out if it
-                   is on the critical path.
+                   share it — an upper bound on the token time it can give
+                   back, because a phase only pays out if it is on the
+                   critical path.
+
+Bytes are counted on the side they are served from, because the two sides are
+not the same thing and only one of them is what rocprof's FETCH_SIZE measures:
+
+    HBM  a cold read: weights, the embedding row. FETCH_SIZE sees these.
+    L2   a read of something another task just wrote: the folded partials, the
+         shared MLA cache rows, the attention partials the merge consumes.
+         These cost the worker time but never leave the chip, so they must not
+         be charged against the FETCH_SIZE reconciliation.
 
 The byte model is written out term by term below, each traced to the kernel's
-row ranges, and reconciled against rocprofv3 FETCH_SIZE, so a wrong term shows
-up as a visible gap instead of hiding inside a total.
+row ranges and flag bits, and reconciled against rocprofv3 FETCH_SIZE on the
+HBM side only, so a wrong term shows up as a visible gap instead of hiding
+inside a total.
 
-    # from a raw trace, with the graph it was produced with
-    python3 src/host/phase_rate.py --graph build/taskgraph_d8.bin \\
-        --trace results/trace_v14.bin --timeline results/timeline_v14_L5.txt
+    # from a raw trace, with the graph it was produced with (flags drive the model)
+    python3 src/host/phase_rate.py --graph build/taskgraph_d16.bin \
+        --trace results/trace_v16.bin --timeline results/timeline_v16_L5.txt
 
     # from what is committed in results/ (no GPU, no trace binary)
-    python3 src/host/phase_rate.py \\
-        --summary results/trace_v14_nt_d16_coh_summary.txt \\
-        --timeline results/timeline_v14_nt_d16_coh_L5.txt \\
-        --measured-bytes results/rocprofv3_fetch_size.csv --tokens 4 \\
-        --microbench results/microbench.json
+    python3 src/host/phase_rate.py \
+        --summary results/trace_v16_default_summary.txt \
+        --timeline results/timeline_v16_default_L5.txt \
+        --measured-bytes results/prof_fetch_v1.csv --tokens 4 \
+        --microbench results/microbench.json --kva-shared
 
 Trace format (src/host/fleet_launch.hip, report_trace): 4 uint64 per
 descriptor in graph order — wait-start, ready, done, and a packed word with
@@ -59,11 +68,16 @@ sys.path.insert(0, str(ROOT / "src" / "host"))
 import taskgraph as tg  # noqa: E402  (the descriptor layout lives in one place)
 
 KIND = {k.value: k.name for k in tg.TaskKind}
+FLAGS = getattr(tg, "Flags", None)
 TICK_US = 0.01            # s_memrealtime is a 100 MHz counter
 BF16 = 2
 WORKERS = 296             # 8 x 37, the workers that share the token's time
 XCDS = 8
 WORKERS_PER_XCD = 37
+# The prologues that fold the previous phase's partials (kernel call sites of
+# stage_residual): the next layer's q/kv_a, the router (always, for o_proj's
+# K-split partials), and lm_head.
+FOLD_SITES = "QKV_FUSED,NORM_ROUTER,LM_HEAD"
 
 
 def _num(pattern: str, text: str) -> float:
@@ -89,6 +103,20 @@ def load_graph(path: Path) -> list[dict]:
     return out
 
 
+def flags_of(tasks: list[dict]) -> dict:
+    """What the emitted graph says about the model's terms. The descriptor
+    flags are the kernel's own switchboard, so the byte model is derived from
+    the graph instead of assumed: kva_shared changes a weight read by 8x, and
+    FOLD_PARTIALS decides whether the prologue still folds."""
+    if FLAGS is None:
+        return {"kva_shared": False, "fold_sites": set()}
+    kv = sum(1 for t in tasks
+             if t["kind"] == tg.TaskKind.QKV_FUSED.value
+             and t["flags"] & int(FLAGS.KVA_SHARED))
+    fold = {KIND[t["kind"]] for t in tasks if t["flags"] & int(FLAGS.FOLD_PARTIALS)}
+    return {"kva_shared": kv > 0, "fold_sites": fold or {"NORM_ROUTER"}}
+
+
 def load_trace(path: Path, n_tasks: int) -> list[tuple[int, int, int, int]]:
     raw = path.read_bytes()
     if len(raw) != n_tasks * 32:
@@ -105,9 +133,10 @@ SUMMARY_ROW = re.compile(
 def parse_summary(path: Path) -> dict:
     """The launcher's own per-kind table: results/trace_*_summary.txt.
 
-    Three columns of microseconds: avg busy, then the prologue, and — once the
-    launcher split it out — the staging inside the prologue. Counted rather
-    than matched, so an extra column is an extra number, not a parse failure."""
+    Three columns of microseconds: average busy, then the prologue, and — once
+    the launcher split it out — the staging inside the prologue. Counted
+    rather than matched, so an extra column is an extra number rather than a
+    parse failure."""
     kinds: dict[str, dict] = {}
     token_ms = None
     for line in path.read_text().splitlines():
@@ -131,11 +160,7 @@ TIMELINE_ROW = re.compile(r"^\s+([A-Z_]+)\s+(\S.*?)\s+(\d+)\s*$")
 
 
 def parse_timeline(path: Path) -> dict:
-    """One layer's per-kind first-ready / last-done: the critical path itself.
-
-    Five numbers before the task count, or six once the staging sub-phase is
-    split out of the prologue (the launcher grew that column), so the numbers
-    are counted rather than matched position by position."""
+    """One layer's per-kind first-ready / last-done: the critical path itself."""
     kinds: dict[str, dict] = {}
     span_us, layer = None, None
     for line in path.read_text().splitlines():
@@ -162,7 +187,8 @@ def parse_timeline(path: Path) -> dict:
 def parse_fetch_size(path: Path, tokens: int) -> dict:
     """rocprofv3 --pmc FETCH_SIZE. Counter_Value is KB, summed over the whole
     dispatch, and one dispatch is every token because the token loop is inside
-    the kernel — hence --tokens."""
+    the kernel — hence --tokens. It is an L2-fill count: traffic that another
+    task already pulled into the L2 does not appear here."""
     kernel_kb, total_kb, name = 0.0, 0.0, None
     with path.open() as f:
         cols = [c.strip('"') for c in f.readline().rstrip("\n").split(",")]
@@ -196,14 +222,14 @@ def parse_microbench(path: Path) -> dict:
 
 # --------------------------------------------------------------- byte model
 #
-# Per layer, in MB. Each term is the kernel's own row range (src/kernels),
-# not the design's idealised table: where the kernel reads a weight block once
-# per chiplet, this charges it once per chiplet and says so.
+# Per layer, in MB, split by the side the bytes come from. Each term is the
+# kernel's own row range or flag (src/kernels, src/host/taskgraph.py), not the
+# design's idealised table: where the kernel reads a weight block once per
+# chiplet, this charges it once per chiplet and says so.
 
 def byte_model(cfg: dict, units: int, fold_tasks: int, kva_shared: bool,
-               seq_len: int) -> dict[str, tuple[float, int]]:
-    """kind -> (MB per layer, layers it runs on). Returns MB per token when
-    multiplied out by the caller."""
+               seq_len: int, fold_sites: set[str]) -> dict[str, dict]:
+    """kind -> {hbm, l2} MB per layer, plus the number of layers it runs on."""
     h = cfg["hidden_size"]
     heads, qk_nope, qk_rope = (cfg["num_attention_heads"], cfg["qk_nope_head_dim"],
                                cfg["qk_rope_head_dim"])
@@ -216,64 +242,80 @@ def byte_model(cfg: dict, units: int, fold_tasks: int, kva_shared: bool,
     q_rows = heads // XCDS * (qk_nope + qk_rope)          # 2 heads per chiplet
     kv_rows = lora + qk_rope                              # 576
     # stage_residual: x (fp32) + the 8 XCD partials (fp32), once per task that
-    # folds them. Called by the q/kv_a prologue and by the router prologue.
+    # folds them. Which tasks those are is a flag in the graph, not a guess.
     fold = (h * 4 + XCDS * h * 4) * fold_tasks * m
-    per_layer = {
-        "QKV_FUSED": (XCDS * q_rows * h
-                      + (kv_rows * h if kva_shared else XCDS * kv_rows * h))
-        * BF16 * m,
-        # the shared MLA cache: 16 heads read the same 1.2 MB, so this is L2 /
-        # Infinity-Cache traffic rather than HBM
-        "ATTENTION": heads * seq_len * (lora + qk_rope) * BF16 * m,
-        "MERGE_UV": heads * v_head * lora * BF16 * m,
-        "O_PROJ": h * heads * v_head * BF16 * m,
-        "NORM_ROUTER": XCDS * n_routed * h * BF16 * m + fold,
-        "EXPERT_GATE_UP": units * 2 * moe_i * h * BF16 * m,
-        "EXPERT_DOWN": units * h * moe_i * BF16 * m,
-        "DENSE_GATE_UP": 2 * dense_i * h * BF16 * m,
-        "DENSE_DOWN": h * dense_i * BF16 * m,
-        "LM_HEAD": vocab * h * BF16 * m + fold,
-        "EMBED": h * BF16 * m,
-        "REDUCE": 0.0, "ARGMAX": 0.0,
+    # the attention partials a merge task consumes: chunks x (m, l, acc[512])
+    merge_l2 = heads * fold_tasks / (heads * XCDS) * (2 + lora) * 4 * m
+    model = {
+        "QKV_FUSED": {"hbm": (XCDS * q_rows * h
+                              + (kv_rows * h if kva_shared else XCDS * kv_rows * h))
+                      * BF16 * m,
+                      "l2": fold if "QKV_FUSED" in fold_sites else 0.0,
+                      "runs": layers},
+        # the shared MLA cache row is written once per layer and read by all 16
+        # heads, so this is L2 / Infinity-Cache traffic, never HBM
+        "ATTENTION": {"hbm": 0.0,
+                      "l2": heads * seq_len * (lora + qk_rope) * BF16 * m,
+                      "runs": layers},
+        "MERGE_UV": {"hbm": heads * v_head * lora * BF16 * m, "l2": merge_l2,
+                     "runs": layers},
+        "O_PROJ": {"hbm": h * heads * v_head * BF16 * m,
+                   "l2": XCDS * h * 4 * WORKERS_PER_XCD * m, "runs": layers},
+        "NORM_ROUTER": {"hbm": XCDS * n_routed * h * BF16 * m,
+                        "l2": fold if "NORM_ROUTER" in fold_sites else 0.0,
+                        "runs": layers},
+        "EXPERT_GATE_UP": {"hbm": units * 2 * moe_i * h * BF16 * m,
+                           "l2": XCDS * moe_i * 4 * m, "runs": moe_layers},
+        "EXPERT_DOWN": {"hbm": units * h * moe_i * BF16 * m,
+                        "l2": XCDS * moe_i * 4 * m, "runs": moe_layers},
+        "DENSE_GATE_UP": {"hbm": 2 * dense_i * h * BF16 * m, "l2": 0.0,
+                          "runs": first_k},
+        "DENSE_DOWN": {"hbm": h * dense_i * BF16 * m, "l2": 0.0, "runs": first_k},
+        "LM_HEAD": {"hbm": vocab * h * BF16 * m,
+                    "l2": fold if "LM_HEAD" in fold_sites else 0.0, "runs": 1},
+        "EMBED": {"hbm": h * BF16 * m, "l2": 0.0, "runs": 1},
+        "REDUCE": {"hbm": 0.0, "l2": 0.0, "runs": 0},
+        "ARGMAX": {"hbm": 0.0, "l2": 0.0, "runs": 0},
     }
-    runs = {"QKV_FUSED": layers, "ATTENTION": layers, "MERGE_UV": layers,
-            "O_PROJ": layers, "NORM_ROUTER": layers,
-            "EXPERT_GATE_UP": moe_layers, "EXPERT_DOWN": moe_layers,
-            "DENSE_GATE_UP": first_k, "DENSE_DOWN": first_k,
-            "LM_HEAD": 1, "EMBED": 1, "REDUCE": 0, "ARGMAX": 0}
-    return {k: (v, runs[k]) for k, v in per_layer.items()}
+    for v in model.values():
+        v["mb_layer"] = v["hbm"] + v["l2"]
+    return model
 
 
 # --------------------------------------------------------------- the table
 
-def build_rows(kinds: dict[str, dict], model: dict[str, tuple[float, int]],
+def build_rows(kinds: dict[str, dict], model: dict[str, dict],
                ref_gbps: float) -> list[dict]:
     rows = []
     for kind, a in kinds.items():
-        per_layer_mb, runs = model.get(kind, (0.0, 0))
-        mb_token = per_layer_mb * runs
+        e = model.get(kind, {"hbm": 0.0, "l2": 0.0, "runs": 0, "mb_layer": 0.0})
+        runs = e["runs"]
+        hbm, l2 = e["hbm"] * runs, e["l2"] * runs
         busy_ms = a["busy_ms"]
-        gbps = (mb_token / 1e3) / (busy_ms / 1e3) if busy_ms else 0.0
+        moved = (hbm + l2) / 1e3                      # GB moved per token
+        gbps = moved / (busy_ms / 1e3) if busy_ms else 0.0
         recover = busy_ms * max(0.0, 1.0 - gbps / ref_gbps) if ref_gbps else 0.0
         rows.append({"kind": kind, "tasks": a["tasks"], "busy_ms": busy_ms,
                      "avg_busy_us": a.get("avg_busy_us", 0.0),
                      "prologue_us": a.get("prologue_us", 0.0),
-                     "mb_layer": per_layer_mb, "mb": mb_token, "gbps": gbps,
-                     "recover_worker_ms": recover,
-                     "recover_ms": recover / WORKERS})
+                     "mb_layer": e["hbm"], "mb_l2_layer": e["l2"],
+                     "mb_layer_all": e["hbm"] + e["l2"],
+                     "hbm": hbm, "l2": l2, "gbps": gbps,
+                     "recover_worker_ms": recover, "recover_ms": recover / WORKERS})
     rows.sort(key=lambda r: -r["recover_ms"])
     return rows
 
 
 def print_rows(rows: list[dict], ref_gbps: float, ref_label: str,
                token_ms: float | None, timeline: dict | None,
-               model_total_gb: float, measured: dict | None,
-               attention_gb: float) -> None:
+               model: dict[str, dict], measured: dict | None) -> None:
+    hbm = sum(v["hbm"] * v["runs"] for v in model.values())
+    l2 = sum(v["l2"] * v["runs"] for v in model.values())
     print(f"\nreference worker rate {ref_gbps:6.2f} GB/s  ({ref_label})")
     if token_ms:
         print(f"token span {token_ms:.3f} ms")
     print(f"\n  {'kind':<16}{'tasks':>6}{'busy-sum':>10}{'avg-busy':>9}"
-          f"{'prologue':>9}{'MB/layer':>10}{'MB/token':>10}{'GB/s':>7}"
+          f"{'prologue':>9}{'HBM MB/l':>10}{'L2 MB/t':>9}{'GB/s':>7}"
           f"{'phase TB/s':>11}{'recover ms':>11}")
     tl = (timeline or {}).get("kinds", {})
     for r in rows:
@@ -282,28 +324,30 @@ def print_rows(rows: list[dict], ref_gbps: float, ref_label: str,
         if t and t["last_done_us"] > t["first_ready_us"] and r["mb_layer"]:
             span_us = t["last_done_us"] - t["first_ready_us"]
             phase = f"{r['mb_layer']/1e3 / (span_us/1e6):7.2f}"
-        rec = f"{r['recover_ms']:7.3f}" if r["mb_layer"] >= 1.0 else "      —"
+        rec = (f"{r['recover_ms']:7.3f}" if r["mb_layer_all"] >= 1.0
+               else "      —")
         print(f"  {r['kind']:<16}{r['tasks']:>6}{r['busy_ms']:>8.1f} ms"
               f"{r['avg_busy_us']:>7.1f} us{r['prologue_us']:>7.1f} us"
-              f"{r['mb_layer']:>10.1f}{r['mb']:>10.1f}{r['gbps']:>7.2f}"
+              f"{r['mb_layer']:>10.1f}{r['l2']:>9.1f}{r['gbps']:>7.2f}"
               f"{phase:>11}{rec:>11}")
 
-    top = [r for r in rows if r["mb_layer"] >= 1.0]
+    top = [r for r in rows if r["mb_layer_all"] >= 1.0]
     print(f"\nrecoverable at the reference rate: "
           f"{sum(r['recover_ms'] for r in top):.3f} ms/token over "
           f"{len(top)} kinds")
     print("  (aggregate worker-time / 296 workers: an upper bound, since a")
     print("   phase only pays out if it is on the critical path)")
 
-    print(f"\nbyte model per token: {model_total_gb:.2f} GB"
-          f"   (attention cache reads {attention_gb:.2f} GB of that are L2"
-          f"\n                      traffic, not HBM)")
+    print(f"\nbyte model per token: {hbm/1e3:.2f} GB from HBM "
+          f"+ {l2/1e3:.2f} GB served from the L2")
+    print("  (the L2 side costs the worker time but no HBM bandwidth, and")
+    print("   FETCH_SIZE — an L2-fill count — does not see it)")
     if measured:
         have = measured["gb_per_token"]
         print(f"  measured FETCH_SIZE {have:.2f} GB/token "
               f"({measured['kernel_gb']:.2f} GB over {measured['tokens']} tokens)"
-              f"   model {model_total_gb - have:+.2f} GB "
-              f"({100 * (model_total_gb / have - 1):+.1f}%)")
+              f"   model {hbm/1e3 - have:+.2f} GB "
+              f"({100 * (hbm/1e3 / have - 1):+.1f}%)")
 
     if timeline:
         print(f"\nlayer {timeline['layer']} critical path "
@@ -338,8 +382,12 @@ def main() -> None:
     ap.add_argument("--fold-tasks", type=int, default=WORKERS,
                     help="workers per layer whose prologue folds the residual; "
                          "0 drops the term")
+    ap.add_argument("--fold-sites", default=FOLD_SITES,
+                    help=f"task kinds whose prologue folds ({FOLD_SITES}); with "
+                         "--graph the graph's FOLD_PARTIALS bit wins")
     ap.add_argument("--kva-shared", action="store_true",
-                    help="the analysed run had --kva-shared: kv_a read once")
+                    help="the analysed run had the kv_a rows split over the "
+                         "8 XCDs; with --graph the graph's flag wins")
     ap.add_argument("--ref-gbps", type=float, default=0.0,
                     help="reference worker rate; default: this run's best phase")
     ap.add_argument("--ceiling", action="store_true",
@@ -347,8 +395,8 @@ def main() -> None:
     a = ap.parse_args()
 
     cfg = json.loads(a.config.read_text())
-    model = byte_model(cfg, a.units, a.fold_tasks, a.kva_shared, a.seq_len)
-
+    fold_sites = {s for s in a.fold_sites.split(",") if s}
+    kva_shared = a.kva_shared
     timeline = parse_timeline(a.timeline) if a.timeline else None
     token_ms = None
     if a.summary:
@@ -356,6 +404,10 @@ def main() -> None:
         kinds, token_ms = s["kinds"], s["token_ms"]
     elif a.graph and a.trace:
         tasks = load_graph(a.graph)
+        f = flags_of(tasks)
+        if f["fold_sites"]:
+            fold_sites = f["fold_sites"]
+        kva_shared = kva_shared or f["kva_shared"]
         tr = load_trace(a.trace, len(tasks))
         agg: dict[str, dict] = {}
         for t, (w, ready, done, packed) in zip(tasks, tr):
@@ -376,6 +428,8 @@ def main() -> None:
     else:
         raise SystemExit("need --summary, or --graph with --trace")
 
+    print(f"model flags: kva_shared={kva_shared} fold={sorted(fold_sites)}")
+    model = byte_model(cfg, a.units, a.fold_tasks, kva_shared, a.seq_len, fold_sites)
     measured = (parse_fetch_size(a.measured_bytes, a.tokens)
                 if a.measured_bytes else None)
     micro = parse_microbench(a.microbench) if a.microbench else None
@@ -390,9 +444,7 @@ def main() -> None:
         best = max(probe, key=lambda r: r["gbps"])
         ref, label = best["gbps"], f"this run's best phase, {best['kind']}"
     rows = build_rows(kinds, model, ref)
-    print_rows(rows, ref, label, token_ms, timeline,
-               sum(v * n for v, n in model.values()) / 1e3, measured,
-               model["ATTENTION"][0] * model["ATTENTION"][1] / 1e3)
+    print_rows(rows, ref, label, token_ms, timeline, model, measured)
 
 
 if __name__ == "__main__":

@@ -55,7 +55,8 @@ def keys(tmp: Path, write_graph: bool = True) -> tuple[Path, Path]:
     t = tmp / "trace.bin"
     if write_graph:
         rows = [
-            (dict(kind=tg.TaskKind.QKV_FUSED.value, layer=1, xcd=0, worker=0),
+            (dict(kind=tg.TaskKind.QKV_FUSED.value, layer=1, xcd=0, worker=0,
+                  flags=int(tg.Flags.KVA_SHARED) | int(tg.Flags.FOLD_PARTIALS)),
              (100, 200, 200 + 2000, 0, 0, 900)),      # 20.0 us busy, 9.0 us prologue
             (dict(kind=tg.TaskKind.QKV_FUSED.value, layer=1, xcd=0, worker=1),
              (100, 300, 300 + 1000, 0, 0, 500)),      # 10.0 us busy, 5.0 us prologue
@@ -86,6 +87,10 @@ def main() -> int:
         tr = pr.load_trace(t, len(tasks))
         results.append(check("trace round trip", len(tr) == 5 and tr[2][3] & 7 == 1,
                              f"packed xcd {tr[2][3] & 7}"))
+        f = pr.flags_of(tasks)
+        results.append(check("the graph's flags drive the model",
+                             f["kva_shared"] and f["fold_sites"] == {"QKV_FUSED"},
+                             f"kva_shared={f['kva_shared']} fold={sorted(f['fold_sites'])}"))
         rows = {}
         for desc, (w, ready, done, packed) in zip(tasks, tr):
             if w == 0:
@@ -194,42 +199,63 @@ def main() -> int:
         cfg = json.loads((ROOT / "reference" / "dsv2lite_config.json").read_text())
         layers, first_k = cfg["num_hidden_layers"], cfg["first_k_dense_replace"]
         moe_layers = layers - first_k
+        sits = {"QKV_FUSED", "NORM_ROUTER", "LM_HEAD"}
         base = pr.byte_model(cfg, units=8, fold_tasks=pr.WORKERS,
-                             kva_shared=False, seq_len=1056)
+                             kva_shared=False, seq_len=1056, fold_sites=sits)
         shared = pr.byte_model(cfg, units=8, fold_tasks=pr.WORKERS,
-                               kva_shared=True, seq_len=1056)
+                               kva_shared=True, seq_len=1056, fold_sites=sits)
         kv_rows = cfg["kv_lora_rank"] + cfg["qk_rope_head_dim"]
         expect_delta = (pr.XCDS - 1) * kv_rows * cfg["hidden_size"] \
             * pr.BF16 / 1e6
-        got = base["QKV_FUSED"][0] - shared["QKV_FUSED"][0]
-        results.append(check("kv_a replication term is 7 extra chiplet reads",
+        got = base["QKV_FUSED"]["hbm"] - shared["QKV_FUSED"]["hbm"]
+        results.append(check("kv_a replication is 7 extra chiplet reads of HBM",
                              abs(got - expect_delta) < 1e-6,
                              f"{got:.2f} MB/layer = {expect_delta:.2f}"))
 
         h, moe_i = cfg["hidden_size"], cfg["moe_intermediate_size"]
         expect_gu = 8 * 2 * moe_i * h * pr.BF16 / 1e6
         results.append(check("expert gate_up = 8 units x 2 x moe_inter x hidden",
-                             abs(base["EXPERT_GATE_UP"][0] - expect_gu) < 1e-6,
-                             f"{base['EXPERT_GATE_UP'][0]:.1f} MB/layer"))
-        no_fold = pr.byte_model(cfg, 8, 0, False, 1056)
-        fold_delta = base["NORM_ROUTER"][0] - no_fold["NORM_ROUTER"][0]
+                             abs(base["EXPERT_GATE_UP"]["hbm"] - expect_gu) < 1e-6,
+                             f"{base['EXPERT_GATE_UP']['hbm']:.1f} MB/layer"))
+        no_fold = pr.byte_model(cfg, 8, 0, False, 1056, sits)
+        fold_delta = base["NORM_ROUTER"]["l2"] - no_fold["NORM_ROUTER"]["l2"]
         results.append(check("fold term scales with the workers that fold",
                              abs(fold_delta - (h * 4 + pr.XCDS * h * 4)
                                  * pr.WORKERS / 1e6) < 1e-6,
                              f"{fold_delta:.1f} MB/layer over {pr.WORKERS} workers"))
+        no_lm = pr.byte_model(cfg, 8, pr.WORKERS, True, 1056,
+                              {"QKV_FUSED", "NORM_ROUTER"})
+        results.append(check("a fold site can be switched off per kind",
+                             base["LM_HEAD"]["l2"] > 0
+                             and no_lm["LM_HEAD"]["l2"] == 0,
+                             f"lm_head l2 {base['LM_HEAD']['l2']:.1f} -> "
+                             f"{no_lm['LM_HEAD']['l2']:.1f} MB/layer"))
 
-        total_gb = sum(v * n for v, n in base.values()) / 1e3
-        results.append(check("model stays reconciled with FETCH_SIZE 5.67 GB",
-                             5.0 <= total_gb <= 7.0,
-                             f"{total_gb:.2f} GB/token "
-                             f"({100 * (total_gb / 5.665 - 1):+.1f}% vs measured)"))
+        # The two sides must not be mixed: only the HBM side is what an
+        # L2-fill counter like FETCH_SIZE can see, and it is what the design's
+        # 4.94 GB/token accounting describes.
+        mv = pr.parse_fetch_size(pr.ROOT / "results" / "prof_fetch_v1.csv",
+                                 tokens=4) if (pr.ROOT / "results" /
+                                               "prof_fetch_v1.csv").exists() else None
+        hbm_gb = sum(v["hbm"] * v["runs"] for v in shared.values()) / 1e3
+        l2_gb = sum(v["l2"] * v["runs"] for v in shared.values()) / 1e3
+        target = mv["gb_per_token"] if mv else 5.202
+        results.append(check("HBM side reconciles with the measured FETCH_SIZE",
+                             abs(hbm_gb / target - 1) <= 0.10,
+                             f"{hbm_gb:.2f} GB HBM vs {target:.2f} GB measured "
+                             f"({100 * (hbm_gb / target - 1):+.1f}%)"))
+        results.append(check("the L2 side is counted separately, not in HBM",
+                             l2_gb > 1.0 and abs(hbm_gb - (hbm_gb + l2_gb)) > 0.5,
+                             f"{l2_gb:.2f} GB served from L2 (folds, cache, "
+                             f"partials) — invisible to FETCH_SIZE"))
 
         # ---- rate and recover arithmetic, on a hand-computed row
         rows = pr.build_rows({"LM_HEAD": {"tasks": 296, "busy_ms": 40.0,
                                           "avg_busy_us": 135.1, "prologue_us": 9.3}},
                              base, ref_gbps=11.0)
         r = rows[0]
-        want_gbps = (base["LM_HEAD"][0] * 1 * 1e-3) / 0.040
+        want_gbps = ((base["LM_HEAD"]["hbm"] + base["LM_HEAD"]["l2"])
+                     * base["LM_HEAD"]["runs"] * 1e-3) / 0.040
         results.append(check("worker GB/s = MB/token / busy-sum",
                              abs(r["gbps"] - want_gbps) < 1e-9,
                              f"{r['gbps']:.2f} vs {want_gbps:.2f}"))
