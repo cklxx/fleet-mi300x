@@ -260,7 +260,10 @@ rejections: at batch 1 every phase already has 296 workers doing the same
 small thing in parallel, so moving work onto one of them to remove
 redundancy trades parallel microseconds for serial ones and loses.
 
-Where the 3.66 ms goes (`results/timeline_v16_default_L5.txt`, layer 5, 129 µs;
+Where the time went **at v0.16, before q_c was published** (`results/timeline_v16_default_L5.txt`, layer 5, 129 µs of the 3.66 ms then;
+q_c publishing later removed q_absorb from all 256 attention tasks, so the
+attention row below is the last measurement taken before that change and no
+per-layer timeline of the shipped configuration exists;
 "prologue" is everything before the weight stream, "staging" its first part):
 
 | phase | starts | ends | avg task busy | prologue | of it: staging |
@@ -366,7 +369,7 @@ happening to be zero; the routing weight is multiplied by
 | Component | What it does | Verified by |
 |---|---|---|
 | `src/host/model_analysis.py` | Per-token HBM byte accounting from `config.json` | Reproduces design.md §1 exactly: attention 27.53 MB/layer, one routed expert 17.30 MB, MoE layer 166.20 MB, lm_head 419.43 MB, **4.935 GB/token**, 31.41 GB resident, floor 0.93 ms @ 5.3 TB/s |
-| `src/host/taskgraph.py` | Builds + validates the Fleet task DAG, fans Chiplet-tasks out to per-worker descriptors, emits them with an event-label sidecar | v0.13 graph (`--kv-chunks 16`): 552 logical tasks / 1,992 descriptors per MoE layer, 2 global + 48 XCD-local events per layer; 14,914 logical / 54,082 descriptors and 1,346 events (58 global) per token; `--report` prints the counts and the validator's verdict |
+| `src/host/taskgraph.py` | Builds + validates the Fleet task DAG, fans Chiplet-tasks out to per-worker descriptors, emits them with an event-label sidecar | v0.13 graph (`--kv-chunks 16`): 552 logical tasks / 1,992 descriptors per MoE layer, 2 global + 48 XCD-local events per layer; 15,778 logical / 54,946 descriptors and 1,346 events (58 global) per token; `--report` prints the counts and the validator's verdict |
 | `tests/test_queue_simulation.py` | Executes the emitted queues under the kernel's protocol: 296 queues in order, monotonic counters, targets `epoch × wait_count`, XCD-local visibility, per-wave chunk arrivals, 3 epochs, forward/reverse/random worker order | 30/30 over five graph variants; the sabotage cases (old signal-side count, missing last-arrival rule) are reported |
 | `src/host/reference_decode.py` | NumPy absorbed-MLA decode: the arithmetic each HIP task must reproduce | Boundary tests below |
 | `src/host/kv_convert.py`, `reference_run.py` | prefill → decode cache `[27][1056][576]` bf16 (32.8 MB) and greedy tokens, written from the *same* HF prefill the launcher is compared against | Layout arithmetic matches §5; reconstruction check needs the model |
@@ -470,7 +473,7 @@ while deleting both is caught. That is recorded rather than papered over.
 
 ## Known limitations, open risks
 
-1. **The design target (2.5–3.5 ms) is not reached: 3.66 ms**, ~1.4 TB/s
+1. **The design target (2.5–3.5 ms) is not reached: 3.60 ms**, ~1.4 TB/s
    of a 4.2 TB/s ceiling at ~5.2 GB/token (byte floor ~1.25 ms), against
    Fleet's own 44% of peak on a dense model. The token is 27 serial layers of seven serial
    phases; events are no longer the cost (< 1 µs each), the per-task
