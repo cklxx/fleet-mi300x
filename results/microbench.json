@@ -5,10 +5,10 @@
   "payload_stale_words": 0, "payload_cross_xcd": true,
   "payload_uncached_stale_words": 12281856, "payload_uncached_cross_xcd": true,
   "payload_atomic_stale_words": 0, "payload_atomic_cross_xcd": true,
-  "event_cached_us": {"median": 1.360, "p95": 1.560},
-  "event_uncached_us": {"median": 1.640, "p95": 1.800},
-  "event_loaded_us": {"median": 5.960, "p95": 7.160, "load_tbs": 1.654, "cross_xcd": true},
-  "xcd_local_us": {"median": 1.3200, "p95": 1.4800},
-  "gemv_tbs": [2.644, 3.414, 3.768, 4.275, 4.188, 3.807],
-  "gemv_best_tbs": 4.275
+  "event_cached_us": {"median": 1.400, "p95": 1.560},
+  "event_uncached_us": {"median": 1.440, "p95": 1.560},
+  "event_loaded_us": {"median": 6.160, "p95": 7.360, "load_tbs": 1.726, "cross_xcd": true},
+  "xcd_local_us": {"median": 1.4000, "p95": 1.5600},
+  "gemv_tbs": [2.669, 3.435, 3.748, 4.333, 4.226, 3.834],
+  "gemv_best_tbs": 4.333
 }

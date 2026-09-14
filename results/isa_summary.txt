@@ -1,13 +1,13 @@
 		.amdhsa_private_segment_fixed_size 48
 		.amdhsa_private_segment_fixed_size 0
-  - .agpr_count:     88
+  - .agpr_count:     87
     .private_segment_fixed_size: 48
-    .sgpr_spill_count: 541
-    .vgpr_count:     344
+    .sgpr_spill_count: 723
+    .vgpr_count:     343
     .vgpr_spill_count: 0
   - .agpr_count:     0
 scratch instructions: 4
       2 --
-      1 16891:.LBB1_181:                              ; %.lr.ph40.i
-      1 16398:.LBB1_165:                              ;   in Loop: Header=BB1_23 Depth=2
-      1 16144:.LBB1_141:                              ; %NodeBlock3329
+      1 20268:.LBB1_193:                              ; %.lr.ph43.i
+      1 19687:.LBB1_172:                              ;   in Loop: Header=BB1_23 Depth=2
+      1 19574:.LBB1_165:                              ; %Flow3286

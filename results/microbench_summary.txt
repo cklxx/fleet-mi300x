@@ -14,30 +14,39 @@ grid: 304 workgroups x 256 threads   tick 10.00 ns
     stale words: same-XCD consumer 0, cross-XCD consumer 0, of 151552000 each  [PASS]
 
 (a) cross-XCD event round-trip (ping-pong, us; release+atomic+poll+acquire)
-    (i)  counters in device memory   median   1.36  p95   1.56
-    (ii) counters uncached           median   1.64  p95   1.80
+    (i)  counters in device memory   median   1.40  p95   1.56
+    (ii) counters uncached           median   1.44  p95   1.56
     -> design picks the cheaper: (i)  (FLEET_UNCACHED_EVENTS=1 selects ii)
 
 (b) same-XCD flag round-trip (us)
-    median  1.320  p95  1.480   (vs cross-XCD 1.36)
+    median  1.400  p95  1.560   (vs cross-XCD 1.40)
 
 (e) cross-XCD event round-trip while 302 workgroups stream HBM (us)
-    median   5.96  p95   7.16   (idle: 1.36)  under 1.65 TB/s of streaming load  <- the value for design.md §9
+    median   6.16  p95   7.36   (idle: 1.40)  under 1.73 TB/s of streaming load  <- the value for design.md §9
 
 (c) register-streamed read bandwidth by in-flight depth
-    depth  1:  2.64 TB/s
-    depth  2:  3.41 TB/s
-    depth  4:  3.77 TB/s
-    depth  8:  4.27 TB/s
-    depth 12:  4.19 TB/s
-    depth 16:  3.81 TB/s
-    -> best 4.27 TB/s = 81% of 5.3 peak (design assumes 4.0 achievable)
+    depth  1:  2.67 TB/s
+    depth  2:  3.44 TB/s
+    depth  4:  3.75 TB/s
+    depth  8:  4.33 TB/s
+    depth 12:  4.23 TB/s
+    depth 16:  3.83 TB/s
+    -> best 4.33 TB/s = 82% of 5.3 peak (design assumes 4.0 achievable)
 
 (f) the kernel's expert GEMVs in isolation (gemv.h, 8 x 17.3 MB units/layer, 27 layers)
-    gate_up only           no handshake           24.3 us/layer, 3.79 TB/s; per block: mean 23.6 us, slowest 29.3 us
-    gate_up + down         no handshake           37.4 us/layer, 3.70 TB/s; per block: mean 36.1 us, slowest 42.7 us
-    gate_up + down         per-worker release     47.6 us/layer, 2.91 TB/s; per block: mean 46.9 us, slowest 51.9 us
-    gate_up + down         last-worker release    39.0 us/layer, 3.55 TB/s; per block: mean 38.1 us, slowest 41.0 us
-    -> 89% of (c)'s ceiling for gate_up alone, 87% with down; with the kernel's per-worker handshake 68%, with the last-worker flush 83%
+    gate_up only           no handshake           24.2 us/layer, 3.82 TB/s; per block: mean 23.3 us, slowest 28.3 us
+    gate_up + down         no handshake           36.9 us/layer, 3.75 TB/s; per block: mean 35.9 us, slowest 43.1 us
+    gate_up + down         per-worker release     46.8 us/layer, 2.96 TB/s; per block: mean 45.8 us, slowest 51.5 us
+    gate_up + down         last-worker release    38.4 us/layer, 3.61 TB/s; per block: mean 37.4 us, slowest 40.1 us
+    -> 88% of (c)'s ceiling for gate_up alone, 87% with down; with the kernel's per-worker handshake 68%, with the last-worker flush 83%
+(g) one buffer, many readers: per-worker GB/s
+     working set           1          37         148         296   <- concurrent workgroups
+           128 K        50.3        48.5        48.2        47.1
+          1024 K        49.1        49.6        49.4        48.3
+          8192 K        27.8        28.2        27.6        25.9
+         65536 K        27.4        28.0        27.6        25.8
+    (a flat row means concurrency is free; a falling column means the
+     working set, not the sharing, is what costs)
+
 
 wrote results/microbench.json

@@ -9,8 +9,8 @@ to be stated plainly, not just for code.
 
 ## Where this is (2026-09-15, after three sessions on the MI300X)
 
-**End to end works, matches HuggingFace, and runs at 3.66 ms per token —
-19% faster than vLLM on the same box (4.52 ms).** On a Hot Aisle 1×MI300X VM
+**End to end works, matches HuggingFace, and runs at 3.60 ms per token —
+20% faster than vLLM on the same box (4.52 ms).** On a Hot Aisle 1×MI300X VM
 (ROCm 7.2, gfx942), one cooperative launch decodes all 32 greedy tokens over
 the 1,024-token context; the argmax task of each token feeds the next
 token's embed on the device. Every token equals HF's greedy choice, and on
@@ -76,6 +76,9 @@ the decode kernel is written before the crash; both tools agree
 | expert phase on two worker groups so the K-chunk tiling can overlap gate_up and down | 4.15–4.83 ms (**slower**) | 18 CUs stream gate_up in 44 µs where 37 take 33: an XCD's share of HBM needs every CU issuing; the tiling on top makes it worse again |
 | **v0.16** — three more candidates, all measured, all rejected: publish the top-k once per XCD instead of per task; prefetch the next task's first rows across its event wait; re-test `--coherent-acts` on an equal graph | 3.661–3.665 ms, i.e. unchanged | the publication trades 4 µs of gate_up prologue for 6 µs of serialised router tail — the same shape as the v0.11 one-writer fold; the prefetch's 8 held loads cost 4%; the coherent protocol is within noise of the fenced one. The kernel keeps all three behind flags and ships none |
 | **v0.17** — the expert partials stored as bf16 | **3.643 ms** vs 3.652–3.659 over three alternating pairs, about 0.4% | the fold reads 72 KB per worker in 4.8 µs, which is 15 GB/s against a 14.2 GB/s per-worker ceiling: bandwidth-bound, and that is why vectorising it to float4 earlier changed nothing. The partials are bf16-valued already (EPI_BF16), so storing them narrower is bit-exact — 32/32 tokens and 27/27 layers unchanged. Predicted 1.5%, measured 0.4%; the rest of the fold's cost is not bytes |
+| **v0.18** — each head's absorbed q_c published once by the workers that idle during attention, instead of all 16 KV chunks streaming W_UK for it | **3.593, 3.595, 3.596 ms** against 3.645, 3.654, 3.650 for the same binary on the old graph: 0.055 ms, 1.5%, intervals not overlapping | 32 of an XCD's 37 workers take an attention task, so five are free. Each publisher owns a row range and writes an fp32 partial; the readers add them in slice order and take q_pe straight from q. The readers wait *inside the body*, after kv_post, which is the discriminator the three failed publications lacked: their waiters had nothing to overlap. Now the default; `--qc-per-task` restores the old graph |
+| exempting the router and kv_b from the non-temporal weight stream so they could stay in the Infinity Cache | **4.249 vs 3.597 ms, 18% slower** (reverted) | the (g) probe had already said why and I did not listen to it: the read-rate cliff is at the 4 MB per-XCD L2, so making 113 MB of kv_b cacheable pushes the working set past it and evicts the stream it was meant to share with |
+| issuing the gate_up logit load before the 8 KB staging, so the load flies during work that does not need it | 3.595 and 3.588 against 3.591 and 3.592: noise (reverted) | the ceiling was 0.03 ms and it did not reach it. Worth recording alongside: that build spilled 729 SGPRs against the baseline's 570 and ran at baseline speed, while the 18% regression spilled 692. **Spill counts do not predict this kernel's performance** |
 
 ### One probe, two optimisations closed
 
@@ -106,6 +109,13 @@ Note what the probe does not say: at 296 readers of 64 MB the aggregate is
 7.6 TB/s, above the 4.2 TB/s HBM ceiling, so even the largest working set
 here is being served by the Infinity Cache. This measures cache bandwidth,
 not HBM.
+
+Estimates for this kernel have run about twice high, three times now: the
+bf16 partials were predicted at 1.5% and measured 0.4%, and q_c was
+predicted at 3.4% and measured 1.5%. The staging and publication costs are
+not proportional to the bytes they move, which is also why vectorising the
+fold changed nothing. Halve any byte-based estimate before spending a day
+on it.
 
 Tried and rejected by measurement: two workgroups per CU (6.5 ms: the
 kernel's 256 VGPRs leave no room for a second wave per SIMD); workers polling

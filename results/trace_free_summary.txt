@@ -1,22 +1,22 @@
 
 trace of token 1: 3.687 ms from first wait to last signal
   kind             tasks   busy-sum   wait-sum   avg-busy avg-prologue  avg-stage
-  QKV_FUSED         7992   136.60 ms    28.78 ms     17.1 us        7.6 us      4.8 us
-  ATTENTION         6912   133.04 ms    18.05 ms     19.2 us       10.6 us      5.8 us
-  MERGE_UV          6912    62.07 ms    28.24 ms      9.0 us        0.0 us      0.0 us
-  O_PROJ            7992    54.62 ms    15.96 ms      6.8 us        0.7 us      0.0 us
-  NORM_ROUTER       7992    88.19 ms    26.59 ms     11.0 us        7.5 us      4.7 us
-  EXPERT_GATE_UP    7696   261.13 ms     5.18 ms     33.9 us        5.7 us      4.7 us
-  EXPERT_DOWN       7696   143.06 ms     6.18 ms     18.6 us        1.6 us      0.0 us
-  DENSE_GATE_UP      296     8.12 ms     0.20 ms     27.4 us        0.0 us      0.0 us
-  DENSE_DOWN         296     6.04 ms     0.79 ms     20.4 us        0.0 us      0.0 us
-  EMBED                1     0.00 ms     0.01 ms      4.2 us        0.0 us      0.0 us
-  LM_HEAD            296    40.58 ms     1.01 ms    137.1 us        8.8 us      0.0 us
+  QKV_FUSED         7992   137.09 ms    30.22 ms     17.2 us        7.5 us      4.3 us
+  ATTENTION         6912   135.53 ms    17.97 ms     19.6 us       10.9 us      5.9 us
+  MERGE_UV          6912    63.55 ms    28.93 ms      9.2 us        0.0 us      0.0 us
+  O_PROJ            7992    56.08 ms    16.74 ms      7.0 us        0.8 us      0.0 us
+  NORM_ROUTER       7992    86.77 ms    25.95 ms     10.9 us        7.2 us      4.5 us
+  EXPERT_GATE_UP    7696   255.96 ms     5.68 ms     33.3 us        5.8 us      4.7 us
+  EXPERT_DOWN       7696   140.66 ms     8.06 ms     18.3 us        1.7 us      0.0 us
+  DENSE_GATE_UP      296     7.77 ms     0.22 ms     26.3 us        0.0 us      0.0 us
+  DENSE_DOWN         296     6.36 ms     0.85 ms     21.5 us        0.0 us      0.0 us
+  EMBED                1     0.00 ms     0.01 ms      4.7 us        0.0 us      0.0 us
+  LM_HEAD            296    39.30 ms     0.95 ms    132.8 us        8.0 us      0.0 us
   ARGMAX               1     0.00 ms     0.01 ms      4.6 us        0.0 us      0.0 us
-  per-layer span (first task ready -> last task signalled): L0 123 us  L1 130 us  L2 129 us  L26 130 us  ... sum 3.50 ms
+  per-layer span (first task ready -> last task signalled): L0 124 us  L1 130 us  L2 131 us  L26 130 us  ... sum 3.50 ms
 wrote results/trace_free.bin (54082 descriptors x 4 uint64: wait-start, ready, done, xcd; 10 ns ticks)
 
-per-token latency (embed -> argmax on device): median 3.668 ms  p95 3.687 ms  mean 3.669 ms  (272.6 tok/s)
-wall time of the launches: 117.799 ms for 32 tokens = 3.681 ms/token (271.7 tok/s), 1 launch(es)
+per-token latency (embed -> argmax on device): median 3.667 ms  p95 3.677 ms  mean 3.667 ms  (272.7 tok/s)
+wall time of the launches: 117.764 ms for 32 tokens = 3.680 ms/token (271.7 tok/s), 1 launch(es)
 tokens: 32/32 match HF greedy
 wrote results/decode_free.json
