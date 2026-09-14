@@ -526,9 +526,18 @@ while deleting both is caught. That is recorded rather than papered over.
    reads kv_a from another XCD's memory now; a per-XCD copy written by the
    q/kv_a workers of that XCD alongside the shared one would keep the
    byte saving and the local read.
-4. Bytes in flight per CU: the GEMV streams ~48 KB per CU; a third buffer
-   in AGPRs (loads can target AGPRs on gfx942) or LDS-direct loads would
-   raise it without touching occupancy.
+4. Bytes in flight per CU: the GEMV streams ~48 KB per CU. Two ideas that
+   looked free here are not, per the CDNA3 ISA guide (checked 2026-09-15):
+   AGPRs are a *partition* of the same 512-register-per-lane file, not extra
+   capacity, so taking 256 AGPRs leaves 256 VGPRs and does cost occupancy;
+   and direct-to-LDS on gfx942 is dword-only (no dwordx3/x4, those are
+   gfx950) with the LDS destination hardwired to ThreadID*4 and no swizzle,
+   which cost IREE 201M bank conflicts and -27.9% throughput. AMD's own
+   gfx942 guidance is the opposite: stay on wide buffer_load_dwordx4 through
+   VGPRs and use relaxed s_waitcnt vmcnt(N) as a pipeline valve, which works
+   because CDNA3 returns VMEM in issue order. Little's law with sourced
+   constants (5.3 TB/s x ~350 ns) needs only ~6 KB in flight per CU; we
+   already keep ~32 KB, so this lever is smaller than it looked.
 5. Understand why `--coherent-acts` needs the producer writeback; the
    protocol's worst case (3.0 ms in the body-less smoke run) says the
    fences are not free even though dropping the acquires bought nothing.
