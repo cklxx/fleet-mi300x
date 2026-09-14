@@ -127,6 +127,20 @@ def main() -> int:
                              and abs(s["kinds"]["LM_HEAD"]["busy_ms"] - 39.84) < 1e-9
                              and abs(s["token_ms"] - 3.946) < 1e-9,
                              f"{len(s['kinds'])} kinds, span {s['token_ms']} ms"))
+        # and the same table with the staging sub-phase split out (v0.15)
+        summ2 = tmp / "s2.txt"
+        summ2.write_text(
+            "trace of token 1: 3.669 ms from first wait to last signal\n"
+            "  kind             tasks   busy-sum   wait-sum   avg-busy avg-prologue  avg-stage\n"
+            "  QKV_FUSED         7992   135.71 ms    32.89 ms     17.0 us        7.5 us      4.9 us\n")
+        s2 = pr.parse_summary(summ2)
+        k = s2["kinds"]["QKV_FUSED"]
+        results.append(check("summary parsed with the staging column",
+                             k["tasks"] == 7992 and abs(k["avg_busy_us"] - 17.0) < 1e-9
+                             and abs(k["prologue_us"] - 7.5) < 1e-9
+                             and abs(k["stage_us"] - 4.9) < 1e-9,
+                             f"busy {k['avg_busy_us']} us, prologue {k['prologue_us']}, "
+                             f"stage {k['stage_us']}"))
         tline = tmp / "l5.txt"
         tline.write_text(
             "layer 5: 1992 descriptors, span 139.3 us\n"
@@ -134,10 +148,23 @@ def main() -> int:
             "  QKV_FUSED             0.0us      0.7us     23.5us    22.6us     8.6us  296\n"
             "  EXPERT_DOWN         110.6us    113.5us    139.3us    23.3us     6.3us  296\n")
         tl = pr.parse_timeline(tline)
-        results.append(check("timeline parsed",
+        results.append(check("timeline parsed (5 numbers before n)",
                              tl["layer"] == 5 and abs(tl["span_us"] - 139.3) < 1e-9
                              and tl["kinds"]["EXPERT_DOWN"]["tasks"] == 296,
                              f"layer {tl['layer']}, span {tl['span_us']} us"))
+        # and the same file with the staging sub-phase split out of the prologue
+        tline6 = tmp / "l5b.txt"
+        tline6.write_text(
+            "layer 5: 1992 descriptors, span 127.6 us\n"
+            "  kind            first-ready last-ready  last-done  avg-busy  prologue of it:stage  n\n"
+            "  QKV_FUSED             0.0us      1.0us     18.6us    16.7us     7.4us       4.9us  296\n")
+        tl6 = pr.parse_timeline(tline6)
+        results.append(check("timeline parsed (6 numbers, staging split out)",
+                             abs(tl6["kinds"]["QKV_FUSED"]["prologue_us"] - 7.4) < 1e-9
+                             and abs(tl6["kinds"]["QKV_FUSED"]["stage_us"] - 4.9) < 1e-9
+                             and tl6["kinds"]["QKV_FUSED"]["tasks"] == 296,
+                             f"prologue {tl6['kinds']['QKV_FUSED']['prologue_us']} us, "
+                             f"stage {tl6['kinds']['QKV_FUSED']['stage_us']} us"))
 
         # ---- FETCH_SIZE: KB, summed over the dispatch, /--tokens
         csv = tmp / "f.csv"
@@ -150,6 +177,18 @@ def main() -> int:
                              abs(f["gb_per_token"] - 5.665) < 0.005
                              and abs(f["total_gb"] - 22.660108) < 0.001,
                              f"{f['gb_per_token']:.3f} GB/token of {f['total_gb']:.2f} GB"))
+        # rocprofv3 also emits a FETCH_SIZE column and a .kd-suffixed symbol
+        csv2 = tmp / "f2.csv"
+        csv2.write_text(
+            'Index,KernelName,grd,FETCH_SIZE\n'
+            '0,"__amd_rocclr_fillBufferAligned.kd",77824,32.0\n'
+            '65,"fleet_probe_xcc(unsigned int*) [clone .kd]",77824,26.875\n'
+            '70,"fleet_decode_step.kd",77824,22661827.375\n')
+        f2 = pr.parse_fetch_size(csv2, tokens=4)
+        results.append(check("fetch-size: FETCH_SIZE column, .kd suffix",
+                             abs(f2["gb_per_token"] - 5.6655) < 0.001
+                             and f2["kernel_gb"] > 22.6 and f2["kernel_gb"] < 22.7,
+                             f"{f2['gb_per_token']:.3f} GB/token from {f2['kernel_gb']:.2f} GB"))
 
         # ---- the byte model's terms
         cfg = json.loads((ROOT / "reference" / "dsv2lite_config.json").read_text())

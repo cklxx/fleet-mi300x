@@ -99,22 +99,27 @@ def load_trace(path: Path, n_tasks: int) -> list[tuple[int, int, int, int]]:
 
 
 SUMMARY_ROW = re.compile(
-    r"^\s+([A-Z_]+)\s+(\d+)\s+([\d.]+) ms\s+([\d.]+) ms\s+([\d.]+) us"
-    r"(?:\s+([\d.]+) us)?\s*$")
+    r"^\s+([A-Z_]+)\s+(\d+)\s+([\d.]+) ms\s+([\d.]+) ms\s+(\S.*)$")
 
 
 def parse_summary(path: Path) -> dict:
-    """The launcher's own per-kind table: results/trace_*_summary.txt."""
+    """The launcher's own per-kind table: results/trace_*_summary.txt.
+
+    Three columns of microseconds: avg busy, then the prologue, and — once the
+    launcher split it out — the staging inside the prologue. Counted rather
+    than matched, so an extra column is an extra number, not a parse failure."""
     kinds: dict[str, dict] = {}
     token_ms = None
     for line in path.read_text().splitlines():
         m = SUMMARY_ROW.match(line)
         if m:
+            us = [float(x) for x in re.findall(r"([\d.]+) us", m.group(5))]
             kinds[m.group(1)] = {"tasks": int(m.group(2)),
                                  "busy_ms": float(m.group(3)),
                                  "wait_ms": float(m.group(4)),
-                                 "avg_busy_us": float(m.group(5)),
-                                 "prologue_us": float(m.group(6) or 0.0)}
+                                 "avg_busy_us": us[0] if us else 0.0,
+                                 "prologue_us": us[1] if len(us) > 1 else 0.0,
+                                 "stage_us": us[2] if len(us) > 2 else 0.0}
         elif "from first wait to last signal" in line:
             token_ms = _num(r"([\d.]+) ms", line)
     if not kinds:
@@ -122,24 +127,30 @@ def parse_summary(path: Path) -> dict:
     return {"kinds": kinds, "token_ms": token_ms}
 
 
-TIMELINE_ROW = re.compile(
-    r"^\s+([A-Z_]+)\s+([\d.]+)us\s+([\d.]+)us\s+([\d.]+)us\s+([\d.]+)us"
-    r"\s+([\d.]+)us\s+(\d+)\s*$")
+TIMELINE_ROW = re.compile(r"^\s+([A-Z_]+)\s+(\S.*?)\s+(\d+)\s*$")
 
 
 def parse_timeline(path: Path) -> dict:
-    """One layer's per-kind first-ready / last-done: the critical path itself."""
+    """One layer's per-kind first-ready / last-done: the critical path itself.
+
+    Five numbers before the task count, or six once the staging sub-phase is
+    split out of the prologue (the launcher grew that column), so the numbers
+    are counted rather than matched position by position."""
     kinds: dict[str, dict] = {}
     span_us, layer = None, None
     for line in path.read_text().splitlines():
         m = TIMELINE_ROW.match(line)
         if m:
-            kinds[m.group(1)] = {"first_ready_us": float(m.group(2)),
-                                 "last_ready_us": float(m.group(3)),
-                                 "last_done_us": float(m.group(4)),
-                                 "avg_busy_us": float(m.group(5)),
-                                 "prologue_us": float(m.group(6)),
-                                 "tasks": int(m.group(7))}
+            nums = [float(x) for x in re.findall(r"([\d.]+)us", m.group(2))]
+            if len(nums) < 5:
+                continue
+            kinds[m.group(1)] = {"first_ready_us": nums[0],
+                                 "last_ready_us": nums[1],
+                                 "last_done_us": nums[2],
+                                 "avg_busy_us": nums[3],
+                                 "prologue_us": nums[4],
+                                 "stage_us": nums[5] if len(nums) > 5 else 0.0,
+                                 "tasks": int(m.group(3))}
         elif line.startswith("layer "):
             layer = int(_num(r"layer (\d+)", line))
             span_us = _num(r"span ([\d.]+) us", line)
@@ -155,16 +166,21 @@ def parse_fetch_size(path: Path, tokens: int) -> dict:
     kernel_kb, total_kb, name = 0.0, 0.0, None
     with path.open() as f:
         cols = [c.strip('"') for c in f.readline().rstrip("\n").split(",")]
-        ci = {c: i for i, c in enumerate(cols)}
+        # Counter_Name/Counter_Value (--pmc per-counter) or a FETCH_SIZE column
+        ni = cols.index("Kernel_Name") if "Kernel_Name" in cols else cols.index("KernelName")
+        vi = (cols.index("Counter_Value") if "Counter_Value" in cols
+              else cols.index("FETCH_SIZE"))
         for line in f:
             parts = [p.strip('"') for p in line.rstrip("\n").split(",")]
             if len(parts) != len(cols):
                 continue
-            kb = float(parts[ci["Counter_Value"]])
+            kb = float(parts[vi])
             total_kb += kb
-            if parts[ci["Kernel_Name"]] == "fleet_decode_step":
+            # rocprof appends .kd and [clone .kd] to the symbol
+            this = parts[ni].replace(".kd", "").split(" [")[0].strip()
+            if this == "fleet_decode_step":
                 kernel_kb += kb
-                name = parts[ci["Kernel_Name"]]
+                name = this
     if name is None:
         raise SystemExit(f"{path}: no fleet_decode_step dispatch in this profile")
     return {"kernel_gb": kernel_kb / 1e6, "total_gb": total_kb / 1e6,
