@@ -1,0 +1,8 @@
+(f) the kernel's expert GEMVs in isolation (gemv.h, 8 x 17.3 MB units/layer, 27 layers)
+    gate_up only           no handshake           24.6 us/layer, 3.75 TB/s; per block: mean 23.8 us, slowest 29.5 us
+    gate_up + down         no handshake           38.8 us/layer, 3.57 TB/s; per block: mean 36.8 us, slowest 44.9 us
+    gate_up + down         per-worker release     49.5 us/layer, 2.80 TB/s; per block: mean 48.0 us, slowest 56.2 us
+    gate_up + down         last-worker release    42.1 us/layer, 3.29 TB/s; per block: mean 40.9 us, slowest 47.9 us
+    gate_up + down, +120 VGPR no handshake           38.8 us/layer, 3.56 TB/s; per block: mean 37.2 us, slowest 45.2 us
+    -> 98% of (c)'s ceiling for gate_up alone, 93% with down; with the kernel's per-worker handshake 73%, with the last-worker flush 86%
+(g) one buffer, many readers: per-worker GB/s

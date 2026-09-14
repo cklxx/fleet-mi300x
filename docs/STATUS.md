@@ -122,6 +122,28 @@ either fewer phase boundaries, which is worth tens of microseconds per
 token, or more tokens per weight read, which is what speculative decoding
 buys and which would change the task's terms.
 
+Occupancy was then tested directly rather than argued about, because the
+one phase where it could plausibly matter is the expert stream. The
+isolated benchmark compiles to 154 VGPRs and reaches 3 waves per SIMD,
+while the same code inside the megakernel is pinned to one. A second copy
+of the identical body was given 120 extra live VGPRs to take that occupancy
+away, and the compiler's own resource report confirms the manipulation:
+256 VGPRs plus 20 AGPRs, occupancy 1.
+
+| gate_up + down, no handshake | 3 waves/SIMD | 1 wave/SIMD |
+|---|---|---|
+| first run | 34.5 us/layer | 34.1 us/layer |
+| second run | 38.8 us/layer | 38.8 us/layer |
+
+**Occupancy makes no difference to this phase, and the register union the
+megakernel forces costs no throughput.** That closes a theory this file
+floated twice, on our own hardware rather than on vendor guidance.
+
+The same table retires something else. The two runs of the *identical*
+3-wave configuration differ by 12%, which is larger than the roughly 6% gap
+between in-kernel and isolated that had been carried as the largest
+unattributed loss. It was inside the benchmark's own noise.
+
 Occupancy, for the record: the kernel uses 256 VGPRs and 87 AGPRs. Those
 share one 512-register file per SIMD, so 343 registers allow exactly one
 wave. That is also the real reason two workgroups per CU measured slower
@@ -133,6 +155,9 @@ Sources: [ROCm occupancy math on CDNA](https://rocm.blogs.amd.com/software-tools
 [ROCm MI300X workload optimization](https://rocm.docs.amd.com/en/latest/how-to/rocm-for-ai/inference-optimization/workload.html),
 [Databricks, LLM inference performance engineering](https://www.databricks.com/blog/llm-inference-performance-engineering-best-practices),
 [MoE-Inference-Bench](https://arxiv.org/pdf/2508.17467).
+
+Raw numbers for the occupancy test are in
+[`results/microbench_f_occupancy.txt`](../results/microbench_f_occupancy.txt).
 
 ### One probe, two optimisations closed
 
