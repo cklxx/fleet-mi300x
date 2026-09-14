@@ -21,11 +21,13 @@
 // fence (buffer_inv), and polling uses agent-scope atomic loads so a stale
 // L1/L2 line can never satisfy the wait. XCD-local events acquire with an
 // L1-only invalidate (the payload is in the producer's own L2). With
-// uncached_acts every cross-XCD activation is in MTYPE-UC memory, which no
-// L2 caches, so global events drop both the writeback and the invalidate;
-// the KV cache (cached, written once per layer per token, read by every XCD
-// from the next token on) is the one payload that still needs them: its
-// writer flushes explicitly and the token boundary keeps the acquire.
+// coherent_acts every cross-XCD activation is accessed through agent-scope
+// relaxed atomics (global_load/store with sc1, which bench (d''') checks
+// word for word; MTYPE-UC allocation does NOT give this on the VM, bench
+// (d'')), so global waits drop the L2 invalidate except where a cached
+// payload still crosses XCDs: the KV cache at the token boundary and the
+// dense layer's h (fenced_events). Producers keep the writeback: measured
+// necessary (see event_release_fenced).
 #pragma once
 
 #include <hip/hip_runtime.h>
@@ -154,12 +156,13 @@ struct RuntimeState {
                            //     on the launch's first token
     int32_t  trace_token;  // token of the launch to trace, or -1
     uint32_t spin_limit;   // polls before a wait declares a deadlock
-    int32_t  uncached_acts; // 1 = every cross-XCD activation lives in uncached
-                            //     (MTYPE UC) memory, so global events carry no
-                            //     L2 writeback / invalidate; only the token
-                            //     boundary (done_event) still fences, for the
-                            //     KV cache, whose writer flushes explicitly
+    int32_t  coherent_acts; // 1 = cross-XCD activations use agent-scope atomic
+                            //     loads/stores and global waits skip the L2
+                            //     invalidate except for done_event and
+                            //     fenced_events (producers still write back)
     int32_t  prefetch_nt;   // 1 = TASK_PREFETCH uses non-temporal loads
+    int32_t  fenced_events[4];  // events whose payload is cached and cross-XCD
+                                // even with coherent_acts (dense gate_up); -1 = none
 
     // Optional per-descriptor trace (design.md §10): [n_descriptors][4] of
     // s_memrealtime ticks — began waiting, wait satisfied, signalled — plus
@@ -218,6 +221,42 @@ __device__ __forceinline__ void fence_acquire_local() {
 #else
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
 #endif
+}
+
+// coherent_acts: which L2 fences does a global event still need?
+// Measured (STATUS.md): dropping the consumer-side invalidate is safe (every
+// cross-XCD activation is read through an agent-scope atomic load, and the
+// KV cache row is never in a reader's L2 before it is written); dropping the
+// producer-side writeback is NOT — 18/18 launches correct with the release
+// kept, most launches wrong without it, although bench (d''') passes. So the
+// release stays on every global event; the acquire only where a cached
+// payload crosses XCDs (done_event: the KV cache; fenced_events: the dense
+// layer's h). Bit 1 of coherent_acts re-enables every acquire (diagnostic).
+__device__ __forceinline__ bool event_fenced(const RuntimeState& rt, int event) {
+    if (!rt.coherent_acts || event == rt.done_event) return true;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) if (rt.fenced_events[i] == event) return true;
+    return false;
+}
+__device__ __forceinline__ bool event_release_fenced(const RuntimeState& rt, int event) {
+    return true;   // see above: measured necessary
+}
+__device__ __forceinline__ bool event_acquire_fenced(const RuntimeState& rt, int event) {
+    return (rt.coherent_acts & 2) || event_fenced(rt, event);
+}
+
+// Agent-scope coherent accesses for cross-XCD activations (coherent_acts).
+__device__ __forceinline__ float ld_coh(const float* p, bool coh) {
+    return coh ? __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) : *p;
+}
+__device__ __forceinline__ int32_t ld_coh(const int32_t* p, bool coh) {
+    return coh ? __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) : *p;
+}
+__device__ __forceinline__ void st_coh(float* p, float v, bool coh) {
+    if (coh) __hip_atomic_store(p, v, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT); else *p = v;
+}
+__device__ __forceinline__ void st_coh(int32_t* p, int32_t v, bool coh) {
+    if (coh) __hip_atomic_store(p, v, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT); else *p = v;
 }
 
 __device__ __forceinline__ bool aborted(const RuntimeState& rt) {
@@ -329,7 +368,7 @@ __device__ __forceinline__ uint32_t signal_event(
                                                 __HIP_MEMORY_SCOPE_AGENT);
     if (scope == SCOPE_XCD_LOCAL) return 0;
     if (old + 1 == epoch * (uint32_t)xcd_count) {        // last of this XCD's share
-        if (!rt.uncached_acts || event == rt.done_event) fence_release();
+        if (event_release_fenced(rt, event)) fence_release();
         const uint32_t g = __hip_atomic_fetch_add(&rt.global_events[event], (uint32_t)xcd_count,
                                                   __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
         return g + (uint32_t)xcd_count;
@@ -367,7 +406,7 @@ __device__ __forceinline__ bool wait_event(
         }
     }
     if (scope == SCOPE_XCD_LOCAL) fence_acquire_local();
-    else if (!rt.uncached_acts || event == rt.done_event) fence_acquire();
+    else if (event_acquire_fenced(rt, event)) fence_acquire();
     return true;
 }
 
@@ -401,7 +440,7 @@ __device__ __forceinline__ void run_scheduler(const RuntimeState& rt, int xcd) {
             const uint32_t g = poll(&rt.global_events[e]);
             if (poll(&mirror[e]) != g) {
                 if (!changed) {
-                    if (!rt.uncached_acts) { fence_acquire(); fence_release(); }
+                    if (!rt.coherent_acts) { fence_acquire(); fence_release(); }
                     changed = true;
                 }
                 __hip_atomic_store(&mirror[e], g, __ATOMIC_RELAXED,

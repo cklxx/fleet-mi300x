@@ -221,6 +221,23 @@ __device__ __forceinline__ RowSlice xcd_rows(int N, int xcd, int n_xcds) {
 //   EPI_BF16_ACC  y = bf16(scale * bf16(residual + sum))  (last chunk; residual = accumulator)
 enum GemvEpilogue { EPI_NONE = 0, EPI_BF16 = 1, EPI_RESIDUAL = 2, EPI_ACC = 3, EPI_BF16_ACC = 4 };
 
+// The epilogue store (and the residual load) are agent-scope atomics when
+// the output crosses XCDs under coherent_acts (fleet_runtime.h).
+__device__ __forceinline__ float epi_ld(const float* p, bool coh) {
+    return coh ? __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) : *p;
+}
+__device__ __forceinline__ void epi_st(float* p, float v, bool coh) {
+    if (coh) __hip_atomic_store(p, v, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT); else *p = v;
+}
+#define FLEET_EPILOGUE(N, V)                                                    \
+    switch (epi) {                                                              \
+        case EPI_BF16:     epi_st(y + (N), bf16_round(scale * bf16_round(V)), coh); break; \
+        case EPI_RESIDUAL: epi_st(y + (N), bf16_round(epi_ld(residual + (N), coh) + bf16_round(V)), coh); break; \
+        case EPI_ACC:      y[N] += (V); break;                                  \
+        case EPI_BF16_ACC: epi_st(y + (N), bf16_round(scale * bf16_round(residual[N] + (V))), coh); break; \
+        default:           epi_st(y + (N), (V), coh);                           \
+    }
+
 // Software-pipelined row loop: the loads of the *next* group of RPI rows are
 // issued before the current group is reduced, so consecutive groups overlap
 // their memory latency. Preconditions: a row fits one buffer (K/8 <= D*64)
@@ -235,7 +252,7 @@ __device__ __forceinline__ void gemv_rows_pipelined(
         const __hip_bfloat16* __restrict__ w, int ld,
         const float* __restrict__ x, float* __restrict__ y,
         const float* __restrict__ residual, GemvEpilogue epi, float scale,
-        int K, int first, int cnt, int n_workers) {
+        int K, int first, int cnt, int n_workers, bool coh) {
     const int wave = threadIdx.x / kWaveLanes;
     const int lane = threadIdx.x % kWaveLanes;
     const int n4 = K / 8;
@@ -278,13 +295,7 @@ __device__ __forceinline__ void gemv_rows_pipelined(
                 if ((KK) + r < cnt) {                                           \
                     const int n = first + ((KK) + r) * n_workers;               \
                     const float v = sums[r];                                    \
-                    switch (epi) {                                              \
-                        case EPI_BF16:     y[n] = bf16_round(scale * bf16_round(v)); break; \
-                        case EPI_RESIDUAL: y[n] = bf16_round(residual[n] + bf16_round(v)); break; \
-                        case EPI_ACC:      y[n] += v; break;                    \
-                        case EPI_BF16_ACC: y[n] = bf16_round(scale * bf16_round(residual[n] + v)); break; \
-                        default:           y[n] = v;                            \
-                    }                                                           \
+                    FLEET_EPILOGUE(n, v)                                        \
                 }                                                               \
             }                                                                   \
         }                                                                       \
@@ -321,7 +332,7 @@ __device__ __forceinline__ void gemv_rows_pipelined_half(
         const __hip_bfloat16* __restrict__ w, int ld,
         const float* __restrict__ x, float* __restrict__ y,
         const float* __restrict__ residual, GemvEpilogue epi, float scale,
-        int K, int first, int cnt, int n_workers) {
+        int K, int first, int cnt, int n_workers, bool coh) {
     constexpr int H = RPI / 2;
     const int wave = threadIdx.x / kWaveLanes;
     const int lane = threadIdx.x % kWaveLanes;
@@ -355,13 +366,7 @@ __device__ __forceinline__ void gemv_rows_pipelined_half(
                 if (r < cnt) {                                                  \
                     const int n = first + r * n_workers;                        \
                     const float v = sums[j];                                    \
-                    switch (epi) {                                              \
-                        case EPI_BF16:     y[n] = bf16_round(scale * bf16_round(v)); break; \
-                        case EPI_RESIDUAL: y[n] = bf16_round(residual[n] + bf16_round(v)); break; \
-                        case EPI_ACC:      y[n] += v; break;                    \
-                        case EPI_BF16_ACC: y[n] = bf16_round(scale * bf16_round(residual[n] + v)); break; \
-                        default:           y[n] = v;                            \
-                    }                                                           \
+                    FLEET_EPILOGUE(n, v)                                        \
                 }                                                               \
             }                                                                   \
         }                                                                       \
@@ -389,7 +394,7 @@ __device__ __forceinline__ void gemv_rows_impl(
         const __hip_bfloat16* __restrict__ w, int ld,
         const float* __restrict__ x, float* __restrict__ y,
         const float* __restrict__ residual, GemvEpilogue epi, float scale,
-        int K, int first, int cnt, int n_workers) {
+        int K, int first, int cnt, int n_workers, bool coh) {
     const int wave = threadIdx.x / kWaveLanes;
     const int lane = threadIdx.x % kWaveLanes;
     for (int k = RPI * wave; k < cnt; k += RPI * kWaves) {
@@ -407,13 +412,7 @@ __device__ __forceinline__ void gemv_rows_impl(
                 if (r < nr) {
                     const int n = first + (k + r) * n_workers;
                     const float v = sums[r];
-                    switch (epi) {
-                        case EPI_BF16:     y[n] = bf16_round(scale * bf16_round(v)); break;
-                        case EPI_RESIDUAL: y[n] = bf16_round(residual[n] + bf16_round(v)); break;
-                        case EPI_ACC:      y[n] += v; break;
-                        case EPI_BF16_ACC: y[n] = bf16_round(scale * bf16_round(residual[n] + v)); break;
-                        default:           y[n] = v;
-                    }
+                    FLEET_EPILOGUE(n, v)
                 }
             }
         }
@@ -424,7 +423,7 @@ __device__ inline void gemv_rows(
         const __hip_bfloat16* __restrict__ w, int ld,
         const float* __restrict__ x, float* __restrict__ y,
         const float* __restrict__ residual, GemvEpilogue epi, float scale,
-        int N, int K, int xcd, int n_xcds, int worker, int n_workers) {
+        int N, int K, int xcd, int n_xcds, int worker, int n_workers, bool coh = false) {
     const RowSlice s = xcd_rows(N, xcd, n_xcds);
     const int first = s.begin + worker;
     if (first >= s.end) return;
@@ -436,15 +435,15 @@ __device__ inline void gemv_rows(
     // kind 1.5-3x slower), so the batch stays at 8 and the overlap does the
     // rest. The tasks own 7–350 rows each; they pay round trips, not bytes.
     if (n4 <= kWaveLanes / 2) {         // K <= 256:  half-wave rows (K-split o_proj)
-        gemv_rows_pipelined_half<8>(w, ld, x, y, residual, epi, scale, K, first, cnt, n_workers);
+        gemv_rows_pipelined_half<8>(w, ld, x, y, residual, epi, scale, K, first, cnt, n_workers, coh);
     } else if (n4 <= kWaveLanes) {      // K <= 512:  8 rows x 1 chunk  (merge W_UV)
-        gemv_rows_pipelined<8, 1>(w, ld, x, y, residual, epi, scale, K, first, cnt, n_workers);
+        gemv_rows_pipelined<8, 1>(w, ld, x, y, residual, epi, scale, K, first, cnt, n_workers, coh);
     } else if (n4 <= 2 * kWaveLanes) {  // K <= 1024: 4 rows x 2 chunks
-        gemv_rows_pipelined<4, 2>(w, ld, x, y, residual, epi, scale, K, first, cnt, n_workers);
+        gemv_rows_pipelined<4, 2>(w, ld, x, y, residual, epi, scale, K, first, cnt, n_workers, coh);
     } else if (n4 <= 4 * kWaveLanes) {  // K = 1408, 2048: 2 rows x 4 chunks
-        gemv_rows_pipelined<2, 4>(w, ld, x, y, residual, epi, scale, K, first, cnt, n_workers);
+        gemv_rows_pipelined<2, 4>(w, ld, x, y, residual, epi, scale, K, first, cnt, n_workers, coh);
     } else {                            // K = 10944: rows do not fit a buffer
-        gemv_rows_impl<2, 4>(w, ld, x, y, residual, epi, scale, K, first, cnt, n_workers);
+        gemv_rows_impl<2, 4>(w, ld, x, y, residual, epi, scale, K, first, cnt, n_workers, coh);
     }
 }
 

@@ -370,7 +370,7 @@ int main(int argc, char** argv) {
     std::string hidden_path = "build/golden_hidden.bin";
     std::string json_path, dump_path, trace_path;
     int tokens = 32, context = 1024, first_token = -1, per_launch = 0, repeat = 1;
-    bool smoke = false, teacher = false, uncached_acts = false;
+    bool smoke = false, teacher = false, coherent_acts = false;
     uint32_t spin_limit = 1u << 22;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -391,7 +391,7 @@ int main(int argc, char** argv) {
         else if (a == "--spin-limit") spin_limit = (uint32_t)std::atol(next().c_str());
         else if (a == "--smoke") smoke = true;
         else if (a == "--teacher-force") teacher = true;
-        else if (a == "--uncached-acts") uncached_acts = true;
+        else if (a == "--coherent-acts") coherent_acts = true;
         else die("unknown argument " + a);
     }
     if (per_launch <= 0 || per_launch > tokens) per_launch = tokens;
@@ -467,7 +467,22 @@ int main(int argc, char** argv) {
     rt.dump_layers = 0;
     rt.trace_token = -1;
     rt.spin_limit = spin_limit;
-    rt.uncached_acts = uncached_acts ? 1 : 0;
+    rt.coherent_acts = coherent_acts ? 1 : 0;
+    if (coherent_acts && std::getenv("FLEET_COH_KEEP")) {   // diagnostic: 2 = keep every acquire
+        rt.coherent_acts |= std::atoi(std::getenv("FLEET_COH_KEEP")) & 2;
+    }
+    // cached payloads that still cross XCDs under --coherent-acts: the dense
+    // layer's h (gate_up -> down), found by event label
+    for (int i = 0; i < 4; ++i) rt.fenced_events[i] = -1;
+    {
+        int nf = 0;
+        for (const auto& kv_ : labels) {
+            if (kv_.second.find("dense_gate_up") != std::string::npos) {
+                if (nf >= 4) die("more dense layers than fenced_events slots");
+                rt.fenced_events[nf++] = kv_.first;
+            }
+        }
+    }
     rt.prefetch_nt = std::getenv("FLEET_PREFETCH_NT") != nullptr ? 1 : 0;
     rt.epoch0 = 1;
     rt.n_tokens = per_launch;
@@ -489,9 +504,9 @@ int main(int argc, char** argv) {
     d.layers = 1;   // smoke mode: harmless defaults
 
     // Token arrays exist in every mode; the smoke run just never reads them.
-    act.token_in = dev_alloc_uc<int32_t>(tokens + 1, uncached_acts);
-    act.token_out = dev_alloc_uc<int32_t>(tokens, uncached_acts);
-    act.token_time = dev_alloc_uc<uint64_t>((size_t)tokens * 2, uncached_acts);
+    act.token_in = dev_alloc_uc<int32_t>(tokens + 1, false);
+    act.token_out = dev_alloc_uc<int32_t>(tokens, false);
+    act.token_time = dev_alloc_uc<uint64_t>((size_t)tokens * 2, false);
 
     if (!smoke) {
         const Manifest m = load_manifest(weights_path + ".manifest");
@@ -565,21 +580,21 @@ int main(int argc, char** argv) {
         }
 
         // activations (§5)
-        // cross-XCD activations (x, the fold partials, the logits) go uncached
-        // with --uncached-acts; everything XCD-local stays in that XCD's L2
-        act.x[0] = dev_alloc_uc<float>(d.hidden, uncached_acts);
-        act.x[1] = dev_alloc_uc<float>(d.hidden, uncached_acts);
+        // (dev_alloc_uc's MTYPE-UC path is kept for experiments only: bench
+        // (d'') showed it is not fence-free here; --coherent-acts uses atomics)
+        act.x[0] = dev_alloc_uc<float>(d.hidden, false);
+        act.x[1] = dev_alloc_uc<float>(d.hidden, false);
         act.x_norm = dev_alloc<float>((size_t)kNumXCDs * d.hidden);
         act.q = dev_alloc<float>((size_t)d.heads * d.q_head_dim);
         act.kv_a = dev_alloc<float>((size_t)kNumXCDs * (d.kv_lora + d.qk_rope));
         act.attn_partial = dev_alloc<float>((size_t)d.heads * kv_chunks * kPartialStride);
         act.o = dev_alloc<float>((size_t)d.heads * d.v_head);
         act.expert_h = dev_alloc<float>(std::max((size_t)kNumXCDs * d.moe_inter, (size_t)d.dense_inter));
-        act.expert_out = dev_alloc_uc<float>((size_t)kNumXCDs * d.hidden, uncached_acts);
-        act.oproj_partial = dev_alloc_uc<float>((size_t)kNumXCDs * d.hidden, uncached_acts);
-        act.logits = dev_alloc_uc<float>(d.vocab, uncached_acts);
-        act.argmax_val = dev_alloc_uc<float>((size_t)kNumXCDs * kWorkersPerXCD, uncached_acts);
-        act.argmax_idx = dev_alloc_uc<int32_t>((size_t)kNumXCDs * kWorkersPerXCD, uncached_acts);
+        act.expert_out = dev_alloc_uc<float>((size_t)kNumXCDs * d.hidden, false);
+        act.oproj_partial = dev_alloc_uc<float>((size_t)kNumXCDs * d.hidden, false);
+        act.logits = dev_alloc_uc<float>(d.vocab, false);
+        act.argmax_val = dev_alloc_uc<float>((size_t)kNumXCDs * kWorkersPerXCD, false);
+        act.argmax_idx = dev_alloc_uc<int32_t>((size_t)kNumXCDs * kWorkersPerXCD, false);
         act.router_logits = dev_alloc<float>((size_t)kNumXCDs * d.n_routed);
         act.layer_dump = dev_alloc<float>((size_t)d.layers * d.hidden);
 

@@ -75,8 +75,10 @@ bash scripts/setup_env.sh        # checks, deps, model, hipcc, graphs, smoke tes
 python3 src/host/reference_run.py --model ~/models/dsv2-lite-base \
         --out build/golden.npz            # golden tokens, fleet_cache.bin, golden_tokens.txt
 python3 src/host/kv_convert.py --model ~/models/dsv2-lite-base --verify
-./build/fleet_decode --graph build/taskgraph_d8.bin --teacher-force   # step-isolated check
-./build/fleet_decode --graph build/taskgraph_d8.bin --json results/decode_d8.json
+./build/fleet_decode_nt --graph build/taskgraph_d16.bin --teacher-force   # step-isolated check
+./build/fleet_decode_nt --graph build/taskgraph_d16.bin --json results/decode.json --trace results/trace.bin
+python3 scripts/trace_timeline.py results/trace.bin build/taskgraph_d16.bin --layer 5   # per-phase timeline
+# fleet_decode_nt = -DFLEET_NT_WEIGHTS=1 (non-temporal weight loads, 4% faster); scripts/hotaisle_bootstrap.sh builds both
 ```
 
 Every non-smoke run also prints, for the first decode step, each layer's
@@ -104,11 +106,12 @@ step with its trace attribution in [docs/STATUS.md](docs/STATUS.md).
 |---|---|
 | Greedy tokens matching HF, free-running / teacher-forced | 32/32 and 32/32 |
 | Layers inside the §6 gate on the first decode step | 27 of 27 (layer 1: max rel 3.1e-3, cosine 0.999993) |
-| Per-token latency, median / p95, one cooperative launch for all 32 tokens | **4.08 ms / 4.11 ms (245 tok/s)**; first correct version was 22.05 ms |
+| Per-token latency, median / p95, one cooperative launch for all 32 tokens | **3.73 ms / 3.75 ms (268 tok/s)** best run, 3.93 ms typical (three interleaved re-runs; ~5% run-to-run spread on the VM); first correct version was 22.05 ms |
+| **vLLM 0.11.2 on the same VM** (AITER MLA backend, CUDA graphs, bf16, batch 1, same prompt; `bench/vllm_decode_timing.py`) | 4.52 ms (220 tok/s), same 32 tokens |
+| HF transformers eager on the same VM | 54.4 ms |
 | Launches per 32 tokens | 1 (the argmax task feeds the next embed on the device) |
-| Global events per MoE layer / per token | 3 / 85 |
-| Protocol alone (`--smoke`, no task bodies) | 1.06 ms per token |
-| Cross-XCD event, idle / under load (last full run, `results/microbench_summary.txt`) | 1.44 µs / 6.76 µs at 1.64 TB/s of streaming load; across the session's runs 5.9–6.8 µs at 1.5–2.2 TB/s (`microbench.json` is an earlier run: 5.88 µs at 2.20 TB/s) |
+| Global events per MoE layer / per token | 2 / 58 |
+| Cross-XCD event, idle / under load (`results/microbench_summary.txt`) | 1.36 µs / 5.88 µs at 1.59 TB/s of streaming load |
 | Payload visibility under the kernel's fence placement (37 producers, one last-arriver flush) | 0 stale words in 151 M, same-XCD and cross-XCD |
 | Streamed read bandwidth / byte floor at it | 4.2 TB/s / 1.17 ms per token |
 

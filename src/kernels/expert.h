@@ -97,12 +97,14 @@ __device__ inline void expert_gate_up(
 __device__ inline void expert_down_chunk(
         const ExpertUnit& u, const float* __restrict__ h_lds,
         float* __restrict__ acc_lds, float* __restrict__ out, int hidden,
-        int worker, int n_workers, int col0, int kc, bool first, bool last) {
+        int worker, int n_workers, int col0, int kc, bool first, bool last,
+        bool coh = false) {
     const GemvEpilogue epi = first ? (last ? EPI_BF16 : EPI_NONE)
                                    : (last ? EPI_BF16_ACC : EPI_ACC);
     gemv_rows(u.down + col0, u.down_ld, h_lds, last ? out : acc_lds,
               (last && !first) ? acc_lds : nullptr,   // residual = the accumulator
-              epi, u.weight, hidden, kc, /*xcd=*/0, /*n_xcds=*/1, worker, n_workers);
+              epi, u.weight, hidden, kc, /*xcd=*/0, /*n_xcds=*/1, worker, n_workers,
+              last && coh);   // the partial crosses XCDs; the accumulator is LDS
 }
 
 __device__ inline void expert_down(

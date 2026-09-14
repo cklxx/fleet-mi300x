@@ -63,14 +63,14 @@ struct TokenCtx {
 // ---------------------------------------------------------------- small tasks
 
 __device__ void task_embed(const ModelDims& d, const Weights& w,
-                           Activations& act, const TokenCtx& tc) {
+                           Activations& act, const TokenCtx& tc, bool coh) {
     if (threadIdx.x == 0 && act.token_time) {
         act.token_time[2 * tc.tok] = __builtin_amdgcn_s_memrealtime();
     }
-    const int token = act.token_in[tc.tok];
+    const int token = ld_coh(act.token_in + tc.tok, coh);
     const __hip_bfloat16* row = w.embed + (int64_t)token * d.hidden;
     for (int i = threadIdx.x; i < d.hidden; i += blockDim.x) {
-        act.x[0][i] = __bfloat162float(row[i]);
+        st_coh(act.x[0] + i, __bfloat162float(row[i]), coh);
     }
 }
 
@@ -101,9 +101,11 @@ __device__ inline void rms_norm_lds(const ModelDims& d,
 __device__ inline void stage_residual(const ModelDims& d, const float* __restrict__ src,
                                       const float* __restrict__ partials,
                                       float* __restrict__ dst, float* __restrict__ vec,
-                                      int xcd, int worker) {
+                                      int xcd, int worker, bool coh) {
     if (partials == nullptr) {
-        stage_vector(src, vec, d.hidden);
+#pragma unroll 8
+        for (int i = threadIdx.x; i < d.hidden; i += kBlockThreads) vec[i] = ld_coh(src + i, coh);
+        __syncthreads();
     } else {
         // 36 independent loads per thread in flight (unroll 4 of 9 loads):
         // two round trips under load, ~7 us. Fully unrolling the 72 loads
@@ -112,13 +114,13 @@ __device__ inline void stage_residual(const ModelDims& d, const float* __restric
         for (int i = threadIdx.x; i < d.hidden; i += kBlockThreads) {
             float acc = 0.f;
 #pragma unroll
-            for (int x = 0; x < kNumXCDs; ++x) acc += partials[x * d.hidden + i];
-            vec[i] = bf16_round(src[i] + bf16_round(acc));
+            for (int x = 0; x < kNumXCDs; ++x) acc += ld_coh(partials + x * d.hidden + i, coh);
+            vec[i] = bf16_round(ld_coh(src + i, coh) + bf16_round(acc));
         }
         __syncthreads();
     }
     if (dst != nullptr && xcd == 0 && worker == 0) {
-        for (int i = threadIdx.x; i < d.hidden; i += blockDim.x) dst[i] = vec[i];
+        for (int i = threadIdx.x; i < d.hidden; i += blockDim.x) st_coh(dst + i, vec[i], coh);
     }
 }
 
@@ -159,9 +161,9 @@ __device__ inline void prefetch_bytes(const void* p, int64_t bytes, bool nt) {
 // the same x in the same order; worker 0 publishes it for the experts.
 __device__ void task_norm_router(const ModelDims& d, const Weights& w,
                                  Activations& act, Scratch& s, int layer,
-                                 int xcd, int worker, bool moe, const TokenCtx& tc) {
+                                 int xcd, int worker, bool moe, const TokenCtx& tc, bool coh) {
     // x[1] = bf16(x[0] + bf16(o_proj)) from the 8 K-split partials
-    stage_residual(d, act.x[0], act.oproj_partial, act.x[1], s.vec, xcd, worker);
+    stage_residual(d, act.x[0], act.oproj_partial, act.x[1], s.vec, xcd, worker, coh);
     rms_norm_lds(d, w.layer_norm_post[layer], s.vec, s.smem);
     FLEET_STAMP();
     if (worker == 0) {
@@ -215,7 +217,8 @@ __device__ inline void select_experts(const ModelDims& d, const float* __restric
 // argmax task reduces 296 candidates instead of scanning 102400 logits on
 // one CU (measured 109 us for the scan: a dependent load per compare).
 __device__ void lm_head_candidate(const ModelDims& d, Activations& act, int xcd,
-                                  int worker, int n_workers, float* smem_val, int* smem_idx) {
+                                  int worker, int n_workers, float* smem_val, int* smem_idx,
+                                  bool coh) {
     const RowSlice sl = xcd_rows(d.vocab, xcd, kNumXCDs);
     const int first = sl.begin + worker;
     float bv = -INFINITY;
@@ -251,8 +254,8 @@ __device__ void lm_head_candidate(const ModelDims& d, Activations& act, int xcd,
         __syncthreads();
     }
     if (threadIdx.x == 0) {
-        act.argmax_val[xcd * n_workers + worker] = smem_val[0];
-        act.argmax_idx[xcd * n_workers + worker] = smem_idx[0];
+        st_coh(act.argmax_val + xcd * n_workers + worker, smem_val[0], coh);
+        st_coh(act.argmax_idx + xcd * n_workers + worker, smem_idx[0], coh);
     }
 }
 
@@ -263,9 +266,10 @@ __device__ void task_argmax(const ModelDims& d, Activations& act, const RuntimeS
     const int n_cand = kNumXCDs * kWorkersPerXCD;
     float bv = -INFINITY;
     int bi = 0x7fffffff;
+    const bool coh = rt.coherent_acts != 0;
     for (int i = threadIdx.x; i < n_cand; i += blockDim.x) {
-        const float v = act.argmax_val[i];
-        const int ix = act.argmax_idx[i];
+        const float v = ld_coh(act.argmax_val + i, coh);
+        const int ix = ld_coh(act.argmax_idx + i, coh);
         if (v > bv || (v == bv && ix < bi)) { bv = v; bi = ix; }
     }
     best_val[threadIdx.x] = bv;
@@ -285,7 +289,7 @@ __device__ void task_argmax(const ModelDims& d, Activations& act, const RuntimeS
     }
     if (threadIdx.x == 0) {
         act.token_out[tc.tok] = best_idx[0];
-        if (!rt.teacher) act.token_in[tc.tok + 1] = best_idx[0];
+        if (!rt.teacher) st_coh(act.token_in + tc.tok + 1, best_idx[0], coh);
         if (act.token_time) act.token_time[2 * tc.tok + 1] = __builtin_amdgcn_s_memrealtime();
     }
 }
@@ -297,12 +301,13 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
     const int L = t.layer;
     const int nw = kWorkersPerXCD;
     const int chunks = max(1, (int)t.n_split);
+    const bool coh = rt.coherent_acts != 0;   // cross-XCD activations via atomics
     const int heads_per_xcd = d.heads / kNumXCDs;
 
     switch (t.kind) {
-        case TASK_EMBED:       task_embed(d, w, act, tc); break;
+        case TASK_EMBED:       task_embed(d, w, act, tc, coh); break;
         case TASK_NORM_ROUTER: task_norm_router(d, w, act, s, L, xcd, worker,
-                                                L >= d.first_k_dense, tc); break;
+                                                L >= d.first_k_dense, tc, coh); break;
         case TASK_ARGMAX:      task_argmax(d, act, rt, tc); break;
         case TASK_REDUCE:      break;   // retired: consumers fold in their prologue
 
@@ -361,7 +366,7 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
             // x[1] (+ its expert partials if it was MoE), published to x[0]
             const float* src = (L == 0) ? act.x[0] : act.x[1];
             const float* parts = (t.flags & FLAG_FOLD_PARTIALS) ? act.expert_out : nullptr;
-            stage_residual(d, src, parts, (L == 0) ? nullptr : act.x[0], s.vec, xcd, worker);
+            stage_residual(d, src, parts, (L == 0) ? nullptr : act.x[0], s.vec, xcd, worker, coh);
             dump_layer(d, act, L - 1, s.vec, xcd, worker, tc);
             rms_norm_lds(d, w.layer_norm_in[L], s.vec, s.smem);
             FLEET_STAMP();
@@ -387,7 +392,7 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
                     d.kv_lora, d.qk_rope, d.rms_eps, s.smem,
                     /*write_cache=*/t.head == 0 && t.kv_chunk == 0,   // one writer per layer
                     cache_layer + (int64_t)tc.pos * kv.row);
-            if (rt.uncached_acts && t.head == 0 && t.kv_chunk == 0) {
+            if (rt.coherent_acts && t.head == 0 && t.kv_chunk == 0) {
                 // The cache row is the one cached cross-XCD payload: with the
                 // global fences gone, its writer flushes it to HBM itself.
                 __syncthreads();
@@ -415,7 +420,7 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
             FLEET_STAMP();
             gemv_rows(w.layer_o_proj[L] + (int64_t)xcd * kc, d.heads * d.v_head, s.vec,
                       act.oproj_partial + (int64_t)xcd * d.hidden, nullptr, EPI_NONE, 1.f,
-                      d.hidden, kc, /*xcd=*/0, /*n_xcds=*/1, worker, nw);
+                      d.hidden, kc, /*xcd=*/0, /*n_xcds=*/1, worker, nw, coh);
             break;
         }
 
@@ -462,7 +467,7 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
                 stage_vector(h + col0, s.vec, kc);
                 if (c == 0) FLEET_STAMP();
                 expert_down_chunk(u, s.vec, s.part, out, d.hidden, worker, nw,
-                                  col0, kc, c == 0, c + 1 == n_chunks);
+                                  col0, kc, c == 0, c + 1 == n_chunks, coh);
             }
             break;
         }
@@ -478,19 +483,19 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
             gemv_rows(w.layer_dense[L] + (int64_t)2 * d.dense_inter * d.hidden,
                       d.dense_inter, act.expert_h, act.x[1], act.x[1],
                       EPI_RESIDUAL, 1.f, d.hidden, d.dense_inter, xcd, kNumXCDs,
-                      worker, nw);
+                      worker, nw, coh);
             break;
 
         case TASK_LM_HEAD:
             stage_residual(d, act.x[1], (t.flags & FLAG_FOLD_PARTIALS) ? act.expert_out : nullptr,
-                           nullptr, s.vec, xcd, worker);
+                           nullptr, s.vec, xcd, worker, coh);
             dump_layer(d, act, d.layers - 1, s.vec, xcd, worker, tc);
             rms_norm_lds(d, w.final_norm, s.vec, s.smem);
             FLEET_STAMP();
             gemv_rows(w.lm_head, d.hidden, s.vec, act.logits, nullptr, EPI_BF16,
                       1.f, d.vocab, d.hidden, xcd, kNumXCDs, worker, nw);
             __syncthreads();   // every wave's logits are written (and in L2)
-            lm_head_candidate(d, act, xcd, worker, nw, s.smem, s.ids_blk);
+            lm_head_candidate(d, act, xcd, worker, nw, s.smem, s.ids_blk, coh);
             break;
 
         default:

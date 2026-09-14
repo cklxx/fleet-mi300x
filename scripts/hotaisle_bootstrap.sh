@@ -64,7 +64,7 @@ log "microbench"
 log "smoke"
 ./build/fleet_decode --graph $GRAPH --smoke --tokens 8 2>&1 | grep -E "placement|launch of|per-token|abort|error"
 ./build/fleet_decode --graph build/taskgraph_d8_prefetch.bin --smoke --tokens 8 2>&1 | grep -E "per-token|abort|error"
-./build/fleet_decode --graph $GRAPH --smoke --tokens 8 --uncached-acts 2>&1 | grep -E "per-token|abort|error"
+./build/fleet_decode --graph $GRAPH --smoke --tokens 8 --coherent-acts 2>&1 | grep -E "per-token|abort|error"
 
 log "waiting for the model"
 wait $DL; tail -1 /tmp/download.log; du -sh "$MODEL"
@@ -81,7 +81,7 @@ log "decode: free-running, one launch, with trace"
 
 # ---- the §12 matrix: every variant is a full 32-token free-running decode
 # checked against the golden tokens and the 27 layer boundaries (exit 0 only
-# if all match). Columns: binary x graph x --uncached-acts x prefetch loads.
+# if all match). Columns: binary x graph x --coherent-acts x prefetch loads.
 log "matrix"
 run_variant() {   # name binary graph extra-args...
   local name=$1 bin=$2 graph=$3; shift 3
@@ -92,17 +92,17 @@ run_variant() {   # name binary graph extra-args...
   echo "   exit=$rc  $(grep -E '^tokens:' "results/decode_v11_$name.log" | tail -1)  $(grep -cE '^  layer.* ok' "results/decode_v11_$name.log") layers ok"
 }
 run_variant base        ./build/fleet_decode    build/taskgraph_d8.bin
-run_variant uncached    ./build/fleet_decode    build/taskgraph_d8.bin          --uncached-acts
+run_variant coherent    ./build/fleet_decode    build/taskgraph_d8.bin          --coherent-acts
 run_variant nt          ./build/fleet_decode_nt build/taskgraph_d8.bin
 run_variant prefetch    ./build/fleet_decode    build/taskgraph_d8_prefetch.bin
 FLEET_PREFETCH_NT=1 run_variant prefetch_ntload ./build/fleet_decode build/taskgraph_d8_prefetch.bin
 run_variant nt_prefetch ./build/fleet_decode_nt build/taskgraph_d8_prefetch.bin
-run_variant all         ./build/fleet_decode_nt build/taskgraph_d8_prefetch.bin --uncached-acts
-run_variant uncached_nt ./build/fleet_decode_nt build/taskgraph_d8.bin          --uncached-acts
+run_variant all         ./build/fleet_decode_nt build/taskgraph_d8_prefetch.bin --coherent-acts
+run_variant coherent_nt ./build/fleet_decode_nt build/taskgraph_d8.bin          --coherent-acts
 
 log "trace of the base and the all-in variant"
 ./build/fleet_decode --graph $GRAPH --repeat 1 --trace results/trace_v11_base.bin 2>&1 | grep -vE "^  layer" | tail -22 > results/trace_v11_base_summary.txt
-./build/fleet_decode_nt --graph build/taskgraph_d8_prefetch.bin --uncached-acts --repeat 1 --trace results/trace_v11_all.bin 2>&1 | grep -vE "^  layer" | tail -22 > results/trace_v11_all_summary.txt
+./build/fleet_decode_nt --graph build/taskgraph_d8_prefetch.bin --coherent-acts --repeat 1 --trace results/trace_v11_all.bin 2>&1 | grep -vE "^  layer" | tail -22 > results/trace_v11_all_summary.txt
 tail -18 results/trace_v11_base_summary.txt
 
 log "bytes actually fetched (rocprofv3 FETCH_SIZE, 4 tokens, base binary)"
