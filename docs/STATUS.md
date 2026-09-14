@@ -80,6 +80,60 @@ the decode kernel is written before the crash; both tools agree
 | exempting the router and kv_b from the non-temporal weight stream so they could stay in the Infinity Cache | **4.249 vs 3.597 ms, 18% slower** (reverted) | the (g) probe had already said why and I did not listen to it: the read-rate cliff is at the 4 MB per-XCD L2, so making 113 MB of kv_b cacheable pushes the working set past it and evicts the stream it was meant to share with |
 | issuing the gate_up logit load before the 8 KB staging, so the load flies during work that does not need it | 3.595 and 3.588 against 3.591 and 3.592: noise (reverted) | the ceiling was 0.03 ms and it did not reach it. Worth recording alongside: that build spilled 729 SGPRs against the baseline's 570 and ran at baseline speed, while the 18% regression spilled 692. **Spill counts do not predict this kernel's performance** |
 
+### Is 26% of peak bandwidth a defect? No, and here is the evidence
+
+The obvious worry about this kernel is that a batch-1 decode is a pure
+bandwidth problem and we only reach a quarter of peak. By the standard
+metric, achieved bandwidth over peak with achieved taken as useful bytes
+divided by time per token, we sit at 4.935 GB / 3.598 ms / 5.3 TB/s =
+**25.9%** (27.2% if the denominator uses the 5.19 GB actually fetched, or
+33% against the 4.2 TB/s this hardware can really stream).
+
+Four independent checks say the streaming code is not what is losing:
+
+* the same GEMV in isolation reaches 3.9 TB/s, 93% of the 4.2 TB/s
+  achievable, so the inner loop is close to the metal;
+* Little's law wants HBM latency times per-CU bandwidth in flight, about
+  14 KB per CU here; the kernel keeps roughly 32 KB in flight, over twice
+  what is needed;
+* AMD's own occupancy guidance says one wave per SIMD can saturate HBM when
+  vector width and outstanding-load count are right, and warns that maximum
+  occupancy often *starves* bandwidth. Our shape, deep per-wave instruction
+  level parallelism at one wave per SIMD, is the recommended one, not an
+  accident;
+* the closest production comparison, vLLM 0.11.2 with the AITER MLA backend
+  and full CUDA graphs, on the same GPU, model, prompt and token count,
+  runs at 4.52 ms, which is **20.6% MBU**. It is 22% slower than this
+  kernel on the same hardware.
+
+For scale, Databricks report batch-1 MBU of about 50% for MPT-7B on one
+A100 and 55 to 60% for Llama-2-70B across two to four GPUs. Those are
+**dense** models: one contiguous multi-gigabyte weight set per token, where
+a single phase streams uninterrupted for hundreds of microseconds. A MoE
+decode at batch 1 is the opposite shape, and the literature names the same
+cause we measure: small per-expert GEMV shapes with low arithmetic
+intensity. Here each XCD streams one 17.3 MB expert for 36 microseconds,
+and the layer then passes through seven serial phases of which roughly 40%
+of the time moves almost no bytes at all.
+
+That last sentence is the whole gap, and it is structural rather than a
+coding defect. Closing it does not need a better inner loop; it needs
+either fewer phase boundaries, which is worth tens of microseconds per
+token, or more tokens per weight read, which is what speculative decoding
+buys and which would change the task's terms.
+
+Occupancy, for the record: the kernel uses 256 VGPRs and 87 AGPRs. Those
+share one 512-register file per SIMD, so 343 registers allow exactly one
+wave. That is also the real reason two workgroups per CU measured slower
+long ago: they could not be co-resident, so they serialised and each took
+half the rows. The attribution in the rejected-experiments line above was
+wrong for two sessions.
+
+Sources: [ROCm occupancy math on CDNA](https://rocm.blogs.amd.com/software-tools-optimization/occupancy-math-mi355x/README.html),
+[ROCm MI300X workload optimization](https://rocm.docs.amd.com/en/latest/how-to/rocm-for-ai/inference-optimization/workload.html),
+[Databricks, LLM inference performance engineering](https://www.databricks.com/blog/llm-inference-performance-engineering-best-practices),
+[MoE-Inference-Bench](https://arxiv.org/pdf/2508.17467).
+
 ### One probe, two optimisations closed
 
 `microbench (g)` streams a single buffer from 1, 37, 148 and 296 workgroups
@@ -117,8 +171,8 @@ not proportional to the bytes they move, which is also why vectorising the
 fold changed nothing. Halve any byte-based estimate before spending a day
 on it.
 
-Tried and rejected by measurement: two workgroups per CU (6.5 ms: the
-kernel's 256 VGPRs leave no room for a second wave per SIMD); workers polling
+Tried and rejected by measurement: two workgroups per CU (6.5 ms, and the
+reason is now understood: see the occupancy section below); workers polling
 the global counters directly instead of the scheduler mirror (slower);
 16-chunk-per-lane GEMV batches (register cap, scratch spills); the one-writer
 fold; K-chunk tiling of gate_up→down on one worker group (nothing overlaps)
