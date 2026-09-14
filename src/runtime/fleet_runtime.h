@@ -119,6 +119,8 @@ enum TaskFlags : int16_t {
                               // one buffer; attention: read that buffer
     FLAG_WORKER_GROUP = 64,   // rows split over the n_split workers starting
                               // at worker `head`, not over all 37
+    FLAG_ROUTING_CACHED = 128, // expert down: this worker's previous task was
+                              // the layer's gate_up; its top-k is still in LDS
 };
 
 // Device-side state, allocated once by the host.

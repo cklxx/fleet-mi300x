@@ -95,6 +95,9 @@ class Flags(IntFlag):
                         # buffer (not replicated); attention: read that buffer
     WORKER_GROUP = 64   # the task's rows are split over the n_split workers
                         # starting at worker `head` of the XCD, not all 37
+    ROUTING_CACHED = 128  # expert down: the same worker just ran this layer's
+                          # gate_up, whose top-k is still in its LDS — skip
+                          # select_experts (measured 4.9 us per task)
 
 
 # Implementation status per task kind, reported because the task spec asks for
@@ -357,10 +360,13 @@ def build_moe_layer(g: Graph, layer: int, prev_event: int | None,
                             flags=Flags.CHUNK_SIGNAL), [xcd], workers=gu_workers)
     for xcd in range(XCDS):
         slot = xcd if xcd < top_k else -(xcd - top_k + 1)
+        # without a worker split the down descriptor directly follows the
+        # same worker's gate_up descriptor, so the routing is still in LDS
+        dn_flags = Flags.CHUNK_WAIT | (Flags.NONE if G else Flags.ROUTING_CACHED)
         g.chiplet_task(Task(TaskKind.EXPERT_DOWN, layer, xcd, e_chunk0[xcd],
                             e_down, Scope.GLOBAL, expert_slot=slot,
                             local_event=e_chunk0[xcd], kv_chunk=n_chunks,
-                            flags=Flags.CHUNK_WAIT), [xcd], workers=dn_workers)
+                            flags=dn_flags), [xcd], workers=dn_workers)
     return e_down
 
 
@@ -507,6 +513,14 @@ def validate(g: Graph) -> list[str]:
             errors.append(f"event {e} ({g.events[e]['label']}): per-XCD shares "
                           f"{by_xcd} do not sum to {want}")
 
+    prev_in_queue: dict[tuple[int, int], Task] = {}
+    for t in g.tasks:
+        if t.flags & Flags.ROUTING_CACHED:
+            q = prev_in_queue.get((t.xcd, t.worker))
+            if q is None or q.kind != TaskKind.EXPERT_GATE_UP or q.layer != t.layer:
+                errors.append(f"task {t.index}: ROUTING_CACHED but the worker's previous "
+                              f"descriptor is not this layer's gate_up")
+        prev_in_queue[(t.xcd, t.worker)] = t
     for t in g.tasks:
         if t.wait_event is not None:
             ev = g.events[t.wait_event]
@@ -652,7 +666,7 @@ def report(g: Graph, cfg: dict) -> None:
 
 
 def load_cfg(config: Path, kv_chunks: int, prefetch: bool = False,
-             k_chunk: int = EXPERT_K_CHUNK, kva_shared: bool = False,
+             k_chunk: int = EXPERT_K_CHUNK, kva_shared: bool = True,
              split_workers: int = 0) -> dict:
     c = json.loads(config.read_text())
     return {
@@ -682,14 +696,16 @@ def main() -> None:
     ap.add_argument("--k-chunk", type=int, default=EXPERT_K_CHUNK,
                     help="rows of h per gate_up->down tile; must match kExpertKChunk "
                          "unless it is >= moe_inter (one chunk = no tiling)")
-    ap.add_argument("--kva-shared", action="store_true",
-                    help="kv_a rows split over the 8 XCDs (one global event) instead of replicated")
+    ap.add_argument("--kva-replicated", action="store_true",
+                    help="every XCD computes its own copy of the 576 kv_a rows behind an "
+                         "XCD-local event (the v0.10-v0.14 graph) instead of the default "
+                         "split over the 8 XCDs behind one global event")
     ap.add_argument("--split-workers", type=int, default=0,
                     help="G: expert gate_up on workers [0,G) and down on [G,37) per XCD, "
                          "so --k-chunk tiling can overlap them")
     a = ap.parse_args()
 
-    cfg = load_cfg(a.config, a.kv_chunks, a.prefetch, a.k_chunk, a.kva_shared, a.split_workers)
+    cfg = load_cfg(a.config, a.kv_chunks, a.prefetch, a.k_chunk, not a.kva_replicated, a.split_workers)
     g = build(cfg)
 
     if a.emit:

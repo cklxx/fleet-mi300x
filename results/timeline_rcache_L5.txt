@@ -1,0 +1,9 @@
+layer 5: 1992 descriptors, span 135.7 us
+  kind            first-ready last-ready  last-done  avg-busy  prologue of it:stage  n
+  QKV_FUSED             0.0us      1.2us     23.6us    22.2us     8.5us       5.4us  296
+  ATTENTION            22.7us     24.7us     44.4us    18.8us     9.0us       3.9us  256
+  MERGE_UV             42.0us     45.5us     56.2us    10.0us     0.0us       0.0us  256
+  O_PROJ               53.0us     57.3us     65.6us     7.7us     0.8us       0.0us  296
+  NORM_ROUTER          66.4us     67.7us     80.0us    12.2us     8.4us       5.3us  296
+  EXPERT_GATE_UP       79.7us     81.2us    115.3us    33.1us     6.4us       5.7us  296
+  EXPERT_DOWN         113.2us    116.4us    135.7us    18.7us     1.7us       0.0us  296

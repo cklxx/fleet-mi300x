@@ -92,11 +92,11 @@ run_variant() {   # name binary graph extra-args...
 }
 python3 src/host/taskgraph.py --kv-chunks 16 --k-chunk 512 --emit build/taskgraph_d16_k512.bin | tail -1
 python3 src/host/taskgraph.py --kv-chunks 16 --prefetch --emit build/taskgraph_d16_prefetch.bin | tail -1
-python3 src/host/taskgraph.py --kv-chunks 16 --kva-shared --emit build/taskgraph_d16_kva.bin | tail -1
+python3 src/host/taskgraph.py --kv-chunks 16 --kva-replicated --emit build/taskgraph_d16_kvarep.bin | tail -1
 python3 src/host/taskgraph.py --kv-chunks 16 --split-workers 18 --k-chunk 512 --emit build/taskgraph_d16_split18_k512.bin | tail -1
 python3 src/host/taskgraph.py --kv-chunks 16 --split-workers 18 --emit build/taskgraph_d16_split18.bin | tail -1
 python3 src/host/taskgraph.py --kv-chunks 16 --split-workers 22 --k-chunk 512 --emit build/taskgraph_d16_split22_k512.bin | tail -1
-python3 src/host/taskgraph.py --kv-chunks 16 --kva-shared --split-workers 18 --k-chunk 512 --emit build/taskgraph_d16_kva_split18_k512.bin | tail -1
+
 run_variant nt_d16_fenced    $BIN                 build/taskgraph_d16.bin
 run_variant nt_d16_coherent  $BIN                 build/taskgraph_d16.bin          --coherent-acts
 run_variant nt_d16_fenced_b  $BIN                 build/taskgraph_d16.bin
@@ -106,12 +106,11 @@ run_variant nt_d8            $BIN                 build/taskgraph_d8.bin
 run_variant nt_d16_kchunk512 $BIN                 build/taskgraph_d16_k512.bin
 run_variant nt_d16_prefetch  $BIN                 build/taskgraph_d16_prefetch.bin
 run_variant nt_d16_v1        $BIN                 build/taskgraph_d16.bin          --tokens-per-launch 1
-run_variant nt_d16_kva       $BIN                 build/taskgraph_d16_kva.bin
+run_variant nt_d16_kvarep    $BIN                 build/taskgraph_d16_kvarep.bin
 run_variant nt_d16_split18_k512 $BIN              build/taskgraph_d16_split18_k512.bin
 run_variant nt_d16_split18   $BIN                 build/taskgraph_d16_split18.bin
 run_variant nt_d16_split22_k512 $BIN              build/taskgraph_d16_split22_k512.bin
-run_variant nt_d16_kva_split18_k512 $BIN          build/taskgraph_d16_kva_split18_k512.bin
-for v in kva split18_k512; do
+for v in kvarep split18_k512; do
   $BIN --graph build/taskgraph_d16_$v.bin --repeat 1 --trace results/trace_$v.bin > /dev/null 2>&1
   python3 scripts/trace_timeline.py results/trace_$v.bin build/taskgraph_d16_$v.bin --layer 5 | tee results/timeline_${v}_L5.txt
 done

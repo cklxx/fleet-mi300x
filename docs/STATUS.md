@@ -9,8 +9,8 @@ to be stated plainly, not just for code.
 
 ## Where this is (2026-09-15, after three sessions on the MI300X)
 
-**End to end works, matches HuggingFace, and runs at 3.75 ms per token —
-faster than vLLM on the same box (4.52 ms).** On a Hot Aisle 1×MI300X VM
+**End to end works, matches HuggingFace, and runs at 3.63 ms per token —
+20% faster than vLLM on the same box (4.52 ms).** On a Hot Aisle 1×MI300X VM
 (ROCm 7.2, gfx942), one cooperative launch decodes all 32 greedy tokens over
 the 1,024-token context; the argmax task of each token feeds the next
 token's embed on the device. Every token equals HF's greedy choice, and on
@@ -19,24 +19,27 @@ per-layer states. The required milestone (one MoE layer through the Fleet
 path) holds for every MoE layer and the stretch goal (full model, e2e,
 single launch) as well. Raw numbers: [`results/`](../results/).
 
-| Measured (v0.14, fresh VM, one unattended `hotaisle_bootstrap.sh` run: `fleet_decode_nt`, `taskgraph_d16.bin`) | Value |
+| Measured (v0.15: `fleet_decode_nt`, `taskgraph_d16.bin`; session 5 on a fresh VM) | Value |
 |---|---|
-| Tokens matching HF greedy, free-running / teacher-forced | 32/32 and 32/32 (`results/decode_free.json`, `decode_teacher.json`) |
+| Tokens matching HF greedy, free-running / teacher-forced | 32/32 and 32/32 (`results/decode_final_r*.json`, `decode_final_teacher.json`) |
 | Layers inside the §6 gate on step 0 | 27 of 27 |
-| Per-token latency, median / p95, **one launch for 32 tokens** | **3.756 / 3.781 ms (266 tok/s)**; five runs in the session 3.746–3.763 ms. (The previous VM gave 3.733 once and 3.93 on re-runs: ~5% between VMs/sessions, <1% within this one) |
-| One launch per token (v1) | 3.757 ms: the single launch is the design's v2 delivered, not a speed-up |
-| `--coherent-acts` (atomic cross-XCD activations, no consumer L2 invalidate) | 3.748–3.763 ms: no longer faster once the prologue loads were vectorised; off |
-| Same kernel with plain loads (`fleet_decode`) / with 8 KV chunks / K-chunk tiling / prefetch | 3.865 / 3.845 / 4.041 / 4.134 ms (`results/decode_*.json`) |
+| Per-token latency, median / p95, **one launch for 32 tokens** | **3.624–3.628 / 3.638–3.652 ms (276 tok/s)** over three runs; teacher-forced 3.623 ms |
+| The same session's earlier binary (v0.14) for scale | 3.723–3.731 ms; between VMs/sessions the same binary has varied by ~5% (3.73–3.93), within a session <1% |
+| One launch per token (v1, v0.14 binary) | 3.733 ms: the single launch is the design's v2 delivered, not a speed-up |
+| `--coherent-acts` (atomic cross-XCD activations, no consumer L2 invalidate; v0.14) | 3.747–3.768 vs 3.723–3.731 fenced: not faster; off |
+| Variants (v0.14 binary): plain loads / 8 KV chunks / K-chunk tiling / prefetch / kv_a replicated (v0.15) | 3.941 / 3.818 / 4.020 / 4.121 / 3.640–3.653 ms (`results/decode_*.json`) |
+| Expert phase on split worker groups (18 gate_up + 19 down per XCD) with / without tiling; 22 + 15 with tiling | 4.784 / 4.150 / 4.834 ms: an XCD's bandwidth needs all 37 CUs, 18 pull 44 µs of gate_up instead of 33 |
 | **vLLM 0.11.2 on the same VM** (rocm/vllm docker, V1 engine, AITER MLA backend, full CUDA graphs, bf16, batch 1, same prompt) | 4.522 ms median / 4.553 mean (220 tok/s), 32/32 tokens equal to the golden ones; `results/baseline_vllm.json`, `bench/vllm_decode_timing.py` |
 | HF transformers 4.44 eager (torch 2.10 rocm7.0), same prompt | 54.4 ms (18 tok/s); `results/baseline_hf.json` |
 | Where the first correct version stood | 22.05 ms |
 | Protocol only (`--smoke`, 1346 events, no task bodies) | 2.84 ms per token with the fences, 2.20 ms without (smoke has no bodies, so the fences are its whole cost) |
-| Global events per MoE layer / per token | 2 / 58 (v0.10 had 3 / 85) |
+| Global events per MoE layer / per token | 3 / 85 (q/kv_a, o_proj, down; v0.10 had merge instead of q/kv_a) |
 | Cross-XCD event, idle / under load (`results/microbench_summary.txt`) | 1.36 µs / 5.88 µs at 1.59 TB/s of streaming load |
 | Payload visibility (`microbench (d)(d')(d''')`) | fenced protocol 0 stale in 16.4 M; 37 producers + last-arriver flush 0 stale in 151 M each; agent-scope atomic payload without fences 0 stale in 16.4 M. MTYPE-UC memory without fences (d''): 12.3 M of 16.4 M stale — not usable on this VM |
 | Streamed read bandwidth, best depth | 4.2 TB/s (79% of peak) |
-| **Bytes per token, measured** (`rocprofv3 --pmc FETCH_SIZE`, 4 teacher-forced tokens, `results/rocprofv3_fetch_size.csv`) | 22.66 GB for 4 tokens = **5.67 GB/token**, 15% above §1's 4.94 GB (kv_a replicated per XCD, the partial folds, L2 misses); at 3.756 ms that is **1.51 TB/s** of the 4.2 TB/s ceiling (byte floor at the measured bytes: 1.35 ms) |
-| Kernel resources (`results/kernel_resource_usage.txt`) | 256 VGPRs, 48 B/lane scratch, ~430 SGPR spills, 25 KB LDS, 1 wave/SIMD |
+| **Bytes per token, measured** (`rocprofv3 --pmc FETCH_SIZE`, 4 teacher-forced tokens, v0.14 graph, `results/rocprofv3_fetch_size.csv`) | 22.66 GB for 4 tokens = **5.67 GB/token**, 15% above §1's 4.94 GB (kv_a replicated per XCD — now removed, −0.51 GB —, the partial folds, L2 misses); at 3.63 ms and ~5.2 GB that is ~**1.4 TB/s** of the 4.2 TB/s ceiling |
+| Protocol only (`--smoke`, 1157 events, no task bodies) | 3.01 ms per token: with no bodies every wait is back-to-back, so this is the protocol's worst case, not its share of the 3.63 |
+| Kernel resources (`results/kernel_resource_usage.txt`, `results/isa_summary.txt`) | 256 VGPRs + 72 AGPRs (VGPR spill space), 472 SGPR spills, 112 B of stack (4 scratch instructions, none in a GEMV loop), 25 KB LDS, 1 wave/SIMD. The weight-streaming basic blocks (16–18 `global_load_dwordx4` each) carry 0 scratch and 2 AGPR moves: **the in-kernel vs isolated GEMV gap is not register pressure** |
 | KV-cache conversion vs HF's own cache | K_nope, K_rope, V all exactly 0 error, 27 layers |
 
 `rocprofv3` (and `rocprof` v1) crash at process exit on this VM (ROCm
@@ -66,37 +69,43 @@ the decode kernel is written before the crash; both tools agree
 | idle-worker prefetch of routing-independent weights into the Infinity Cache (`--prefetch`) | no gain (4.84 vs 4.80; 4.77 vs 4.70 with NT) | kept as a graph option; the per-CU streaming rate (~30 GB/s) limits what 21 idle workers can pull in 20 µs to ~60 MB/layer, and the phases that would benefit are latency-bound, not byte-bound |
 | fold with all 72 partial loads in flight (one round trip instead of two) | +0.1 ms (**slower**) | 48 B/lane of scratch: the register file, again |
 | **v0.14** — 16-byte loads for every staged vector and for the fold (18 loads per thread in flight instead of 36 scalar ones in two batches); merge partials in two batches of 8 | 3.75 ms, and the run-to-run spread within a session fell below 1% | the prologues did *not* get shorter (7.5 / 8.3 / 7.2 / 5.6 µs), so the round-trip count was not what bounded them; the scratch stayed at 48 B/lane, so the merge was not its source either |
+| a second stamp splits each prologue into staging vs the rest | — | q/kv_a 7.4 = 4.9 fold + 2.5 norm; router 7.4 = 4.7 + 2.7; attention 8.0 = 3.4 kv_post + 4.6 q_absorb; **gate_up 5.5 = 4.9 routing (64 logits from L2 under full load, softmax, top-k) + 0.6 staging; down 5.7, the same routing again** |
+| **v0.15** — down reuses the routing its own worker's gate_up left in LDS (`ROUTING_CACHED`, the validator checks the queue order); kv_a computed once, split over the 8 XCDs behind one global event instead of replicated (`--kva-replicated` restores the old graph) | **3.63 ms** | down's prologue 5.7 → 1.6 µs (−2.2%); q/kv_a 23.2 → 18.6 µs but attention's kv_post now reads kv_a from another XCD's write (+2 µs), net −0.6%, and 0.51 GB/token fewer bytes |
+| expert phase on two worker groups so the K-chunk tiling can overlap gate_up and down | 4.15–4.83 ms (**slower**) | 18 CUs stream gate_up in 44 µs where 37 take 33: an XCD's share of HBM needs every CU issuing; the tiling on top makes it worse again |
 
 Tried and rejected by measurement: two workgroups per CU (6.5 ms: the
 kernel's 256 VGPRs leave no room for a second wave per SIMD); workers polling
 the global counters directly instead of the scheduler mirror (slower);
 16-chunk-per-lane GEMV batches (register cap, scratch spills); the one-writer
-fold; K-chunk tiling of gate_up→down; idle-worker prefetch; MTYPE-UC
-activations without fences (wrong: bench (d'')).
+fold; K-chunk tiling of gate_up→down on one worker group (nothing overlaps)
+and on two (too few CUs per group); idle-worker prefetch; MTYPE-UC
+activations without fences (wrong: bench (d'')); fence-free coherent
+activations (no gain). Not tried, by arithmetic: a per-head q_absorb task
+— 16 chunk tasks do it in parallel today, one task would do it serially
+for the same wall time plus an event.
 
-Where the 3.75 ms goes (`results/timeline_free_L5.txt`, layer 5, 133 µs;
-"prologue" is staging + norm + fold + routing before the stream):
+Where the 3.63 ms goes (`results/timeline_final_L5.txt`, layer 5, 128 µs;
+"prologue" is everything before the weight stream, "staging" its first part):
 
-| phase | starts | ends | avg task busy | of which prologue |
-|---|---|---|---|---|
-| q/kv_a | 0 | 22.6 | 21.1 | 7.5 |
-| attention (256 tasks) | 21.8 | 41.2 | 16.9 | 8.3 |
-| merge + W_UV (256) | 38.9 | 51.4 | 8.9 | — |
-| o_proj K-split | 48.8 | 59.7 | 6.7 | 0.6 |
-| norm + router | 60.4 | 73.8 | 10.6 | 7.2 |
-| expert gate_up | 72.0 | 107.6 | 33.5 | 5.6 |
-| expert down | 105.6 | 132.8 | 23.0 | 5.8 |
+| phase | starts | ends | avg task busy | prologue | of it: staging |
+|---|---|---|---|---|---|
+| q/kv_a | 0 | 18.6 | 16.7 | 7.4 | 4.9 (fold) |
+| attention (256 tasks) | 19.8 | 39.9 | 18.8 | 10.0 | 5.5 (kv_post) |
+| merge + W_UV (256) | 39.2 | 50.2 | 8.9 | — | — |
+| o_proj K-split | 48.8 | 58.9 | 6.9 | 0.7 | — |
+| norm + router | 59.7 | 71.8 | 10.8 | 7.4 | 4.7 (fold) |
+| expert gate_up | 71.4 | 107.2 | 33.5 | 5.7 | 5.0 (routing) |
+| expert down | 105.4 | 127.6 | 18.3 | 1.6 | — |
 
 Events cost under 1 µs each now (2 global + 48 XCD-local per layer); the
 gaps between phases are 0.4–1 µs. What remains is the phases themselves,
 and inside them the prologues: every one of the 296 workers stages 8 KB of
 x (and 64 KB of partials at the two fold points) from HBM/Infinity Cache
-under full streaming load. Halving the number of load round trips (v0.14)
-did not shorten them, so the cost is not the loads' latency alone; the
-RMSNorm's block reductions and the routing (softmax + top-k on one wave)
-are the next suspects, and the sub-phase stamps can be moved to split
-them. The 27 layers × ~36 µs of prologue ≈ 1 ms of the 3.75. The lm_head
-streams 420 MB at 3.1 TB/s (135 µs) and its prologue is 9 µs.
+under full streaming load. The split stamps say what it is: a 64 KB fold
+or a 64-logit routing read costs ~5 µs under load whether it is 18 loads
+or 72, and a 2048-float RMSNorm ~2.5 µs. The 27 layers × ~32 µs of
+prologue ≈ 0.9 ms of the 3.63. The lm_head streams 420 MB at 3.1 TB/s
+(136 µs) and its prologue is 9 µs.
 
 ### Third session: the "far goal" route and what survived contact
 
@@ -106,7 +115,9 @@ The plan was eight structural steps to ~2.5 ms. Measured one by one:
 |---|---|
 | 1. `rocprofv3 --pmc FETCH_SIZE` | obtained on the third try (without `--kernel-trace`): 5.67 GB/token, 15% over §1 |
 | 2. Fold once by the globally last worker, single `x` | slower (serial ~4 µs per fold point); replaced by the parallel prologue fold with a ping-pong `x` and a separate o_proj partial buffer |
-| 3. Tile-granular gate_up→down | slower; down and gate_up share workers, so nothing overlaps. The machinery (per-wave chunk arrivals, in-body chunk waits, K-chunked accumulation) stays behind `--k-chunk` |
+| 2b. kv_a once instead of 8 copies | kept (v0.15): −0.6%, −0.51 GB/token |
+| 2c. Routing once per worker instead of twice | kept (v0.15): −2.2% |
+| 3. Tile-granular gate_up→down | slower on one worker group (nothing overlaps) and slower again on two (`--split-workers`: 18 CUs cannot pull an XCD's share of HBM). The machinery stays behind `--k-chunk` / `--split-workers` |
 | 4. o_proj K-split per XCD | kept: merge→o_proj is XCD-local, 2 global events per layer; needed the half-wave GEMV to pay off |
 | 5. Activations without L2 fences | MTYPE-UC allocation does not deliver it here (bench d''); agent-scope atomic payload accesses do (bench d'''): `--coherent-acts`, see below |
 | 6. Non-temporal weight streams | kept, −4% |
@@ -215,17 +226,18 @@ happening to be zero; the routing weight is multiplied by
 
 ## Known limitations, open risks
 
-1. **The design target (2.5–3.5 ms) is not reached: 3.75 ms**, 1.51 TB/s
-   of a 4.2 TB/s ceiling at the measured 5.67 GB/token (byte floor 1.35 ms),
-   against Fleet's own 44% of peak on a dense model. The token is 27 serial layers of seven serial
+1. **The design target (2.5–3.5 ms) is not reached: 3.63 ms**, ~1.4 TB/s
+   of a 4.2 TB/s ceiling at ~5.2 GB/token (byte floor ~1.25 ms), against
+   Fleet's own 44% of peak on a dense model. The token is 27 serial layers of seven serial
    phases; events are no longer the cost (< 1 µs each), the per-task
    prologues and the latency-bound phases (q/kv_a with 28 rows per worker,
    attention at 1K context, router) are. It beats vLLM on the same box by
-   18% (4.52 ms) with bit-exact HF greedy tokens.
-2. **Bytes per token are 5.67 GB, not the 4.935 GB of §1** (measured,
-   `FETCH_SIZE`). Every XCD recomputes all 576 kv_a rows (0.51 GB/token of
-   HBM reads) and every worker folds the 8 partials itself (64 KB per
-   worker per fold point); the rest is L2 misses on the shared tensors.
+   20% (4.52 ms) with bit-exact HF greedy tokens.
+2. **Bytes per token were 5.67 GB, not the 4.935 GB of §1** (measured,
+   `FETCH_SIZE`, v0.14). Of the excess, 0.51 GB was the replicated kv_a
+   (gone in v0.15, not re-measured: the profiler crashes at exit and the
+   run was not repeated); every worker still folds the 8 partials itself
+   (64 KB per worker per fold point) and the rest is L2 misses.
 3. **`--coherent-acts` is validated by measurement, not only by the memory
    model.** Cross-XCD activations go through agent-scope atomic loads and
    stores, and global waits skip the L2 invalidate (except the token
@@ -238,11 +250,12 @@ happening to be zero; the routing weight is multiplied by
    (3.748–3.763 vs 3.746–3.756 ms). Why the write-through atomic store is
    not enough without the writeback is not understood. Off by default; the
    headline number uses the fenced protocol.
-4. The expert GEMVs still run slower inside the kernel (34 µs gate_up) than
-   in isolation (25 µs, `microbench (f)`); the sub-phase stamps attribute
-   6 µs of it to the prologue (routing + staging under load) and the rest
-   to the stream itself in the union kernel's register environment
-   (256 VGPRs, 48 B/lane scratch since the 16-chunk merge).
+4. The expert GEMVs still run slower inside the kernel (33.5 µs gate_up)
+   than in isolation (25 µs, `microbench (f)`). The ISA rules out register
+   pressure (the streaming loops have no spill traffic); the sub-phase
+   stamps attribute 5 µs to the routing read; the remaining ~4 µs is the
+   stream itself under 296-CU contention plus the per-wave chunk arrival
+   at the end.
 5. Attention's lane mapping is specialised to `kv_lora = 512`,
    `qk_rope = 64`; the launcher refuses other shapes.
 6. `transformers` 5.x vs the vendored modeling file: pinned `<5` on the box;
@@ -254,22 +267,20 @@ happening to be zero; the routing weight is multiplied by
 
 ## Next, in order
 
-1. Split the prologue with more stamps (after staging, after the norm,
-   after routing) — vectorising the loads changed nothing, so the ~7 µs
-   is somewhere else, most likely the norm's two block reductions and the
-   per-task routing; then stage the normed vector once per XCD (one
-   XCD-local event) instead of 296 workers each norming it. ~1 ms of the
-   3.75 is prologue.
-2. The register environment: 48 B/lane of scratch is not the merge (batching
-   its loads changed nothing); find it with `-save-temps` and the ISA, or
-   move attention/merge into a separate code path so the GEMVs get their
-   registers back.
-3. Bytes in flight per CU: the GEMV streams ~48 KB per CU; a third buffer
+1. The gate_up routing read (5 µs/layer): let the router phase's last
+   arriver per XCD write the top-k (8 ids + 8 weights) so the expert tasks
+   read 64 B instead of 64 logits and skip the softmax; ~0.1 ms.
+2. The two folds (4.9 µs each per layer, ~0.26 ms/token): the bytes are
+   not the cost (18 vs 72 loads made no difference), the round trip under
+   load is; the only way out is fewer of them, e.g. the router's fold
+   result published by one worker per XCD and re-read from L2.
+3. The attention prologue (10 µs of 18.8 with the shared kv_a): kv_post
+   reads kv_a from another XCD's memory now; a per-XCD copy written by the
+   q/kv_a workers of that XCD alongside the shared one would keep the
+   byte saving and the local read.
+4. Bytes in flight per CU: the GEMV streams ~48 KB per CU; a third buffer
    in AGPRs (loads can target AGPRs on gfx942) or LDS-direct loads would
    raise it without touching occupancy.
-4. kv_a replication: 8 × 576 rows per layer is 0.51 GB of the measured
-   5.67 GB/token; compute it once per XCD pair or accept the global event
-   and measure.
-5. Understand why `--coherent-acts` needs the producer writeback; if the
-   answer allows dropping it, the protocol cost (2.2 vs 2.9 ms in the
-   body-less smoke run) says there is ~0.1 ms in it.
+5. Understand why `--coherent-acts` needs the producer writeback; the
+   protocol's worst case (3.0 ms in the body-less smoke run) says the
+   fences are not free even though dropping the acquires bought nothing.

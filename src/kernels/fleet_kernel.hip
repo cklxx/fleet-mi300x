@@ -483,7 +483,13 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
         }
 
         case TASK_EXPERT_DOWN: {
-            select_experts(d, act.router_logits + (int64_t)xcd * d.n_routed, s.ids, s.ws);
+            // the routing (64 logits from L2 under full streaming load, then
+            // softmax + top-k on one wave) measured 4.9 us; when this
+            // worker's previous descriptor was the layer's gate_up the
+            // choice is still in s.ids / s.ws
+            if (!(t.flags & FLAG_ROUTING_CACHED)) {
+                select_experts(d, act.router_logits + (int64_t)xcd * d.n_routed, s.ids, s.ws);
+            }
             const ExpertUnit u = resolve_unit(
                 t.expert_slot, w.layer_experts[L], w.layer_shared[L],
                 s.ids, s.ws, d.routed_scaling, d.hidden, d.moe_inter, d.moe_inter * 2,

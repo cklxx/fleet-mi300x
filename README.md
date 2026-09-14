@@ -106,12 +106,12 @@ step with its trace attribution in [docs/STATUS.md](docs/STATUS.md).
 |---|---|
 | Greedy tokens matching HF, free-running / teacher-forced | 32/32 and 32/32 |
 | Layers inside the §6 gate on the first decode step | 27 of 27 (layer 1: max rel 3.1e-3, cosine 0.999993) |
-| Per-token latency, median / p95, one cooperative launch for all 32 tokens | **3.76 ms / 3.78 ms (266 tok/s)**, five runs of the final session within 3.746–3.763; first correct version was 22.05 ms |
-| Bytes per token, measured (`rocprofv3 FETCH_SIZE`) | 5.67 GB → 1.51 TB/s of the 4.2 TB/s streaming ceiling |
+| Per-token latency, median / p95, one cooperative launch for all 32 tokens | **3.63 ms / 3.64 ms (276 tok/s)**, three runs within 3.624–3.628; first correct version was 22.05 ms |
+| Bytes per token, measured (`rocprofv3 FETCH_SIZE`, before kv_a stopped being replicated) | 5.67 GB; ~5.2 GB now → ~1.4 TB/s of the 4.2 TB/s streaming ceiling |
 | **vLLM 0.11.2 on the same VM** (AITER MLA backend, CUDA graphs, bf16, batch 1, same prompt; `bench/vllm_decode_timing.py`) | 4.52 ms (220 tok/s), same 32 tokens |
 | HF transformers eager on the same VM | 54.4 ms |
 | Launches per 32 tokens | 1 (the argmax task feeds the next embed on the device) |
-| Global events per MoE layer / per token | 2 / 58 |
+| Global events per MoE layer / per token | 3 / 85 (q/kv_a, o_proj, down) |
 | Cross-XCD event, idle / under load (`results/microbench_summary.txt`) | 1.40 µs / 6.00 µs at 1.66 TB/s of streaming load |
 | Payload visibility under the kernel's fence placement (37 producers, one last-arriver flush) | 0 stale words in 151 M, same-XCD and cross-XCD |
 | Streamed read bandwidth / byte floor at it | 4.2 TB/s / 1.17 ms per token |

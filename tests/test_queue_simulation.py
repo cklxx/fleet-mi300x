@@ -149,7 +149,7 @@ def simulate(tasks: list[dict], epochs: int, order: str, seed: int = 0,
 def main() -> int:
     results = []
     variants = [dict(kv_chunks=1), dict(kv_chunks=8), dict(kv_chunks=8, prefetch=True),
-                dict(kv_chunks=16, kva_shared=True),
+                dict(kv_chunks=16, kva_shared=False),
                 dict(kv_chunks=16, split_workers=18, k_chunk=512)]
     for v in variants:
         kv_chunks, prefetch = v["kv_chunks"], v.get("prefetch", False)
