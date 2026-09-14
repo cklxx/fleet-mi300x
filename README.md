@@ -95,21 +95,22 @@ golden run comes next because every later boundary is judged against it.
 imports symbols that transformers 5 removed. Results should be reproduced under
 that pin.
 
-## Measured (1×MI300X, Hot Aisle, ROCm 7.2, 2026-09-14)
+## Measured (1×MI300X, Hot Aisle, ROCm 7.2, 2026-09-14/15)
 
-Raw files in [`results/`](results/); the narrative and the trace-driven
-optimisation steps in [docs/STATUS.md](docs/STATUS.md).
+Raw files in [`results/`](results/); the narrative and every optimisation
+step with its trace attribution in [docs/STATUS.md](docs/STATUS.md).
 
 | | |
 |---|---|
 | Greedy tokens matching HF, free-running / teacher-forced | 32/32 and 32/32 |
 | Layers inside the §6 gate on the first decode step | 27 of 27 (layer 1: max rel 3.1e-3, cosine 0.999993) |
-| Per-token latency, median / p95, one launch per token | 5.46 ms / 5.51 ms (171 tok/s); first correct version was 22.05 ms |
-| Protocol alone (`--smoke`, 805 events, no task bodies) | 1.17 ms per token |
+| Per-token latency, median / p95, one cooperative launch for all 32 tokens | **4.08 ms / 4.11 ms (245 tok/s)**; first correct version was 22.05 ms |
+| Launches per 32 tokens | 1 (the argmax task feeds the next embed on the device) |
+| Global events per MoE layer / per token | 3 / 85 |
+| Protocol alone (`--smoke`, no task bodies) | 1.06 ms per token |
 | Cross-XCD event, idle / under a 1.46 TB/s stream | 1.44 µs / 6.0 µs |
-| Cross-XCD payload visibility under the kernel's fence placement | 0 stale words in 16.4 M |
-| Streamed read bandwidth | 4.25 TB/s at depth 8 (80% of peak) |
-| Byte floor at that bandwidth | 1.16 ms per token |
+| Payload visibility under the kernel's fence placement (37 producers, one last-arriver flush) | 0 stale words in 151 M, same-XCD and cross-XCD |
+| Streamed read bandwidth / byte floor at it | 4.2 TB/s / 1.17 ms per token |
 
 ## Why the numbers in the design are checkable
 

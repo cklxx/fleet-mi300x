@@ -7,54 +7,64 @@ This file tracks what is done, what is verified, and what is known to be
 missing — the task asks for the milestone reached and the remaining limitations
 to be stated plainly, not just for code.
 
-## Where this is (2026-09-14, first day on the MI300X)
+## Where this is (2026-09-15, after two days on the MI300X)
 
-**End to end works and matches HuggingFace.** On a Hot Aisle 1×MI300X VM
-(ROCm 7.2, gfx942), the persistent kernel decodes 32 greedy tokens over the
-1,024-token context, free-running (its own tokens fed back) and teacher-forced,
-and every token equals HF's; the smallest top-2 logit margin in the run is
-6.6, so this is not a lucky tie. On the first decode step all 27 layers are
-inside the §6 gate against HF's per-layer states (max rel ≤ 1.5e-2, cosine
-≥ 0.9995; layer 1, the first MoE layer, is at 3.1e-3 / 0.999993). The
-required milestone — one MoE layer through the Fleet path — is therefore met
-for every MoE layer, and the stretch goal (full model, e2e) as well.
+**End to end works, matches HuggingFace, and runs at 4.08 ms per token.** On a
+Hot Aisle 1×MI300X VM (ROCm 7.2, gfx942), one cooperative launch decodes all
+32 greedy tokens over the 1,024-token context; the argmax task of each token
+feeds the next token's embed on the device. Free-running and teacher-forced,
+every token equals HF's (smallest top-2 margin in the run 6.6), and on the
+first decode step all 27 layers are inside the §6 gate against HF's
+per-layer states (layer 1: max rel 3.1e-3, cosine 0.999993). The required
+milestone (one MoE layer through the Fleet path) holds for every MoE layer
+and the stretch goal (full model, e2e, single launch) as well.
 Raw numbers: [`results/`](../results/).
 
 | Measured | Value |
 |---|---|
 | Tokens matching HF greedy, free-running / teacher-forced | 32/32 and 32/32 |
 | Layers inside the §6 gate on step 0 | 27 of 27 |
-| Per-token latency, median / p95 (1 launch per token), split-KV ×8 graph | **5.46 ms / 5.51 ms (171 tok/s)** free-running; 5.41 ms teacher-forced; the first version of the day was 22.05 ms |
-| Protocol only (`--smoke`, all 805 events, no task bodies) | 1.17 ms per token |
-| Cross-XCD event, idle / under a 1.46 TB/s stream | 1.44 µs / 6.0 µs (§9 was 2–4 µs) |
-| Cross-XCD payload visibility (4 waves store, thread 0 releases) | 0 stale words in 16.4 M |
-| Streamed read bandwidth, best depth | 4.25 TB/s at depth 8 (80% of peak) |
-| Kernel resources | 253 VGPRs, 0 AGPRs, 24 KB LDS, 1 wave/SIMD (the design point), 169 SGPR spills, 80 B/lane scratch |
+| Per-token latency, median / p95, **one launch for 32 tokens** | **4.08 ms / 4.11 ms (245 tok/s)**; 4.09 ms wall per token including the launch |
+| Same, one launch per token (v1, for comparison) | 4.07 ms on the device, 4.11 ms wall per token with 32 launches vs 4.09 with one: the launch itself is cheap; the single launch is the design's v2 delivered, not a speed-up |
+| Where the first version of the day stood | 22.05 ms |
+| Protocol only (`--smoke`, 1157 events, no task bodies), one token per launch | 1.06 ms per token |
+| Cross-XCD event, idle / under a 1.46 TB/s stream | 1.44 µs / 6.0 µs |
+| Payload visibility: 37 producers, drained stores, one last-arriver flush; same-XCD consumer with an L1-only acquire, cross-XCD consumer | 0 stale words in 151 M, each |
+| The kernel's expert GEMVs in isolation (`microbench (f)`) | 3.9 TB/s gate_up, 3.8 TB/s with down; with the per-producer flush protocol 2.8 TB/s, with the last-arriver flush 3.3 TB/s |
+| Streamed read bandwidth, best depth | 4.2 TB/s (79% of peak) |
+| Kernel resources | 253 VGPRs, 0 AGPRs, 0 scratch, 24 KB LDS, 1 wave/SIMD |
 | KV-cache conversion vs HF's own cache | K_nope, K_rope, V all exactly 0 error, 27 layers |
 
-**From 22 ms to 6.5 ms in four steps, each attributed by the per-task trace**
-(`results/trace_d2_summary.txt` before, `results/trace_d4_summary.txt` after):
+**From 22 ms to 4.1 ms**, each step attributed by the per-task trace
+(`results/trace_d2_summary.txt` … `trace_d8_summary.txt`):
 
 | Step | Per token | What the trace said and what changed |
 |---|---|---|
-| first run | 22.05 ms | MoE layer critical path ~810 µs: attention 296 µs/task, router 371 µs |
-| router top-k mask in registers | 13.7 ms | `bool taken[64]` was in scratch memory and thread 0 paid a memory round trip per element; a 64-bit mask made it 68 µs |
-| q-absorb streamed by rows; GEMV depth 8 | 11.6 ms | the attention prologue walked 128 rows per output column with one dependent load each; streaming W_UK rows made attention 203 µs. Depth 8 changed nothing: with a dozen rows per worker the GEMV tasks are latency-bound, not bandwidth-bound |
-| split-KV graph (4 chunks/head, 64 tasks/layer) | 7.65 ms | attention 61 µs/task; the `taskgraph_d4.bin` from D0, no kernel change |
-| prologues unrolled; router softmax/top-k as wave reductions | 6.50 ms | `stage_vector` / RMSNorm loads all in flight; router 31 µs; MoE layer critical path ~227 µs |
-| GEMV tails batched, 8 chunks/head split-KV | 5.35 ms | with depth 8 and K = 2048 every row had been going through a one-load-at-a-time tail loop (so "depth 8" never happened); now every partial batch is issued in full. Attention 37 µs/task on `taskgraph_d8.bin` |
-| 16 loads in flight per lane in every GEMV shape; direct polling A/B | **5.46 ms** | no gain: the expert GEMVs already stream at ~2.4 TB/s aggregate and the small ones are round-trip bound. Workers polling the global counters directly instead of the scheduler mirror is *slower* (5.8 ms): 296 fabric pollers cost more than the mirror hop, which settles §4's open question in favour of the scheduler |
+| first run | 22.05 ms | attention 296 µs/task, router 371 µs |
+| router top-k out of scratch memory, then as wave reductions | 13.7 → 6.5 ms (with the next two) | `bool taken[64]` lived in scratch; 371 → 68 → 31 µs |
+| q-absorb streamed by W_UK rows | | the per-column walk with a dependent load per row was the 296 µs, not the position loop |
+| split-KV ×4, then ×8 | | attention 296 → 61 → 37 µs/task |
+| GEMV tails batched; prologue loads unrolled | 5.35 ms | with depth 8 and K = 2048 every row had gone through a one-load-at-a-time tail; "depth 8" had never happened |
+| three global events per layer instead of six; in-kernel token loop | 5.33 ms | head-aligned q/kv_a, per-XCD router, folded reduce; the protocol cost fell (1.17 → 1.06 ms/token) but q/kv_a grew with more rows and the fold; one launch for 32 tokens |
+| batched attention score reduction | 5.04 ms | 8 interleaved shuffle trees instead of 8 dependent ones: 39 → 25 µs/task |
+| last-arriver L2 flush (the Fleet scheme) | 4.71 ms | per-producer `buffer_wbl2` measured at 13 µs/layer on the expert phase alone; one flush per XCD per event, validated by (d′) |
+| router and merge spread over the XCD's 37 workers | 4.31 ms | one CU cannot stream 256 KB (router) or 128 KB (W_UV) fast enough: 22 → 9 µs and 12 → 8 µs |
+| merge loads unrolled; L1-only acquire for XCD-local waits | **4.08 ms** | partial-merge loads in flight together (12.7 → 7.6 µs); a same-L2 consumer invalidates only its L1 instead of the L2 that 36 workers stream through |
 
-Where the remaining 5.4 ms goes (per MoE layer, ~190 µs; `results/trace_d8_mirror_summary.txt`):
-gate_up 39, attention 38, router 20, down 20, merge 20, q/kv_a 16, o_proj 12,
-reduce 5, and ~6 global events at ~6 µs each. The layer's bytes at the
-measured 4.25 TB/s are 39 µs, so the layer runs at ~20% of the bandwidth
-ceiling; per token that is 5.4 ms against a 1.2 ms byte floor and a 1.2 ms
-protocol cost. The levers left are §12's cross-task prefetch (the small
-GEMVs pay 2–4 round trips each that could overlap the preceding event
-wait), fusing merge into attention, and fewer, larger tasks for q/kv_a and
-o_proj so each worker streams more than a dozen rows. The design's
-2.5–3.5 ms target was not reached in the day on the machine.
+Tried and rejected by measurement: two workgroups per CU (6.5 ms: per-CU
+parallelism does not bound the expert GEMVs); workers polling the global
+counters directly instead of the scheduler mirror (slower); 16-chunk-per-lane
+GEMV batches (register cap, scratch spills).
+
+Where the remaining 4.1 ms goes (per MoE layer, ~142 µs): gate_up 36,
+down 23, attention 22, q/kv_a 21 (26 rows/worker plus the 64 KB partial fold),
+router 9.5, o_proj 8.5, merge 7.6, and ~15 µs of events. The expert GEMVs
+still run 1.5× slower inside the kernel than the same code does in
+isolation (36 vs 23–27 µs); the protocol around them has been taken apart
+piece by piece (flush, acquire, barrier) and accounts for roughly half of
+that gap. The design's 2.5–3.5 ms target is not reached; 4.08 ms is 28% of
+the measured 4.2 TB/s ceiling (the byte floor is 1.17 ms) against Fleet's
+own 44% on a dense model.
 
 ## Review pass before GPU time (2026-09-13)
 

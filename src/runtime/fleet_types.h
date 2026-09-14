@@ -73,8 +73,8 @@ struct Activations {
     float* __restrict__ expert_h;      // [kNumXCDs][moe_inter], or [dense_inter]
     float* __restrict__ expert_out;    // [kNumXCDs][hidden] partials, folded later
     float* __restrict__ logits;        // [vocab]
-    int32_t* __restrict__ topk_ids;    // [kNumXCDs][top_k]
-    float* __restrict__ topk_w;        // [kNumXCDs][top_k]
+    float* __restrict__ router_logits; // [kNumXCDs][n_routed], fp32; the expert
+                                       // tasks derive top-k from it themselves
     const float* __restrict__ cos;     // [max_pos][qk_rope] YaRN tables; the kernel
     const float* __restrict__ sin;     // indexes them by position
     float* __restrict__ layer_dump;    // [layers][hidden] each layer's output x on

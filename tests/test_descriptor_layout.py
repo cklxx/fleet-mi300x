@@ -30,7 +30,8 @@ C_SCALARS = {"uint16_t": ("H", 2), "int16_t": ("h", 2), "int32_t": ("i", 4),
 # be mirrored deliberately rather than silently.
 PY_FIELDS = ["kind", "layer", "xcd", "worker", "wait_event", "signal_event",
              "signal_scope", "n_split", "head", "kv_chunk", "expert_slot",
-             "wait_scope", "wait_count", "local_event", "flags", "index"]
+             "wait_scope", "wait_count", "local_event", "flags",
+             "signal_xcd_count", "index"]
 
 
 def parse_header(path: Path) -> tuple[list[tuple[str, str, int]], int]:
@@ -82,7 +83,7 @@ def main() -> int:
                   signal_event=12, signal_scope=Scope.XCD_LOCAL, head=5,
                   kv_chunk=2, expert_slot=-1, n_split=4, worker=9,
                   wait_scope=Scope.GLOBAL, wait_count=296, local_event=13,
-                  flags=Flags.SIGNAL_LAST)
+                  flags=Flags.SIGNAL_LAST, signal_xcd_count=2)
     sample.index = 40000            # > int16: the d2 graph has 33k descriptors
     packed = sample.pack()
 
@@ -107,7 +108,7 @@ def main() -> int:
               "signal_scope": int(Scope.XCD_LOCAL), "n_split": 4, "head": 5,
               "kv_chunk": 2, "expert_slot": -1, "index": 40000,
               "wait_scope": int(Scope.GLOBAL), "wait_count": 296,
-              "local_event": 13, "flags": int(Flags.SIGNAL_LAST)}
+              "local_event": 13, "flags": int(Flags.SIGNAL_LAST), "signal_xcd_count": 2}
     bad = {k: (got.get(k), expect[k]) for k in expect if got.get(k) != expect[k]}
     results.append(check("field values round-trip", not bad,
                          "" if not bad else str(bad)))

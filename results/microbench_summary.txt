@@ -1,0 +1,28 @@
+device: AMD Instinct MI300X VF  CUs 304  arch gfx942:sramecc+:xnack-
+grid: 304 workgroups x 256 threads   tick 10.00 ns
+(d) cross-XCD payload visibility: 4 waves store 32 KB, thread 0 releases, thread 0 acquires on another XCD, every word checked, 2000 rounds
+    stale words: 0 of 16384000  [PASS]
+(d') 37 producers on one XCD, drained stores, ONE last-arriver flush; a same-XCD consumer (L1-only acquire) and a cross-XCD consumer (L1+L2 acquire) verify every word, 500 rounds
+    stale words: same-XCD consumer 0, cross-XCD consumer 0, of 151552000 each  [PASS]
+(a) cross-XCD event round-trip (ping-pong, us; release+atomic+poll+acquire)
+    (i)  counters in device memory   median   1.44  p95   1.56
+    (ii) counters uncached           median   1.44  p95   1.56
+    -> design picks the cheaper: (i)  (FLEET_UNCACHED_EVENTS=1 selects ii)
+(b) same-XCD flag round-trip (us)
+    median  1.200  p95  1.320   (vs cross-XCD 1.44)
+(e) cross-XCD event round-trip while 302 workgroups stream HBM (us)
+    median   6.76  p95   8.72   (idle: 1.44)  under 1.64 TB/s of streaming load  <- the value for design.md §9
+(c) register-streamed read bandwidth by in-flight depth
+    depth  1:  2.59 TB/s
+    depth  2:  3.40 TB/s
+    depth  4:  3.74 TB/s
+    depth  8:  4.24 TB/s
+    depth 12:  4.17 TB/s
+    depth 16:  4.15 TB/s
+    -> best 4.24 TB/s = 80% of 5.3 peak (design assumes 4.0 achievable)
+(f) the kernel's expert GEMVs in isolation (gemv.h, 8 x 17.3 MB units/layer, 27 layers)
+    gate_up only           no handshake           25.0 us/layer, 3.69 TB/s; per block: mean 24.0 us, slowest 30.8 us
+    gate_up + down         no handshake           38.6 us/layer, 3.58 TB/s; per block: mean 37.5 us, slowest 45.8 us
+    gate_up + down         per-worker release     46.1 us/layer, 3.00 TB/s; per block: mean 44.0 us, slowest 49.6 us
+    gate_up + down         last-worker release    39.0 us/layer, 3.55 TB/s; per block: mean 38.2 us, slowest 40.5 us
+    -> 87% of (c)'s ceiling for gate_up alone, 84% with down; with the kernel's per-worker handshake 71%, with the last-worker flush 84%

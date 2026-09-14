@@ -558,8 +558,7 @@ int main(int argc, char** argv) {
         act.expert_h = dev_alloc<float>(std::max((size_t)kNumXCDs * d.moe_inter, (size_t)d.dense_inter));
         act.expert_out = dev_alloc<float>((size_t)kNumXCDs * d.hidden);
         act.logits = dev_alloc<float>(d.vocab);
-        act.topk_ids = dev_alloc<int32_t>((size_t)kNumXCDs * kMaxTopK);
-        act.topk_w = dev_alloc<float>((size_t)kNumXCDs * kMaxTopK);
+        act.router_logits = dev_alloc<float>((size_t)kNumXCDs * d.n_routed);
         act.layer_dump = dev_alloc<float>((size_t)d.layers * d.hidden);
 
         std::vector<float> cos_h, sin_h;

@@ -102,10 +102,12 @@ def simulate(tasks: list[dict], epochs: int, order: str, seed: int = 0,
                         local[t["xcd"]][t["local_event"]] += 1
                         do_signal = local[t["xcd"]][t["local_event"]] == epoch * t["n_split"]
                     if t["signal_event"] >= 0 and do_signal:
-                        if t["signal_scope"] == Scope.XCD_LOCAL:
-                            local[t["xcd"]][t["signal_event"]] += 1
-                        else:
-                            glob[t["signal_event"]] += 1
+                        e = t["signal_event"]
+                        local[t["xcd"]][e] += 1          # every signal arrives locally
+                        if t["signal_scope"] == Scope.GLOBAL:
+                            # the last arrival of this XCD's share adds the share
+                            if local[t["xcd"]][e] == epoch * t["signal_xcd_count"]:
+                                glob[e] += t["signal_xcd_count"]
                     head[w] += 1
                     ran += 1
                     progressed = True
@@ -124,6 +126,8 @@ def simulate(tasks: list[dict], epochs: int, order: str, seed: int = 0,
         for ev in events or []:
             e, want = ev["id"], epoch * ev["producers"]
             got = glob[e] if ev["scope"] == Scope.GLOBAL else max(local[x][e] for x in range(XCDS))
+            if ev["scope"] == Scope.GLOBAL and sum(local[x][e] for x in range(XCDS)) != want:
+                return f"epoch {epoch}: event {e} local arrivals {sum(local[x][e] for x in range(XCDS))} != {want}"
             if got != want:
                 return (f"epoch {epoch}: event {e} ({ev['label']}) count {got}, expected {want} "
                         f"— {'over' if got > want else 'under'}-signalled")
@@ -164,7 +168,7 @@ def main() -> int:
         # last-arrival rule) the global count would overshoot the producer
         # count — the simulator sees that as the final event being off, or
         # as a wait target reached early. Only meaningful with > 1 chunk.
-        if kv_chunks > 1:
+        if kv_chunks > 1 and any(t["flags"] & Flags.SIGNAL_LAST for t in tasks):
             bad = [dict(t) for t in tasks]
             for t in bad:
                 if t["flags"] & Flags.SIGNAL_LAST:

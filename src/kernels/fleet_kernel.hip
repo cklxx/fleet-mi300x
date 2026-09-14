@@ -34,6 +34,8 @@ struct Scratch {
     float q_pe[kMaxQkRope];
     float part[kWaves * kPartialStride];         // per-wave attention partials
     float logits[kMaxRouted];
+    int   ids[kMaxTopK];                         // this XCD's routing choice
+    float ws[kMaxTopK];
 };
 
 // One token's loop variables, derived from the token index of the launch.
@@ -115,40 +117,42 @@ __device__ inline void fold_x(const ModelDims& d, const Activations& act,
     }
 }
 
-// RMSNorm over the full hidden vector, then the router — once per XCD, so
-// the experts of this XCD wait on an XCD-local event. Every XCD computes
-// the same values from the same x in the same order, so the copies agree.
+// RMSNorm over the full hidden vector, then this worker's rows of the router
+// — a Chiplet-task per XCD, so the experts of this XCD wait on an XCD-local
+// event and one CU is not asked to stream 256 KB alone. Every worker norms
+// the same x in the same order; worker 0 publishes it for the experts.
 __device__ void task_norm_router(const ModelDims& d, const Weights& w,
                                  Activations& act, Scratch& s, int layer,
-                                 int xcd, bool moe) {
-    float* x_norm = act.x_norm + (int64_t)xcd * d.hidden;
+                                 int xcd, int worker, bool moe) {
     stage_vector(act.x[layer & 1], s.vec, d.hidden);
     rms_norm_lds(d, w.layer_norm_post[layer], s.vec, s.smem);
-    for (int i = threadIdx.x; i < d.hidden; i += blockDim.x) x_norm[i] = s.vec[i];
+    if (worker == 0) {
+        float* x_norm = act.x_norm + (int64_t)xcd * d.hidden;
+        for (int i = threadIdx.x; i < d.hidden; i += blockDim.x) x_norm[i] = s.vec[i];
+    }
     if (!moe) return;
+    // Router logits: fp32 throughout, matching HF's fp32 gate.
+    gemv_rows(w.layer_router[layer], d.hidden, s.vec,
+              act.router_logits + (int64_t)xcd * d.n_routed, nullptr, EPI_NONE,
+              1.f, d.n_routed, d.hidden, 0, 1, worker, kWorkersPerXCD);
+}
 
-    // Router: fp32 throughout, matching HF (softmax over 64 logits, top-k with
-    // no renormalisation because norm_topk_prob is false).
-    gemv_rows(w.layer_router[layer], d.hidden, s.vec, s.logits, nullptr, EPI_NONE,
-              1.f, d.n_routed, d.hidden, 0, 1, 0, 1);
-    __syncthreads();
-
-    // Softmax and top-k on wave 0, one expert per lane: max, sum and each of
-    // the k argmax picks are shuffle reductions.
+// Softmax over the router logits and top-k, on wave 0 with one expert per
+// lane (max, sum and each argmax pick are shuffle reductions), into LDS.
+// Run by every expert task of the XCD: 64 floats, deterministic, and it
+// saves a task and an event. Ties go to the lower index (torch.topk order).
+__device__ inline void select_experts(const ModelDims& d, const float* __restrict__ logits,
+                                      int* __restrict__ ids, float* __restrict__ ws) {
     if (threadIdx.x < kWaveLanes) {
         const int lane = threadIdx.x;
         const bool valid = lane < d.n_routed;
-        float v = valid ? s.logits[lane] : -INFINITY;
+        float v = valid ? logits[lane] : -INFINITY;
         float mx = v;
 #pragma unroll
         for (int off = kWaveLanes / 2; off; off >>= 1) mx = fmaxf(mx, __shfl_xor(mx, off, kWaveLanes));
         float p = valid ? __expf(v - mx) : 0.f;
         const float inv = 1.f / wave_sum(p);
         p *= inv;
-
-        // top-k by selection; ties go to the lower index (torch.topk order).
-        int32_t* ids = act.topk_ids + xcd * kMaxTopK;
-        float* ws = act.topk_w + xcd * kMaxTopK;
         for (int k = 0; k < d.top_k; ++k) {
             float bv = p;
             int bi = valid ? lane : 0x7fffffff;
@@ -162,6 +166,7 @@ __device__ void task_norm_router(const ModelDims& d, const Weights& w,
             if (lane == bi) p = -INFINITY;                // taken
         }
     }
+    __syncthreads();
 }
 
 // Greedy pick over the bf16 logits (lm_head writes them bf16-rounded, as HF's
@@ -215,11 +220,21 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
 
     switch (t.kind) {
         case TASK_EMBED:       task_embed(d, w, act, tc); break;
-        case TASK_NORM_ROUTER: task_norm_router(d, w, act, s, L, xcd,
+        case TASK_NORM_ROUTER: task_norm_router(d, w, act, s, L, xcd, worker,
                                                 L >= d.first_k_dense); break;
         case TASK_ARGMAX:      task_argmax(d, act, rt, tc); break;
         case TASK_REDUCE:      break;   // retired: folded into fold_x
-        case TASK_MERGE_UV:    break;   // retired: done by the last KV chunk
+
+        // Merge the head's kv_chunks partials (every merge task of the head
+        // recomputes the 16 KB merge) and apply this task's slice of W_UV.
+        case TASK_MERGE_UV: {
+            const float* partials = act.attn_partial + (int64_t)t.head * chunks * kPartialStride;
+            const int rows = d.v_head / chunks;
+            merge_and_uv(partials, w.layer_kv_b[L], act.o, t.head, chunks,
+                         d.kv_lora, d.qk_nope, d.v_head, s.q_c,
+                         t.kv_chunk * rows, rows);
+            break;
+        }
 
         // This XCD's heads' q rows plus its own copy of kv_a, from the fused
         // [3072 + 576, hidden] matrix. RMSNorm (and the fold of the previous
@@ -241,9 +256,7 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
         }
 
         // Attention: kv post + q-absorb (+ q_pe RoPE) in the prologue, all
-        // into LDS, then this task's slice of the cache. The last chunk of
-        // the head to arrive (XCD-local counter) merges the partials and
-        // applies W_UV; only it signals the global merge event.
+        // into LDS, then this task's slice of the cache into a partial.
         case TASK_ATTENTION: {
             __hip_bfloat16* cache_layer = kv.data + (int64_t)L * kv.max_pos * kv.row;
             const float* kv_a = act.kv_a + (int64_t)xcd * (d.kv_lora + d.qk_rope);
@@ -258,17 +271,7 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
             attention_chunk(cache_layer, s.q_c, s.q_pe, s.row, d.softmax_scale,
                             tc.seq_len, kv.row, t.kv_chunk, chunks,
                             partials + (int64_t)t.kv_chunk * kPartialStride, s.part);
-            __syncthreads();
-            __shared__ int last_smem;
-            if (threadIdx.x == 0) {
-                last_smem = arrive_last(rt, tc.epoch, t.local_event, xcd, chunks) ? 1 : 0;
-                if (last_smem) fence_acquire();
-            }
-            __syncthreads();
-            if (!last_smem) return false;
-            merge_and_uv(partials, w.layer_kv_b[L], act.o, t.head, chunks,
-                         d.kv_lora, d.qk_nope, d.v_head, s.q_c);
-            return true;
+            break;
         }
 
         // o_proj needs all 16 heads, so it is the layer's one unavoidable
@@ -281,10 +284,10 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
             break;
 
         case TASK_EXPERT_GATE_UP: {
+            select_experts(d, act.router_logits + (int64_t)xcd * d.n_routed, s.ids, s.ws);
             const ExpertUnit u = resolve_unit(
                 t.expert_slot, w.layer_experts[L], w.layer_shared[L],
-                act.topk_ids + xcd * kMaxTopK, act.topk_w + xcd * kMaxTopK,
-                d.routed_scaling, d.hidden, d.moe_inter, d.moe_inter * 2,
+                s.ids, s.ws, d.routed_scaling, d.hidden, d.moe_inter, d.moe_inter * 2,
                 w.expert_stride);
             stage_vector(act.x_norm + (int64_t)xcd * d.hidden, s.vec, d.hidden);
             expert_gate_up(u, s.vec, act.expert_h + (int64_t)xcd * d.moe_inter,
@@ -293,10 +296,10 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
         }
 
         case TASK_EXPERT_DOWN: {
+            select_experts(d, act.router_logits + (int64_t)xcd * d.n_routed, s.ids, s.ws);
             const ExpertUnit u = resolve_unit(
                 t.expert_slot, w.layer_experts[L], w.layer_shared[L],
-                act.topk_ids + xcd * kMaxTopK, act.topk_w + xcd * kMaxTopK,
-                d.routed_scaling, d.hidden, d.moe_inter, d.moe_inter * 2,
+                s.ids, s.ws, d.routed_scaling, d.hidden, d.moe_inter, d.moe_inter * 2,
                 w.expert_stride);
             stage_vector(act.expert_h + (int64_t)xcd * d.moe_inter, s.vec, u.inter);
             expert_down(u, s.vec, act.expert_out + (int64_t)xcd * d.hidden,
@@ -405,7 +408,8 @@ void fleet_decode_step(RuntimeState rt, ModelDims d, Weights w,
 
             if (threadIdx.x == 0) {
                 if (do_signal) {
-                    signal_event(rt, t->signal_event, (EventScope)t->signal_scope, xcd);
+                    signal_event(rt, tc.epoch, t->signal_event, (EventScope)t->signal_scope,
+                                 xcd, t->signal_xcd_count);
                 }
                 if (tc.trace) {
                     uint64_t* tr = rt.trace + (int64_t)t->index * 4;

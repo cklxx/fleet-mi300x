@@ -68,7 +68,7 @@ enum EventScope : int16_t {
     SCOPE_GLOBAL = 2,
 };
 
-// 64 bytes, laid out to match taskgraph.py's struct.pack("<Hhhh hhhh hhhh hhh 2x i 28x").
+// 64 bytes, laid out to match taskgraph.py's struct.pack("<Hhhh hhhh hhhh hhhh i 28x").
 // Any drift here is silent and catastrophic, so static_assert guards the size
 // and tests/test_descriptor_layout.py re-checks the field offsets from Python.
 //
@@ -92,7 +92,7 @@ struct TaskDescriptor {
     int16_t  wait_count;      // producers of wait_event (per epoch)
     int16_t  local_event;     // FLAG_SIGNAL_LAST: XCD-local arrival counter, else -1
     int16_t  flags;           // TaskFlags
-    int16_t  _pad0;
+    int16_t  signal_xcd_count; // producers of signal_event on this XCD
     int32_t  index;           // position in the global task list (> 32767)
     uint8_t  _pad[28];
 };
@@ -185,7 +185,21 @@ __device__ __forceinline__ void fence_release() {
 }
 
 __device__ __forceinline__ void fence_acquire() {
-    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");   // buffer_inv
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");   // buffer_inv sc1: L1 + L2
+}
+
+// Acquire for a consumer on the producer's own XCD: the drained stores are
+// in this L2 already, so only this CU's L1 (write-through TCP) can be stale.
+// `buffer_inv sc0` invalidates L1 without touching the L2 that the other 36
+// workers are streaming through; an agent-scope buffer_inv here costs the
+// phase several microseconds (bench/microbench.hip (f)), and (d') checks a
+// same-XCD consumer reads every word with this acquire.
+__device__ __forceinline__ void fence_acquire_local() {
+#if defined(__gfx942__) || defined(__gfx940__) || defined(__gfx941__)
+    asm volatile("s_waitcnt vmcnt(0) lgkmcnt(0)\n\tbuffer_inv sc0\n\ts_waitcnt vmcnt(0)" ::: "memory");
+#else
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+#endif
 }
 
 __device__ __forceinline__ bool aborted(const RuntimeState& rt) {
@@ -248,14 +262,20 @@ __device__ __forceinline__ const TaskDescriptor* fetch_task(
     return &rt.tasks[rt.queue_index[begin + slot]];
 }
 
-// arrive_last: bump an XCD-local arrival counter with release semantics and
-// report whether this arrival completed the group for this epoch (the last
-// KV chunk of a head then merges the partials). Returns the old count, so the
-// caller decides; the acquire that makes the other arrivals' data visible
-// is the caller's fence_acquire().
+// Store draining. On gfx942 the L1 (TCP) is write-through, so once a wave's
+// stores have completed (vscnt = 0) they are in this XCD's L2; no cache
+// writeback is needed for a consumer on the same L2.
+__device__ __forceinline__ void drain_stores() {
+    __builtin_amdgcn_s_waitcnt(0);
+}
+
+// arrive_last: bump an XCD-local arrival counter after draining this
+// workgroup's stores, and report whether this arrival completed the group
+// for this epoch (the last KV chunk of a head then merges the partials, on
+// the same XCD). The caller's fence_acquire() makes the others' data visible.
 __device__ __forceinline__ bool arrive_last(
         const RuntimeState& rt, uint32_t epoch, int counter, int xcd, int members) {
-    fence_release();
+    drain_stores();
     const uint32_t old = __hip_atomic_fetch_add(
         &rt.xcd_counters[xcd * kMaxEvents + counter], 1u,
         __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
@@ -263,21 +283,35 @@ __device__ __forceinline__ bool arrive_last(
 }
 
 // signal_event: publish this task's stores, then count. Called by one thread
-// after a __syncthreads(), so every wave's stores precede the fence.
+// after a __syncthreads(), so every wave's stores precede the drain.
 //
-// Scheme (i)  (default) the release fence writes back this XCD's dirty L2
-//             lines, then the counter atomic resolves device-wide.
-// Scheme (ii) counters in uncached memory (hipDeviceMallocUncached): the
-//             atomic resolves at the Infinity Cache. The fence is the same;
-//             D1 microbenchmark (a) measures whether the allocation matters.
+// XCD-local events: drain, then bump the XCD-local counter. The consumer is
+// on the same L2, so the drained stores are already where it reads.
+//
+// Global events (design.md §4, the Fleet scheme): drain, then bump this
+// XCD's arrival counter for the event; the arrival that completes this
+// XCD's share (xcd_count producers per epoch) performs the one L2 writeback
+// — which covers every earlier arrival's drained stores, as their atomics
+// are ordered before it in L2 — and adds the whole share to the global
+// counter. One buffer_wbl2 per XCD per event instead of one per producer:
+// measured on the expert phase, per-producer flushes cost 13 us per layer,
+// the last-arriver flush 6 us (bench/microbench.hip (f)); the payload test
+// (d) checks the scheme publishes every word. Scheme (ii) (uncached
+// counters) uses the same code path.
 __device__ __forceinline__ void signal_event(
-        const RuntimeState& rt, int event, EventScope scope, int xcd) {
+        const RuntimeState& rt, uint32_t epoch, int event, EventScope scope,
+        int xcd, int xcd_count) {
     if (event < 0) return;
-    fence_release();
-    uint32_t* counter = (scope == SCOPE_XCD_LOCAL)
-        ? &rt.xcd_counters[xcd * kMaxEvents + event]
-        : &rt.global_events[event];
-    __hip_atomic_fetch_add(counter, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    drain_stores();
+    uint32_t* local = &rt.xcd_counters[xcd * kMaxEvents + event];
+    const uint32_t old = __hip_atomic_fetch_add(local, 1u, __ATOMIC_RELAXED,
+                                                __HIP_MEMORY_SCOPE_AGENT);
+    if (scope == SCOPE_XCD_LOCAL) return;
+    if (old + 1 == epoch * (uint32_t)xcd_count) {        // last of this XCD's share
+        fence_release();
+        __hip_atomic_fetch_add(&rt.global_events[event], (uint32_t)xcd_count,
+                               __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    }
 }
 
 // wait_event: block until the event has `producers` signals for this epoch.
@@ -309,7 +343,8 @@ __device__ __forceinline__ bool wait_event(
             }
         }
     }
-    fence_acquire();
+    if (scope == SCOPE_XCD_LOCAL) fence_acquire_local();
+    else                          fence_acquire();
     return true;
 }
 

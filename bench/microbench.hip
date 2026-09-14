@@ -87,7 +87,15 @@ __device__ __forceinline__ void fence_release() {
   __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");   // buffer_wbl2 on gfx942
 }
 __device__ __forceinline__ void fence_acquire() {
-  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");   // buffer_inv on gfx942
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");   // buffer_inv sc1 on gfx942: L1 + L2
+}
+// The runtime's acquire for a consumer on the producer's own XCD: L1 only.
+__device__ __forceinline__ void fence_acquire_local() {
+#if defined(__gfx942__) || defined(__gfx940__) || defined(__gfx941__)
+  asm volatile("s_waitcnt vmcnt(0) lgkmcnt(0)\n\tbuffer_inv sc0\n\ts_waitcnt vmcnt(0)" ::: "memory");
+#else
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+#endif
 }
 __device__ __forceinline__ void signal(unsigned* p) {
   fence_release();
@@ -188,6 +196,87 @@ __global__ __launch_bounds__(kBlock) void payload_visibility(
       if (threadIdx.x == 0) signal(flag_b);
     }
   }
+}
+
+// ---------------------------------------------------------------- (d') multi-producer, last-arriver flush
+//
+// The runtime's global-event scheme with many producers: every producer
+// workgroup of one XCD writes its own 32 KB slice, drains its stores
+// (s_waitcnt), and bumps an XCD-local arrival counter; only the arrival that
+// completes the group does the L2 writeback and publishes. A consumer on
+// another XCD (acquire, then verify all slices) checks that the single
+// flush covered every producer's drained stores; a consumer on the *same*
+// XCD checks that its L2 invalidate does not lose lines that were never
+// written back. Roles come from XCD-local tickets, like the kernel's.
+constexpr int kProducers = 37;
+
+__global__ __launch_bounds__(kBlock) void payload_lastflush(
+    unsigned* __restrict__ payload, unsigned* __restrict__ tickets,
+    unsigned* __restrict__ arrivals, unsigned* __restrict__ published,
+    unsigned* __restrict__ acks, unsigned* __restrict__ errors, int iters) {
+  const unsigned xcd = xcc_id();
+  __shared__ unsigned ticket_s;
+  if (threadIdx.x == 0) ticket_s = atomicAdd(&tickets[xcd], 1u);
+  __syncthreads();
+  const unsigned ticket = ticket_s;
+  // XCD 0: tickets 0..36 produce, ticket 37 consumes locally; XCD 1: ticket 0
+  // consumes across the fabric. Everyone else leaves.
+  const bool producer = xcd == 0 && ticket < kProducers;
+  const bool consumer_local = xcd == 0 && ticket == kProducers;
+  const bool consumer_cross = xcd == 1 && ticket == 0;
+  if (!producer && !consumer_local && !consumer_cross) return;
+  unsigned* mine = payload + (size_t)ticket * kPayloadWords;
+
+  for (int i = 1; i <= iters; ++i) {
+    if (producer) {
+      for (int k = threadIdx.x; k < kPayloadWords; k += blockDim.x) mine[k] = mix((unsigned)i + 7u * ticket, (unsigned)k);
+      __syncthreads();
+      if (threadIdx.x == 0) {
+        __builtin_amdgcn_s_waitcnt(0);                                         // drain to L2
+        const unsigned old = __hip_atomic_fetch_add(arrivals, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        if (old + 1 == (unsigned)i * kProducers) {                             // last arrival
+          fence_release();                                                     // the one wbl2
+          __hip_atomic_store(published, (unsigned)i, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        }
+        wait_for(acks, 2u * (unsigned)i);                                      // both consumers done
+      }
+      __syncthreads();
+    } else {
+      if (threadIdx.x == 0) {
+        while (poll(published) < (unsigned)i) { __builtin_amdgcn_s_sleep(1); }
+        if (consumer_local) fence_acquire_local();        // same L2: L1 invalidate only
+        else                fence_acquire();              // other XCD: L1 + L2
+      }
+      __syncthreads();
+      unsigned bad = 0;
+      for (unsigned p = 0; p < kProducers; ++p) {
+        const unsigned* slice = payload + (size_t)p * kPayloadWords;
+        for (int k = threadIdx.x; k < kPayloadWords; k += blockDim.x) {
+          bad += slice[k] != mix((unsigned)i + 7u * p, (unsigned)k);
+        }
+      }
+      if (bad) atomicAdd(&errors[consumer_local ? 0 : 1], bad);
+      __syncthreads();
+      if (threadIdx.x == 0) signal(acks);
+    }
+  }
+}
+
+static void run_payload_lastflush(int iters, unsigned* bad_local, unsigned* bad_cross) {
+  unsigned *payload, *misc, *errors;
+  HIP_CHECK(hipMalloc(&payload, (size_t)(kProducers + 1) * kPayloadWords * sizeof(unsigned)));
+  HIP_CHECK(hipMalloc(&misc, 4096));      // tickets[16] | arrivals | published | acks, on separate lines
+  HIP_CHECK(hipMalloc(&errors, 2 * sizeof(unsigned)));
+  HIP_CHECK(hipMemset(payload, 0, (size_t)(kProducers + 1) * kPayloadWords * sizeof(unsigned)));
+  HIP_CHECK(hipMemset(misc, 0, 4096));
+  HIP_CHECK(hipMemset(errors, 0, 2 * sizeof(unsigned)));
+  hipLaunchKernelGGL(payload_lastflush, dim3(kGrid), dim3(kBlock), 0, 0,
+                     payload, misc, misc + 64, misc + 128, misc + 192, errors, iters);
+  HIP_CHECK(hipDeviceSynchronize());
+  unsigned e[2];
+  HIP_CHECK(hipMemcpy(e, errors, sizeof(e), hipMemcpyDeviceToHost));
+  *bad_local = e[0]; *bad_cross = e[1];
+  HIP_CHECK(hipFree(payload)); HIP_CHECK(hipFree(misc)); HIP_CHECK(hipFree(errors));
 }
 
 // ---------------------------------------------------------------- (e) event cost under load
@@ -345,9 +434,20 @@ __global__ __launch_bounds__(kBlock, 1) void gemv_stream(
 constexpr int kHidden = 2048, kInter = 1408, kLayersF = 27, kUnits = 8;
 constexpr size_t kUnitElems = (size_t)3 * kInter * kHidden;   // gate/up interleaved + down
 
+// Per block and layer, the block's own busy time (thread 0's clock) goes to
+// `busy[L * grid + block]`: the mean over blocks is the throughput view,
+// the max over blocks is what a phase costs the persistent kernel, whose
+// next task waits for the slowest worker.
+// sync: 0 = none (throughput view); 1 = the persistent kernel's handshake
+// between gate_up and down — every block releases (buffer_wbl2) and bumps an
+// XCD-local counter, then all blocks of the unit wait for it and acquire
+// (buffer_inv); 2 = the design's §4 variant — blocks drain their stores
+// (s_waitcnt) and bump the counter, only the *last* one releases; waiters
+// acquire as before. The counters are monotonic across layers and launches.
 __global__ __launch_bounds__(kBlock, 1) void expert_phase(
     const __hip_bfloat16* __restrict__ experts, float* __restrict__ h,
-    float* __restrict__ out, int layers, int do_down) {
+    float* __restrict__ out, unsigned long long* __restrict__ busy,
+    unsigned* __restrict__ ctr, unsigned base, int layers, int do_down, int sync) {
   __shared__ float x[kHidden];
   for (int i = threadIdx.x; i < kHidden; i += kBlock) x[i] = 0.001f * (i % 7);
   __syncthreads();
@@ -355,39 +455,72 @@ __global__ __launch_bounds__(kBlock, 1) void expert_phase(
   const int worker = blockIdx.x / kXCDs;        // 0..37 (38 per unit here)
   const int n_workers = kCUsPerXCD;
   for (int L = 0; L < layers; ++L) {
+    const unsigned long long t0 = clk();
     const __hip_bfloat16* unit = experts + ((size_t)L * kUnits + xcd) * kUnitElems;
     float* hx = h + (size_t)xcd * kInter;
     fleet::gemv_gate_up_rows(unit, x, hx, kInter, kHidden, 0, 1, worker, n_workers);
     if (do_down) {
       __syncthreads();
+      if (sync) {
+        const unsigned target = base + (unsigned)(L + 1) * n_workers;
+        if (threadIdx.x == 0) {
+          if (sync == 1) {
+            signal(&ctr[xcd * 16]);                             // release + atomic
+          } else {
+            __builtin_amdgcn_s_waitcnt(0);                      // stores are in L2
+            const unsigned old = __hip_atomic_fetch_add(&ctr[xcd * 16], 1u,
+                                     __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            if (old + 1 == target) fence_release();             // last one flushes
+          }
+          wait_for(&ctr[xcd * 16], target);                     // poll + acquire
+        }
+        __syncthreads();
+      }
       fleet::gemv_rows(unit + (size_t)2 * kInter * kHidden, kInter, hx,
                        out + (size_t)xcd * kHidden, nullptr, fleet::EPI_BF16, 1.f,
                        kHidden, kInter, 0, 1, worker, n_workers);
     }
+    __syncthreads();
+    if (threadIdx.x == 0) busy[(size_t)L * gridDim.x + blockIdx.x] = clk() - t0;
   }
 }
 
-static double run_expert_phase(int do_down) {
+static double run_expert_phase(int do_down, int sync, double ns) {
   const size_t elems = (size_t)kLayersF * kUnits * kUnitElems;
-  __hip_bfloat16* w; float *h, *out;
+  __hip_bfloat16* w; float *h, *out; unsigned long long* busy; unsigned* ctr;
   HIP_CHECK(hipMalloc(&w, elems * sizeof(__hip_bfloat16)));
   HIP_CHECK(hipMalloc(&h, kUnits * kInter * sizeof(float)));
   HIP_CHECK(hipMalloc(&out, kUnits * kHidden * sizeof(float)));
+  HIP_CHECK(hipMalloc(&busy, (size_t)kLayersF * kGrid * sizeof(unsigned long long)));
+  HIP_CHECK(hipMalloc(&ctr, kXCDs * 16 * sizeof(unsigned)));
+  HIP_CHECK(hipMemset(ctr, 0, kXCDs * 16 * sizeof(unsigned)));
   HIP_CHECK(hipMemset(w, 0x3c, elems * sizeof(__hip_bfloat16)));   // ~1.0 in bf16
   hipEvent_t a, b;
   HIP_CHECK(hipEventCreate(&a)); HIP_CHECK(hipEventCreate(&b));
-  hipLaunchKernelGGL(expert_phase, dim3(kGrid), dim3(kBlock), 0, 0, w, h, out, kLayersF, do_down);
+  const unsigned per_launch = (unsigned)kLayersF * kCUsPerXCD;
+  hipLaunchKernelGGL(expert_phase, dim3(kGrid), dim3(kBlock), 0, 0, w, h, out, busy, ctr, 0u, kLayersF, do_down, sync);
   HIP_CHECK(hipDeviceSynchronize());
   HIP_CHECK(hipEventRecord(a));
-  hipLaunchKernelGGL(expert_phase, dim3(kGrid), dim3(kBlock), 0, 0, w, h, out, kLayersF, do_down);
+  hipLaunchKernelGGL(expert_phase, dim3(kGrid), dim3(kBlock), 0, 0, w, h, out, busy, ctr, per_launch, kLayersF, do_down, sync);
   HIP_CHECK(hipEventRecord(b));
   HIP_CHECK(hipEventSynchronize(b));
   float ms = 0; HIP_CHECK(hipEventElapsedTime(&ms, a, b));
+  std::vector<unsigned long long> hb((size_t)kLayersF * kGrid);
+  HIP_CHECK(hipMemcpy(hb.data(), busy, hb.size() * sizeof(hb[0]), hipMemcpyDeviceToHost));
+  double mean_us = 0, max_us = 0;
+  for (int L = 0; L < kLayersF; ++L) {
+    unsigned long long mx = 0, sum = 0;
+    for (int g = 0; g < kGrid; ++g) { sum += hb[(size_t)L * kGrid + g]; mx = std::max(mx, hb[(size_t)L * kGrid + g]); }
+    mean_us += sum / (double)kGrid * ns / 1e3; max_us += mx * ns / 1e3;
+  }
+  mean_us /= kLayersF; max_us /= kLayersF;
   const double bytes = (double)kLayersF * kUnits * (do_down ? 3.0 : 2.0) * kInter * kHidden * 2;
-  std::printf("    %-22s %7.3f ms for %d layers = %6.1f us/layer, %.2f TB/s\n",
-              do_down ? "gate_up + down" : "gate_up only", ms, kLayersF, ms * 1e3 / kLayersF,
-              bytes / (ms * 1e-3) / 1e12);
-  HIP_CHECK(hipFree(w)); HIP_CHECK(hipFree(h)); HIP_CHECK(hipFree(out));
+  static const char* names[] = {"no handshake", "per-worker release", "last-worker release"};
+  std::printf("    %-22s %-20s %6.1f us/layer, %.2f TB/s; per block: mean %.1f us, slowest %.1f us\n",
+              do_down ? "gate_up + down" : "gate_up only", names[sync], ms * 1e3 / kLayersF,
+              bytes / (ms * 1e-3) / 1e12, mean_us, max_us);
+  HIP_CHECK(hipFree(w)); HIP_CHECK(hipFree(h)); HIP_CHECK(hipFree(out)); HIP_CHECK(hipFree(busy));
+  HIP_CHECK(hipFree(ctr));
   return bytes / (ms * 1e-3) / 1e12;
 }
 
@@ -580,6 +713,16 @@ int main(int argc, char** argv) {
                 "stop here — every number below is meaningless until this passes\n");
   }
 
+  std::printf("(d') %d producers on one XCD, drained stores, ONE last-arriver flush; a same-XCD consumer "
+              "(L1-only acquire) and a cross-XCD consumer (L1+L2 acquire) verify every word, %d rounds\n",
+              kProducers, iters / 4);
+  unsigned bad_local = 0, bad_cross = 0;
+  run_payload_lastflush(iters / 4, &bad_local, &bad_cross);
+  const bool lastflush_ok = bad_local == 0 && bad_cross == 0;
+  std::printf("    stale words: same-XCD consumer %u, cross-XCD consumer %u, of %llu each  [%s]\n\n",
+              bad_local, bad_cross, (unsigned long long)(iters / 4) * kProducers * kPayloadWords,
+              lastflush_ok ? "PASS" : "FAIL");
+
   std::printf("(a) cross-XCD event round-trip (ping-pong, us; release+atomic+poll+acquire)\n");
   bool cross_a = false, cross_b = false;
   Stats wbl2 = run_event(SCHEME_CACHED, iters, ns, &cross_a);
@@ -626,10 +769,13 @@ int main(int argc, char** argv) {
               "(design assumes 4.0 achievable)\n", best, best / 5.3 * 100);
 
   std::printf("\n(f) the kernel's expert GEMVs in isolation (gemv.h, 8 x 17.3 MB units/layer, 27 layers)\n");
-  const double f_gu = run_expert_phase(0);
-  const double f_all = run_expert_phase(1);
-  std::printf("    -> %.0f%% of (c)'s streaming ceiling with gate_up alone, %.0f%% with down\n",
-              f_gu / best * 100, f_all / best * 100);
+  const double f_gu = run_expert_phase(0, 0, ns);
+  const double f_all = run_expert_phase(1, 0, ns);
+  const double f_sync1 = run_expert_phase(1, 1, ns);
+  const double f_sync2 = run_expert_phase(1, 2, ns);
+  std::printf("    -> %.0f%% of (c)'s ceiling for gate_up alone, %.0f%% with down; with the kernel's "
+              "per-worker handshake %.0f%%, with the last-worker flush %.0f%%\n",
+              f_gu / best * 100, f_all / best * 100, f_sync1 / best * 100, f_sync2 / best * 100);
 
   if (json_path) {
     FILE* f = std::fopen(json_path, "w");
@@ -651,5 +797,5 @@ int main(int argc, char** argv) {
     std::fclose(f);
     std::printf("\nwrote %s\n", json_path);
   }
-  return payload_ok ? 0 : 1;
+  return (payload_ok && lastflush_ok) ? 0 : 1;
 }
