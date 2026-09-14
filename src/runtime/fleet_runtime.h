@@ -67,6 +67,7 @@ enum TaskKind : uint16_t {
     TASK_LM_HEAD = 11,
     TASK_ARGMAX = 12,
     TASK_PREFETCH = 13,   // stream routing-independent weights into the Infinity Cache
+    TASK_Q_ABSORB = 14,   // publish one row-slice of a head's absorbed q_c
 };
 
 enum EventScope : int16_t {
@@ -126,6 +127,10 @@ enum TaskFlags : int16_t {
                               // the top-k and publishes it for the experts
     FLAG_TOPK_READ = 512,     // expert: read that published top-k (64 B) rather
                               // than repeating softmax + top-k per task
+    FLAG_PUB_WAIT = 1024,     // the task waits on local_event *inside its body*, after
+                              // the work that does not depend on the publication, and
+                              // then reads a published buffer instead of recomputing.
+                              // wait_count carries the publisher count.
 };
 
 // Device-side state, allocated once by the host.

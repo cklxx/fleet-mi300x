@@ -534,6 +534,19 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
         case TASK_ARGMAX:      task_argmax(d, act, rt, tc); break;
         case TASK_REDUCE:      break;   // retired: consumers fold in their prologue
 
+        // Publish one row slice of this head's absorbed q_c. Runs on a worker
+        // that would otherwise idle through the attention phase (32 of the
+        // XCD's 37 workers take an attention task), so the 131 KB of W_UK is
+        // streamed once per head rather than once per KV chunk.
+        case TASK_Q_ABSORB: {
+            const int rows = d.qk_nope / kQAbsSlices;
+            q_absorb_rows(act.q + (int64_t)t.head * d.q_head_dim, w.layer_kv_b[L],
+                          act.q_absorbed + ((int64_t)t.head * kQAbsSlices + t.kv_chunk) * d.kv_lora,
+                          s.part, t.head, d.qk_nope, d.v_head, d.kv_lora,
+                          t.kv_chunk * rows, rows);
+            break;
+        }
+
         // Idle-worker prefetch (§12): stream a slice of the weights the
         // routing does not decide — this layer's shared expert and the next
         // layer's q/kv_a, o_proj and kv_b — during attention, so they sit in
@@ -630,9 +643,26 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
                 __syncthreads();
                 if (threadIdx.x == 0) fence_release();
             }
-            q_absorb(act.q + (int64_t)t.head * d.q_head_dim, w.layer_kv_b[L],
-                     tc.cos, tc.sin, s.q_c, s.q_pe, s.part, t.head,
-                     d.qk_nope, d.qk_rope, d.v_head, d.kv_lora);
+            if (t.flags & FLAG_PUB_WAIT) {
+                // q_c was published for this head while this task was doing
+                // kv_post, so the wait is paid against work already done and
+                // 131 KB of W_UK is read once per head instead of per chunk.
+                __shared__ int qabs_ok;
+                if (threadIdx.x == 0) {
+                    qabs_ok = wait_event(rt, tc.epoch, t.local_event, SCOPE_XCD_LOCAL,
+                                         xcd, kQAbsSlices) ? 1 : 0;
+                }
+                __syncthreads();
+                if (!qabs_ok) return false;
+                q_absorb_gather(act.q + (int64_t)t.head * d.q_head_dim,
+                                act.q_absorbed + (int64_t)t.head * kQAbsSlices * d.kv_lora,
+                                tc.cos, tc.sin, s.q_c, s.q_pe,
+                                d.qk_nope, d.qk_rope, d.kv_lora, kQAbsSlices);
+            } else {
+                q_absorb(act.q + (int64_t)t.head * d.q_head_dim, w.layer_kv_b[L],
+                         tc.cos, tc.sin, s.q_c, s.q_pe, s.part, t.head,
+                         d.qk_nope, d.qk_rope, d.v_head, d.kv_lora);
+            }
             float* partials = act.attn_partial + (int64_t)t.head * chunks * kPartialStride;
             FLEET_STAMP();
             attention_chunk(cache_layer, s.q_c, s.q_pe, s.row, d.softmax_scale,

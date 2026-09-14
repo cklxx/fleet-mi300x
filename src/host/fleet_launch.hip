@@ -303,7 +303,7 @@ static void describe_abort(uint32_t code, const std::map<int, std::string>& labe
 
 static const char* kKindNames[] = {"QKV_FUSED", "ATTENTION", "MERGE_UV", "O_PROJ",
     "NORM_ROUTER", "EXPERT_GATE_UP", "EXPERT_DOWN", "REDUCE", "DENSE_GATE_UP",
-    "DENSE_DOWN", "EMBED", "LM_HEAD", "ARGMAX", "PREFETCH"};
+    "DENSE_DOWN", "EMBED", "LM_HEAD", "ARGMAX", "PREFETCH", "Q_ABSORB"};
 
 // Per-task timeline (design.md §10): aggregated per task kind and per layer.
 static void report_trace(const std::vector<TaskDescriptor>& tasks,
@@ -582,6 +582,7 @@ int main(int argc, char** argv) {
         act.x[1] = dev_alloc<float>(d.hidden);
         act.x_norm = dev_alloc<float>((size_t)kNumXCDs * d.hidden);
         act.q = dev_alloc<float>((size_t)d.heads * d.q_head_dim);
+        act.q_absorbed = dev_alloc<float>((size_t)d.heads * kQAbsSlices * d.kv_lora);
         act.kv_a = dev_alloc<float>((size_t)kNumXCDs * (d.kv_lora + d.qk_rope));
         act.attn_partial = dev_alloc<float>((size_t)d.heads * kv_chunks * kPartialStride);
         act.o = dev_alloc<float>((size_t)d.heads * d.v_head);

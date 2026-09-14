@@ -51,6 +51,7 @@ BLOCKS_PER_CU = 1     # must match FLEET_BLOCKS_PER_CU in fleet_runtime.h
 BLOCKS_PER_XCD = CUS_PER_XCD * BLOCKS_PER_CU
 WORKERS_PER_XCD = BLOCKS_PER_XCD - 1   # 1 scheduler + 37 workers
 WAVES = 4             # waves per workgroup, must match kWaves in gemv.h
+QABS_SLICES = 2       # publishers per head for q_c, must match kQAbsSlices in fleet_types.h
 EXPERT_K_CHUNK = 2048  # rows of h per gate_up→down tile, kExpertKChunk in fleet_types.h;
                        # >= moe_inter = one chunk (tiling measured no gain: same workers)
 DESCRIPTOR_BYTES = 64
@@ -79,6 +80,7 @@ class TaskKind(IntEnum):
     LM_HEAD = 11       # Chiplet-task x8, fold + final norm in prologue
     ARGMAX = 12
     PREFETCH = 13      # idle-worker weight prefetch during attention (--prefetch)
+    Q_ABSORB = 14      # publish one row slice of a head's absorbed q_c (--qc-published)
 
 
 class Flags(IntFlag):
@@ -102,6 +104,9 @@ class Flags(IntFlag):
                           # local_event publishes the top-k for the experts
     TOPK_READ = 512       # expert: read that published top-k instead of redoing
                           # softmax + top-k per task
+    PUB_WAIT = 1024       # the task waits on local_event inside its body, after the
+                          # work that does not depend on the publication, and then
+                          # reads the published buffer instead of recomputing it
 
 
 # Implementation status per task kind, reported because the task spec asks for
@@ -120,6 +125,7 @@ IMPLEMENTATION: dict[str, str] = {
     "LM_HEAD": "fleet-verified",
     "ARGMAX": "fleet-verified",
     "PREFETCH": "fleet-experimental",
+    "Q_ABSORB": "fleet-experimental",
 }
 
 
@@ -248,15 +254,35 @@ def build_attention(g: Graph, layer: int, e_qkv: list[int], cfg: dict) -> list[i
 
     e_merge = [g.new_event(Scope.XCD_LOCAL, heads_per_xcd * kv_chunks,
                            f"L{layer}.merge.x{x}") for x in range(XCDS)]
+    # q_c publication (--qc-published): every KV chunk of a head used to
+    # stream all 131 KB of W_UK to build the same q_c. Publishers run on the
+    # workers that would otherwise idle through this phase (32 of 37 take an
+    # attention task), and the readers wait for them *after* kv_post, so the
+    # wait is paid against work already done.
+    published = cfg.get("qc_published", False)
+    e_qabs = []
+    if published:
+        for h in range(heads):
+            xcd = h // heads_per_xcd
+            e = g.new_event(Scope.XCD_LOCAL, QABS_SLICES, f"L{layer}.qabs.h{h}")
+            e_qabs.append(e)
+            for sl in range(QABS_SLICES):
+                g.cu_task(Task(TaskKind.Q_ABSORB, layer, xcd, e_qkv[xcd], e,
+                               Scope.XCD_LOCAL, head=h, kv_chunk=sl, n_split=QABS_SLICES))
+
     e_attn = []
     for h in range(heads):
         xcd = h // heads_per_xcd
         e = g.new_event(Scope.XCD_LOCAL, kv_chunks, f"L{layer}.attn.h{h}")
         e_attn.append(e)
+        att_flags = Flags.KVA_SHARED if cfg.get("kva_shared") else Flags.NONE
+        if published:
+            att_flags |= Flags.PUB_WAIT
         for chunk in range(kv_chunks):
             g.cu_task(Task(TaskKind.ATTENTION, layer, xcd, e_qkv[xcd], e,
                            Scope.XCD_LOCAL, head=h, kv_chunk=chunk, n_split=kv_chunks,
-                           flags=Flags.KVA_SHARED if cfg.get("kva_shared") else Flags.NONE))
+                           local_event=e_qabs[h] if published else None,
+                           flags=att_flags))
     for h in range(heads):
         xcd = h // heads_per_xcd
         for chunk in range(kv_chunks):
@@ -510,6 +536,16 @@ def validate(g: Graph) -> list[str]:
                           f"its local event")
 
     for t in g.tasks:
+        if t.flags & Flags.PUB_WAIT:
+            if t.local_event is None:
+                errors.append(f"task {t.index}: PUB_WAIT without a local_event")
+            else:
+                ev = g.events[t.local_event]
+                if ev["producers"] != QABS_SLICES or ev["scope"] != int(Scope.XCD_LOCAL):
+                    errors.append(f"task {t.index}: PUB_WAIT on event {ev['id']} with "
+                                  f"{ev['producers']} producers, scope {ev['scope']}; "
+                                  f"expected {QABS_SLICES} XCD-local")
+    for t in g.tasks:
         if t.flags & Flags.TOPK_PUBLISH:
             if t.local_event is None or t.n_split != WORKERS_PER_XCD:
                 errors.append(f"task {t.index}: TOPK_PUBLISH without a full-XCD arrival counter")
@@ -576,6 +612,8 @@ def validate(g: Graph) -> list[str]:
         waits = [] if t.wait_event is None else [t.wait_event]
         if t.flags & Flags.CHUNK_WAIT:
             waits += [t.local_event + c for c in range(1, t.kv_chunk)]
+        if t.flags & Flags.PUB_WAIT:
+            waits.append(t.local_event)
         for e in waits:
             if last_producer.get(e, 1 << 30) > t.index:
                 errors.append(f"task {t.index} ({t.kind.name}) waits on event "
@@ -695,7 +733,8 @@ def report(g: Graph, cfg: dict) -> None:
 
 def load_cfg(config: Path, kv_chunks: int, prefetch: bool = False,
              k_chunk: int = EXPERT_K_CHUNK, kva_shared: bool = True,
-             split_workers: int = 0, topk_published: bool = False) -> dict:
+             split_workers: int = 0, topk_published: bool = False,
+             qc_published: bool = False) -> dict:
     c = json.loads(config.read_text())
     return {
         "prefetch": prefetch,
@@ -703,6 +742,7 @@ def load_cfg(config: Path, kv_chunks: int, prefetch: bool = False,
         "kva_shared": kva_shared,
         "split_workers": split_workers,
         "topk_published": topk_published,
+        "qc_published": qc_published,
         "layers": c["num_hidden_layers"],
         "heads": c["num_attention_heads"],
         "top_k": c["num_experts_per_tok"],
@@ -729,6 +769,9 @@ def main() -> None:
                     help="every XCD computes its own copy of the 576 kv_a rows behind an "
                          "XCD-local event (the v0.10-v0.14 graph) instead of the default "
                          "split over the 8 XCDs behind one global event")
+    ap.add_argument("--qc-published", action="store_true",
+                    help="publish each head's absorbed q_c from the workers that idle "
+                         "during attention, instead of every KV chunk streaming W_UK")
     ap.add_argument("--topk-published", action="store_true",
                     help="the router's last arriver publishes the top-k and the expert tasks "
                          "read it (64 B); measured 0.4%% slower than the default, where every "
@@ -739,7 +782,7 @@ def main() -> None:
     a = ap.parse_args()
 
     cfg = load_cfg(a.config, a.kv_chunks, a.prefetch, a.k_chunk, not a.kva_replicated,
-                   a.split_workers, a.topk_published)
+                   a.split_workers, a.topk_published, a.qc_published)
     g = build(cfg)
 
     if a.emit:

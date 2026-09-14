@@ -126,7 +126,8 @@ def main() -> int:
     tg = (ROOT / "src" / "host" / "taskgraph.py").read_text()
     ty = (ROOT / "src" / "runtime" / "fleet_types.h").read_text()
     gm = (ROOT / "src" / "kernels" / "gemv.h").read_text()
-    pairs = [("EXPERT_K_CHUNK", tg, "kExpertKChunk", ty), ("WAVES", tg, "kWaves", gm)]
+    pairs = [("EXPERT_K_CHUNK", tg, "kExpertKChunk", ty), ("WAVES", tg, "kWaves", gm),
+             ("QABS_SLICES", tg, "kQAbsSlices", ty)]
     mismatched = []
     for py_name, py_src, c_name, c_src in pairs:
         py = re.search(rf"^{py_name}\s*=\s*(\d+)", py_src, re.M)

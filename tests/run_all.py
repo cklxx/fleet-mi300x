@@ -37,6 +37,7 @@ GRAPH_VARIANTS = [
     ("1 KV chunk", ["--kv-chunks", "1"]),
     ("kv_a replicated", ["--kv-chunks", "16", "--kva-replicated"]),
     ("top-k published", ["--kv-chunks", "16", "--topk-published"]),
+    ("q_c published", ["--kv-chunks", "16", "--qc-published"]),
     ("idle-worker prefetch", ["--kv-chunks", "16", "--prefetch"]),
     ("split workers + tiling", ["--kv-chunks", "16", "--split-workers", "18",
                                 "--k-chunk", "512"]),

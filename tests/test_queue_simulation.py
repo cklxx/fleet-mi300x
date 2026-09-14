@@ -26,8 +26,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src" / "host"))
 
-from taskgraph import (PACK_FIELDS, PACK_FORMAT, WAVES, WORKERS_PER_XCD, XCDS,  # noqa: E402
-                       Flags, Scope, TaskKind, build, load_cfg)
+from taskgraph import (PACK_FIELDS, PACK_FORMAT, QABS_SLICES, WAVES,  # noqa: E402
+                       WORKERS_PER_XCD, XCDS, Flags, Scope, TaskKind, build, load_cfg)
 
 CONFIG = ROOT / "reference" / "dsv2lite_config.json"
 
@@ -104,6 +104,11 @@ def simulate(tasks: list[dict], epochs: int, order: str, seed: int = 0,
                                 arr[t["local_event"] + c] < target
                                 for c in range(1, t["kv_chunk"])):
                             break
+                        # PUB_WAIT: an XCD-local wait taken inside the body,
+                        # against the publisher count rather than wait_count
+                        if t["flags"] & Flags.PUB_WAIT and \
+                                local[t["xcd"]][t["local_event"]] < epoch * QABS_SLICES:
+                            break
                     if t["flags"] & Flags.CHUNK_SIGNAL:
                         for c in range(t["kv_chunk"]):     # every wave, in-body
                             local[t["xcd"]][t["local_event"] + c] += WAVES
@@ -153,6 +158,7 @@ def main() -> int:
     variants = [dict(kv_chunks=1), dict(kv_chunks=8), dict(kv_chunks=8, prefetch=True),
                 dict(kv_chunks=16, kva_shared=False),
                 dict(kv_chunks=16, topk_published=True),
+                dict(kv_chunks=16, qc_published=True),
                 dict(kv_chunks=16, split_workers=18, k_chunk=512)]
     for v in variants:
         kv_chunks, prefetch = v["kv_chunks"], v.get("prefetch", False)

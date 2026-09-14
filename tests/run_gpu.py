@@ -50,6 +50,7 @@ VARIANTS = {
     "kv_a replicated": ("taskgraph_d16_kvarep.bin", []),
     "kv_a replicated + coherent": ("taskgraph_d16_kvarep.bin", ["--coherent-acts"]),
     "top-k published": ("taskgraph_d16_topkpub.bin", []),
+    "q_c published": ("taskgraph_d16_qc.bin", []),
     "idle-worker prefetch": ("taskgraph_d16_prefetch.bin", []),
     "K-chunk tiling": ("taskgraph_d16_k512.bin", []),
     "split workers + tiling": ("taskgraph_d16_split18_k512.bin", []),

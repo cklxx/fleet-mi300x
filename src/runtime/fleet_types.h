@@ -26,6 +26,7 @@ constexpr int kMaxRouted = 64;     // router logits
 constexpr int kMaxTopK = 8;
 constexpr int kPartialStride = 2 + kMaxKvLora;   // attention partial: m, l, acc[512]
 constexpr int kMaxKvChunks = 16;   // split-KV factor the merge unrolls to (taskgraph --kv-chunks)
+constexpr int kQAbsSlices = 2;     // publishers per head for q_c (taskgraph QABS_SLICES)
 constexpr int kNumXCDs = 8;        // per-XCD buffers below
 
 // Static model shape, read from build/weights.manifest by the host.
@@ -71,6 +72,9 @@ struct Weights {
 struct Activations {
     float* __restrict__ x[2];          // [hidden] each, bf16-valued: layer input, post-attention
     float* __restrict__ x_norm;        // [kNumXCDs][hidden] post-attention norm
+    float* __restrict__ q_absorbed;    // [heads][kQAbsSlices][kv_lora] row-split partials of
+                                       // W_UK^T q_nope, published once per head instead of
+                                       // every KV chunk streaming all 131 KB of W_UK
     float* __restrict__ q;             // [heads * q_head_dim]; XCD k writes its heads'
     float* __restrict__ kv_a;          // [kNumXCDs][kv_lora + qk_rope] raw, pre-norm
     float* __restrict__ attn_partial;  // [heads][chunks][2 + kv_lora] m, l, acc

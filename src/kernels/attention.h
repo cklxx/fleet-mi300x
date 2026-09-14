@@ -99,6 +99,75 @@ __device__ inline void kv_post(
 // per output column with one dependent global load each; that prologue,
 // not the position loop, was the 296 us measured per attention task.)
 // `part_lds` must hold kWaves * kMaxKvLora floats.
+// One publisher's row slice of q_c[head] = W_UK[head]^T q_nope, summed over
+// rows [row0, row0 + rows) and written to global as an fp32 partial. The
+// readers add the kQAbsSlices partials in slice order, so the result is
+// deterministic; it is not the same summation order as the single-task
+// q_absorb below, which sums over all 128 rows per wave.
+//
+// The split is by rows, not columns: a column slice would leave half of every
+// wave's lanes idle on each 16-byte load and halve the publisher's bandwidth,
+// which is the whole point of publishing.
+__device__ inline void q_absorb_rows(
+        const float* __restrict__ q_head, const __hip_bfloat16* __restrict__ kv_b,
+        float* __restrict__ out_partial, float* __restrict__ part_lds,
+        int head, int qk_nope, int v_head, int kv_lora, int row0, int rows) {
+    const int row_stride = qk_nope + v_head;
+    const uint4* w_uk4 = reinterpret_cast<const uint4*>(
+        kv_b + (int64_t)head * row_stride * kv_lora);
+    const int wave = threadIdx.x / kWaveLanes;
+    const int lane = threadIdx.x % kWaveLanes;
+    const int row4 = kv_lora / 8;
+
+    float acc[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) acc[j] = 0.f;
+
+    constexpr int kRowBatch = 8;
+    for (int i0 = row0 + wave * kRowBatch; i0 < row0 + rows; i0 += kWaves * kRowBatch) {
+        uint4 v[kRowBatch];
+#pragma unroll
+        for (int k = 0; k < kRowBatch; ++k) v[k] = w_uk4[(int64_t)(i0 + k) * row4 + lane];
+#pragma unroll
+        for (int k = 0; k < kRowBatch; ++k) {
+            const float q = q_head[i0 + k];
+            float a, b;
+            unpack_bf16x2(v[k].x, a, b); acc[0] += q * a; acc[1] += q * b;
+            unpack_bf16x2(v[k].y, a, b); acc[2] += q * a; acc[3] += q * b;
+            unpack_bf16x2(v[k].z, a, b); acc[4] += q * a; acc[5] += q * b;
+            unpack_bf16x2(v[k].w, a, b); acc[6] += q * a; acc[7] += q * b;
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < 8; ++j) part_lds[wave * kMaxKvLora + 8 * lane + j] = acc[j];
+    __syncthreads();
+    for (int j = threadIdx.x; j < kv_lora; j += blockDim.x) {
+        float v = 0.f;
+        for (int w = 0; w < kWaves; ++w) v += part_lds[w * kMaxKvLora + j];   // fixed order
+        out_partial[j] = v;
+    }
+    __syncthreads();
+}
+
+// The reader side: add the published partials in slice order and take q_pe
+// straight from q, which is 256 bytes and needs no publishing.
+__device__ inline void q_absorb_gather(
+        const float* __restrict__ q_head, const float* __restrict__ partials,
+        const float* __restrict__ cos, const float* __restrict__ sin,
+        float* __restrict__ q_c_lds, float* __restrict__ q_pe_lds,
+        int qk_nope, int qk_rope, int kv_lora, int n_slices) {
+    for (int j = threadIdx.x; j < kv_lora; j += blockDim.x) {
+        float v = 0.f;
+        for (int s = 0; s < n_slices; ++s) v += partials[s * kv_lora + j];   // fixed order
+        q_c_lds[j] = v;
+    }
+    for (int i = threadIdx.x; i < qk_rope; i += blockDim.x) {
+        q_pe_lds[i] = q_head[qk_nope + i];
+    }
+    __syncthreads();
+    apply_rope_interleaved(q_pe_lds, cos, sin, qk_rope);
+}
+
 __device__ inline void q_absorb(
         const float* __restrict__ q_head, const __hip_bfloat16* __restrict__ kv_b,
         const float* __restrict__ cos, const float* __restrict__ sin,
