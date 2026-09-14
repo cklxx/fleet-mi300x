@@ -259,7 +259,7 @@ def build_attention(g: Graph, layer: int, e_qkv: list[int], cfg: dict) -> list[i
     # workers that would otherwise idle through this phase (32 of 37 take an
     # attention task), and the readers wait for them *after* kv_post, so the
     # wait is paid against work already done.
-    published = cfg.get("qc_published", False)
+    published = cfg.get("qc_published", True)
     e_qabs = []
     if published:
         for h in range(heads):
@@ -734,7 +734,7 @@ def report(g: Graph, cfg: dict) -> None:
 def load_cfg(config: Path, kv_chunks: int, prefetch: bool = False,
              k_chunk: int = EXPERT_K_CHUNK, kva_shared: bool = True,
              split_workers: int = 0, topk_published: bool = False,
-             qc_published: bool = False) -> dict:
+             qc_published: bool = True) -> dict:
     c = json.loads(config.read_text())
     return {
         "prefetch": prefetch,
@@ -769,9 +769,10 @@ def main() -> None:
                     help="every XCD computes its own copy of the 576 kv_a rows behind an "
                          "XCD-local event (the v0.10-v0.14 graph) instead of the default "
                          "split over the 8 XCDs behind one global event")
-    ap.add_argument("--qc-published", action="store_true",
-                    help="publish each head's absorbed q_c from the workers that idle "
-                         "during attention, instead of every KV chunk streaming W_UK")
+    ap.add_argument("--qc-per-task", action="store_true",
+                    help="every KV chunk streams all 131 KB of W_UK to build its own q_c "
+                         "(the pre-v0.18 graph); the default publishes it once per head, "
+                         "measured 3.593 vs 3.650 ms over three alternating pairs")
     ap.add_argument("--topk-published", action="store_true",
                     help="the router's last arriver publishes the top-k and the expert tasks "
                          "read it (64 B); measured 0.4%% slower than the default, where every "
@@ -782,7 +783,7 @@ def main() -> None:
     a = ap.parse_args()
 
     cfg = load_cfg(a.config, a.kv_chunks, a.prefetch, a.k_chunk, not a.kva_replicated,
-                   a.split_workers, a.topk_published, a.qc_published)
+                   a.split_workers, a.topk_published, not a.qc_per_task)
     g = build(cfg)
 
     if a.emit:

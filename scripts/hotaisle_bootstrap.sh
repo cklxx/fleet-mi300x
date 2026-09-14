@@ -58,7 +58,7 @@ python3 src/host/taskgraph.py --kv-chunks 16 --k-chunk 512 --emit build/taskgrap
 python3 src/host/taskgraph.py --kv-chunks 16 --prefetch --emit build/taskgraph_d16_prefetch.bin | tail -1
 python3 src/host/taskgraph.py --kv-chunks 16 --kva-replicated --emit build/taskgraph_d16_kvarep.bin | tail -1
 python3 src/host/taskgraph.py --kv-chunks 16 --topk-published --emit build/taskgraph_d16_topkpub.bin | tail -1
-python3 src/host/taskgraph.py --kv-chunks 16 --qc-published --emit build/taskgraph_d16_qc.bin | tail -1
+python3 src/host/taskgraph.py --kv-chunks 16 --qc-per-task --emit build/taskgraph_d16_qcpt.bin | tail -1
 python3 src/host/taskgraph.py --kv-chunks 16 --split-workers 18 --k-chunk 512 --emit build/taskgraph_d16_split18_k512.bin | tail -1
 python3 src/host/taskgraph.py --kv-chunks 16 --split-workers 18 --emit build/taskgraph_d16_split18.bin | tail -1
 python3 src/host/taskgraph.py --kv-chunks 16 --split-workers 22 --k-chunk 512 --emit build/taskgraph_d16_split22_k512.bin | tail -1
