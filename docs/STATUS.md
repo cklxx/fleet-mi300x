@@ -9,8 +9,8 @@ to be stated plainly, not just for code.
 
 ## Where this is (2026-09-15, after three sessions on the MI300X)
 
-**End to end works, matches HuggingFace, and runs at 3.73–3.93 ms per
-token — faster than vLLM on the same box (4.52 ms).** On a Hot Aisle 1×MI300X VM
+**End to end works, matches HuggingFace, and runs at 3.75 ms per token —
+faster than vLLM on the same box (4.52 ms).** On a Hot Aisle 1×MI300X VM
 (ROCm 7.2, gfx942), one cooperative launch decodes all 32 greedy tokens over
 the 1,024-token context; the argmax task of each token feeds the next
 token's embed on the device. Every token equals HF's greedy choice, and on
@@ -19,13 +19,14 @@ per-layer states. The required milestone (one MoE layer through the Fleet
 path) holds for every MoE layer and the stretch goal (full model, e2e,
 single launch) as well. Raw numbers: [`results/`](../results/).
 
-| Measured (v0.13: `fleet_decode_nt`, `taskgraph_d16.bin`) | Value |
+| Measured (v0.14, fresh VM, one unattended `hotaisle_bootstrap.sh` run: `fleet_decode_nt`, `taskgraph_d16.bin`) | Value |
 |---|---|
-| Tokens matching HF greedy, free-running | 32/32 (`results/decode_v13_nt_d16.json`); teacher-forced 32/32 on the v0.11 graph (`decode_d8_teacher.json`) |
+| Tokens matching HF greedy, free-running / teacher-forced | 32/32 and 32/32 (`results/decode_free.json`, `decode_teacher.json`) |
 | Layers inside the §6 gate on step 0 | 27 of 27 |
-| Per-token latency, median / p95, **one launch for 32 tokens** | best run **3.733 / 3.750 ms (268 tok/s)**; three later runs interleaved with the variant below: 3.926–3.929 ms (255 tok/s). Same binary, same graph — the VM's run-to-run spread is ~5% |
-| `--coherent-acts` (atomic cross-XCD activations, no consumer L2 invalidate; see limitations) | 3.865–3.879 ms in the same interleaved session, 32/32 |
-| Same kernel with plain loads (`fleet_decode`, d16) / with 8 KV chunks (NT) | 3.872 ms / 3.830 ms |
+| Per-token latency, median / p95, **one launch for 32 tokens** | **3.756 / 3.781 ms (266 tok/s)**; five runs in the session 3.746–3.763 ms. (The previous VM gave 3.733 once and 3.93 on re-runs: ~5% between VMs/sessions, <1% within this one) |
+| One launch per token (v1) | 3.757 ms: the single launch is the design's v2 delivered, not a speed-up |
+| `--coherent-acts` (atomic cross-XCD activations, no consumer L2 invalidate) | 3.748–3.763 ms: no longer faster once the prologue loads were vectorised; off |
+| Same kernel with plain loads (`fleet_decode`) / with 8 KV chunks / K-chunk tiling / prefetch | 3.865 / 3.845 / 4.041 / 4.134 ms (`results/decode_*.json`) |
 | **vLLM 0.11.2 on the same VM** (rocm/vllm docker, V1 engine, AITER MLA backend, full CUDA graphs, bf16, batch 1, same prompt) | 4.522 ms median / 4.553 mean (220 tok/s), 32/32 tokens equal to the golden ones; `results/baseline_vllm.json`, `bench/vllm_decode_timing.py` |
 | HF transformers 4.44 eager (torch 2.10 rocm7.0), same prompt | 54.4 ms (18 tok/s); `results/baseline_hf.json` |
 | Where the first correct version stood | 22.05 ms |
@@ -34,13 +35,14 @@ single launch) as well. Raw numbers: [`results/`](../results/).
 | Cross-XCD event, idle / under load (`results/microbench_summary.txt`) | 1.36 µs / 5.88 µs at 1.59 TB/s of streaming load |
 | Payload visibility (`microbench (d)(d')(d''')`) | fenced protocol 0 stale in 16.4 M; 37 producers + last-arriver flush 0 stale in 151 M each; agent-scope atomic payload without fences 0 stale in 16.4 M. MTYPE-UC memory without fences (d''): 12.3 M of 16.4 M stale — not usable on this VM |
 | Streamed read bandwidth, best depth | 4.2 TB/s (79% of peak) |
-| Bytes per token (§1) at 3.73 ms | 4.94 GB → 1.32 TB/s of the 4.2 TB/s ceiling (byte floor 1.17 ms) |
-| Kernel resources (`results/kernel_resource_usage.txt`) | 256 VGPRs, 48 B/lane scratch (since the 16-chunk merge), ~420 SGPR spills, 25 KB LDS, 1 wave/SIMD |
+| **Bytes per token, measured** (`rocprofv3 --pmc FETCH_SIZE`, 4 teacher-forced tokens, `results/rocprofv3_fetch_size.csv`) | 22.66 GB for 4 tokens = **5.67 GB/token**, 15% above §1's 4.94 GB (kv_a replicated per XCD, the partial folds, L2 misses); at 3.756 ms that is **1.51 TB/s** of the 4.2 TB/s ceiling (byte floor at the measured bytes: 1.35 ms) |
+| Kernel resources (`results/kernel_resource_usage.txt`) | 256 VGPRs, 48 B/lane scratch, ~430 SGPR spills, 25 KB LDS, 1 wave/SIMD |
 | KV-cache conversion vs HF's own cache | K_nope, K_rope, V all exactly 0 error, 27 layers |
 
-`rocprofv3 --pmc FETCH_SIZE` was attempted for the real byte count and
-segfaults on this VM (ROCm 7.2.4, SR-IOV VF) before the decode kernel runs;
-the bandwidth figure above still uses §1's accounting.
+`rocprofv3` (and `rocprof` v1) crash at process exit on this VM (ROCm
+7.2.4, SR-IOV VF), but with `--kernel-trace` left out the counter row for
+the decode kernel is written before the crash; both tools agree
+(22,660,092 vs 22,665,918 KB).
 
 ### The optimisation path, each step attributed by the per-task trace
 
@@ -63,6 +65,7 @@ the bandwidth figure above still uses §1's accounting.
 | **v0.13** — 16 KV chunks (256 attention tasks/layer, still ≤ 37 per XCD); argmax from 296 per-worker candidates written by the lm_head epilogue | **3.73 ms** | attention 20.3 → 16.7 µs; argmax was 109 µs on one CU (a dependent load per compare), now 4 µs |
 | idle-worker prefetch of routing-independent weights into the Infinity Cache (`--prefetch`) | no gain (4.84 vs 4.80; 4.77 vs 4.70 with NT) | kept as a graph option; the per-CU streaming rate (~30 GB/s) limits what 21 idle workers can pull in 20 µs to ~60 MB/layer, and the phases that would benefit are latency-bound, not byte-bound |
 | fold with all 72 partial loads in flight (one round trip instead of two) | +0.1 ms (**slower**) | 48 B/lane of scratch: the register file, again |
+| **v0.14** — 16-byte loads for every staged vector and for the fold (18 loads per thread in flight instead of 36 scalar ones in two batches); merge partials in two batches of 8 | 3.75 ms, and the run-to-run spread within a session fell below 1% | the prologues did *not* get shorter (7.5 / 8.3 / 7.2 / 5.6 µs), so the round-trip count was not what bounded them; the scratch stayed at 48 B/lane, so the merge was not its source either |
 
 Tried and rejected by measurement: two workgroups per CU (6.5 ms: the
 kernel's 256 VGPRs leave no room for a second wave per SIMD); workers polling
@@ -71,26 +74,29 @@ the global counters directly instead of the scheduler mirror (slower);
 fold; K-chunk tiling of gate_up→down; idle-worker prefetch; MTYPE-UC
 activations without fences (wrong: bench (d'')).
 
-Where the 3.73 ms goes (`results/timeline_v13_nt_d16_L5.txt`, layer 5,
-133 µs; "prologue" is staging + norm + fold + routing before the stream):
+Where the 3.75 ms goes (`results/timeline_free_L5.txt`, layer 5, 133 µs;
+"prologue" is staging + norm + fold + routing before the stream):
 
 | phase | starts | ends | avg task busy | of which prologue |
 |---|---|---|---|---|
-| q/kv_a | 0 | 22.7 | 21.2 | 7.7 |
-| attention (256 tasks) | 21.5 | 40.8 | 16.8 | 7.9 |
-| merge + W_UV (256) | 38.6 | 50.9 | 8.6 | — |
-| o_proj K-split | 48.0 | 59.4 | 7.0 | 0.7 |
-| norm + router | 60.3 | 72.9 | 11.2 | 7.7 |
-| expert gate_up | 72.4 | 108.7 | 34.0 | 6.2 |
-| expert down | 107.0 | 133.1 | 22.6 | 6.2 |
+| q/kv_a | 0 | 22.6 | 21.1 | 7.5 |
+| attention (256 tasks) | 21.8 | 41.2 | 16.9 | 8.3 |
+| merge + W_UV (256) | 38.9 | 51.4 | 8.9 | — |
+| o_proj K-split | 48.8 | 59.7 | 6.7 | 0.6 |
+| norm + router | 60.4 | 73.8 | 10.6 | 7.2 |
+| expert gate_up | 72.0 | 107.6 | 33.5 | 5.6 |
+| expert down | 105.6 | 132.8 | 23.0 | 5.8 |
 
 Events cost under 1 µs each now (2 global + 48 XCD-local per layer); the
 gaps between phases are 0.4–1 µs. What remains is the phases themselves,
 and inside them the prologues: every one of the 296 workers stages 8 KB of
 x (and 64 KB of partials at the two fold points) from HBM/Infinity Cache
-under full streaming load, where a dependent round trip costs 3–4 µs.
-The 27 layers × ~36 µs of prologue ≈ 1 ms of the 3.73. The lm_head streams
-420 MB at 3.0 TB/s (138 µs) and its prologue is 14 µs.
+under full streaming load. Halving the number of load round trips (v0.14)
+did not shorten them, so the cost is not the loads' latency alone; the
+RMSNorm's block reductions and the routing (softmax + top-k on one wave)
+are the next suspects, and the sub-phase stamps can be moved to split
+them. The 27 layers × ~36 µs of prologue ≈ 1 ms of the 3.75. The lm_head
+streams 420 MB at 3.1 TB/s (135 µs) and its prologue is 9 µs.
 
 ### Third session: the "far goal" route and what survived contact
 
@@ -98,7 +104,7 @@ The plan was eight structural steps to ~2.5 ms. Measured one by one:
 
 | Step | Result |
 |---|---|
-| 1. `rocprofv3 --pmc FETCH_SIZE` | rocprofv3 segfaults on this VM; not obtained |
+| 1. `rocprofv3 --pmc FETCH_SIZE` | obtained on the third try (without `--kernel-trace`): 5.67 GB/token, 15% over §1 |
 | 2. Fold once by the globally last worker, single `x` | slower (serial ~4 µs per fold point); replaced by the parallel prologue fold with a ping-pong `x` and a separate o_proj partial buffer |
 | 3. Tile-granular gate_up→down | slower; down and gate_up share workers, so nothing overlaps. The machinery (per-wave chunk arrivals, in-body chunk waits, K-chunked accumulation) stays behind `--k-chunk` |
 | 4. o_proj K-split per XCD | kept: merge→o_proj is XCD-local, 2 global events per layer; needed the half-wave GEMV to pay off |
@@ -173,7 +179,7 @@ happening to be zero; the routing weight is multiplied by
 | Component | What it does | Verified by |
 |---|---|---|
 | `src/host/model_analysis.py` | Per-token HBM byte accounting from `config.json` | Reproduces design.md §1 exactly: attention 27.53 MB/layer, one routed expert 17.30 MB, MoE layer 166.20 MB, lm_head 419.43 MB, **4.935 GB/token**, 31.41 GB resident, floor 0.93 ms @ 5.3 TB/s |
-| `src/host/taskgraph.py` | Builds + validates the Fleet task DAG, fans Chiplet-tasks out to per-worker descriptors, emits them with an event-label sidecar | 66 logical tasks / 1,218 descriptors per MoE layer (kv_chunks=1), 114 / 1,266 with split-KV; 1,791 logical / 33,183 descriptors per token (3,087 / 34,479 with split-KV); 6 global + 24 XCD-local events per layer; per-worker queue length 112–113; XCD imbalance 0.1% |
+| `src/host/taskgraph.py` | Builds + validates the Fleet task DAG, fans Chiplet-tasks out to per-worker descriptors, emits them with an event-label sidecar | v0.13 graph (`--kv-chunks 16`): 552 logical tasks / 1,992 descriptors per MoE layer, 2 global + 48 XCD-local events per layer; 14,914 logical / 54,082 descriptors and 1,346 events (58 global) per token; `--report` prints the counts and the validator's verdict |
 | `tests/test_queue_simulation.py` | Executes the emitted queues under the kernel's protocol: 296 queues in order, monotonic counters, targets `epoch × wait_count`, XCD-local visibility, per-wave chunk arrivals, 3 epochs, forward/reverse/random worker order | 15/15 over three graphs; the sabotage cases (old signal-side count, missing last-arrival rule) are reported |
 | `src/host/reference_decode.py` | NumPy absorbed-MLA decode: the arithmetic each HIP task must reproduce | Boundary tests below |
 | `src/host/kv_convert.py`, `reference_run.py` | prefill → decode cache `[27][1056][576]` bf16 (32.8 MB) and greedy tokens, written from the *same* HF prefill the launcher is compared against | Layout arithmetic matches §5; reconstruction check needs the model |
@@ -182,43 +188,44 @@ happening to be zero; the routing weight is multiplied by
 | `src/runtime/fleet_runtime.h` | AOT queues, events with wait-side fields, XCD-local role tickets, grid-distribution check, wait timeouts → abort codes | Layout test 6/6; interface test 14/14; queue simulation 10/10 |
 | `src/kernels/fleet_kernel.hip`, `gemv.h`, `attention.h`, `expert.h` | Persistent kernel and task bodies; LDS-only scratch; wave-per-row GEMV; wave-per-position attention | **Parsed in HIP language mode, device and host passes, by clang 14 with the AMDGPU backend** (`scripts/hip_syntax_check.sh`): 0 errors, 0 warnings at `-Wall -Wextra`. The compiler's own `__hip_atomic_*`, `__builtin_amdgcn_fence`, attributes and inline asm are exercised; only the runtime API is stubbed |
 | `src/host/fleet_launch.hip` | Queues, event buffers, weights/cache/golden loading, YaRN tables, per-token cooperative launch, HF comparison, abort decoding, `--smoke` / `--teacher-force` / `--json` | Same parse, both passes, 0 errors |
-| `bench/microbench.hip` | D1 (d) cross-XCD payload visibility under the kernel's exact fence placement; (a) cross-XCD event cost, cached vs uncached counters; (e) the same under a 302-workgroup HBM stream; (b) same-XCD cost; (c) streamed read bandwidth vs depth; XCC_ID checks on every pair | Same parse, 0 errors; never run |
+| `bench/microbench.hip` | (d) cross-XCD payload visibility under the kernel's fence placement, (d') 37 producers with one last-arriver flush, (d'') MTYPE-UC memory without fences, (d''') agent-scope atomic payload without fences; (a) cross-XCD event cost, cached vs uncached counters; (e) the same under a 302-workgroup HBM stream; (b) same-XCD cost; (c) streamed read bandwidth vs depth; (f) the expert phase in isolation; XCC_ID checks on every pair | Run on every session; `results/microbench_summary.txt` |
 | `src/host/pack_weights.py` | Flat bf16 blob, 256-B aligned, fused q‖kv_a, interleaved gate/up, `.manifest` the launcher parses | Syntax and CLI only; needs the checkpoint |
-| `scripts/setup_env.sh` | One-shot environment build on the MI300X: the seven local tests, hipcc, task graphs, the protocol smoke test, and only then the 31 GB download and the packing | Written; unrun |
+| `scripts/hotaisle_bootstrap.sh` (`setup_env.sh` is the generic form) | Fresh Ubuntu + ROCm box to results, unattended: venv, torch/transformers, model download, the seven local tests, both binaries, graphs, microbench, smoke, reference run, packing, the headline decodes, the variants, a best-effort rocprof byte count | Run from scratch on every new VM (three times) |
 | `tests/test_expert_addressing.py` | Builds the packer's byte layout, resolves the 8 units as `expert.h` does, runs the kernel's arithmetic with HF's rounding points against `reference_decode.moe` | 7/7: routing exact, phase output within 4.1e-3 of the reference (bf16-ulp level), and the pre-review offsets produce a 37% error that the test reports |
 
 ## Decisions the design text did not make, made here
 
-- **Every cross-workgroup handshake is agent-scope.** MI300X L2 is per XCD.
-  Producers release (`buffer_wbl2`), counters are agent-scope atomics, pollers
-  use agent-scope atomic loads, consumers acquire (`buffer_inv`). This is what
-  the LLVM AMDGPU memory model guarantees; the "fence-free XCD-local counter"
-  and "L2-resident mirror" in design.md §4 are *optimisations to be measured*
-  on D1, not assumptions the correctness of the kernel rests on. If D1 (b)
-  shows the same-XCD hop is no cheaper than the cross-XCD one under this
-  protocol, the scheduler mirror buys nothing and should be removed.
+- **Every cross-XCD handshake is agent-scope; XCD-local ones are not.**
+  MI300X L2 is per XCD. For a global event the XCD's last arriver releases
+  once (`buffer_wbl2`), counters are agent-scope atomics, pollers use
+  agent-scope atomic loads, consumers acquire (`buffer_inv sc1`). For an
+  XCD-local event producers only drain their stores and consumers invalidate
+  their L1. Both are what the LLVM AMDGPU memory model guarantees and both are
+  checked word for word by the microbench. The scheduler mirror stays: direct
+  polling of the global counters by 296 workers measured slower.
 - **Chiplet-tasks are per-worker descriptors.** Nothing on the device
   broadcasts a task; the descriptor count grows to 33k (2 MB), which is read
   sequentially per worker and is irrelevant next to 4.9 GB of weights.
 - **Failure is loud.** A wrong XCD distribution, a wait that never completes,
   or a grid barrier that does not fill all end the launch with a reason code
   the launcher prints with the event's label, instead of a hung GPU.
-- **Split-KV (D4) is wired but the merge still runs after all chunks**; the
-  tile-granular producer/consumer of §12 row 1 is not implemented.
+- **Split-KV runs at 16 chunks per head; the merge runs after all chunks.**
+  The tile-granular producer/consumer of §12 row 1 is implemented
+  (`--k-chunk`) and measured slower, so it is off.
 
 ## Known limitations, open risks
 
-1. **The design target (2.5–3.5 ms) is not reached: 3.73 ms**, 1.32 TB/s
-   of a 4.2 TB/s ceiling (byte floor 1.17 ms), against Fleet's own 44% of
-   peak on a dense model. The token is 27 serial layers of seven serial
+1. **The design target (2.5–3.5 ms) is not reached: 3.75 ms**, 1.51 TB/s
+   of a 4.2 TB/s ceiling at the measured 5.67 GB/token (byte floor 1.35 ms),
+   against Fleet's own 44% of peak on a dense model. The token is 27 serial layers of seven serial
    phases; events are no longer the cost (< 1 µs each), the per-task
    prologues and the latency-bound phases (q/kv_a with 28 rows per worker,
    attention at 1K context, router) are. It beats vLLM on the same box by
    18% (4.52 ms) with bit-exact HF greedy tokens.
-2. **Bytes per token are not the 4.935 GB of §1.** Every XCD recomputes
-   all 576 kv_a rows (0.51 GB/token of HBM reads) and every worker folds
-   the 8 partials itself (64 KB per worker per fold point, L2/MALL traffic).
-   `rocprofv3` could not measure the real count on this VM.
+2. **Bytes per token are 5.67 GB, not the 4.935 GB of §1** (measured,
+   `FETCH_SIZE`). Every XCD recomputes all 576 kv_a rows (0.51 GB/token of
+   HBM reads) and every worker folds the 8 partials itself (64 KB per
+   worker per fold point); the rest is L2 misses on the shared tensors.
 3. **`--coherent-acts` is validated by measurement, not only by the memory
    model.** Cross-XCD activations go through agent-scope atomic loads and
    stores, and global waits skip the L2 invalidate (except the token
@@ -226,13 +233,11 @@ happening to be zero; the routing weight is multiplied by
    skipping the `buffer_wbl2` too, which bench (d''') passes — produced wrong
    tokens in 10 of 18 launches; with the writeback kept it was correct in
    18/18 launches plus every run since (free-running and teacher-forced,
-   27/27 layers). Interleaved with the fenced protocol in one session it is
-   1.5–2% faster (3.85–3.89 vs 3.93 ms). Why the write-through atomic store
-   is not enough without the writeback is not understood; the kernel keeps
-   the fence. Off by default; the headline number uses the fenced protocol.
-   Run-to-run spread of the same binary on this VM: 3.73–3.93 ms (the table
-   above reports the best run and the session's other runs are in
-   `results/decode_v1[34]_*.json`).
+   27/27 layers). It was 1.5–2% faster than the fenced protocol before the
+   prologue loads were vectorised and is not measurably faster after
+   (3.748–3.763 vs 3.746–3.756 ms). Why the write-through atomic store is
+   not enough without the writeback is not understood. Off by default; the
+   headline number uses the fenced protocol.
 4. The expert GEMVs still run slower inside the kernel (34 µs gate_up) than
    in isolation (25 µs, `microbench (f)`); the sub-phase stamps attribute
    6 µs of it to the prologue (routing + staging under load) and the rest
@@ -249,17 +254,22 @@ happening to be zero; the routing weight is multiplied by
 
 ## Next, in order
 
-1. Find the `--coherent-acts` race (repeated runs with acquires-only and
-   releases-only kept, `FLEET_COH_KEEP`), then make it the default: −0.1 ms.
-2. Cut the prologues: stage `x` once per XCD into an XCD-local copy instead
-   of 296 workers each pulling 8 KB (and 64 KB of partials) through a loaded
-   fabric; the fold could be done by 37 workers per XCD, each 1/37 of the
-   vector, behind one XCD-local event. Expected 0.3–0.5 ms/token.
-3. The register environment: the 16-chunk merge pushed the kernel into
-   scratch; split the merge's chunk loop or move attention/merge into a
-   separate code path so the GEMV kernels get their registers back.
-4. Bytes in flight per CU: the GEMV streams ~48 KB per CU; a third buffer
+1. Split the prologue with more stamps (after staging, after the norm,
+   after routing) — vectorising the loads changed nothing, so the ~7 µs
+   is somewhere else, most likely the norm's two block reductions and the
+   per-task routing; then stage the normed vector once per XCD (one
+   XCD-local event) instead of 296 workers each norming it. ~1 ms of the
+   3.75 is prologue.
+2. The register environment: 48 B/lane of scratch is not the merge (batching
+   its loads changed nothing); find it with `-save-temps` and the ISA, or
+   move attention/merge into a separate code path so the GEMVs get their
+   registers back.
+3. Bytes in flight per CU: the GEMV streams ~48 KB per CU; a third buffer
    in AGPRs (loads can target AGPRs on gfx942) or LDS-direct loads would
    raise it without touching occupancy.
-5. kv_a replication: 8 × 576 rows per layer is 0.51 GB/token; compute it
-   once per XCD pair or accept the global event and measure.
+4. kv_a replication: 8 × 576 rows per layer is 0.51 GB of the measured
+   5.67 GB/token; compute it once per XCD pair or accept the global event
+   and measure.
+5. Understand why `--coherent-acts` needs the producer writeback; if the
+   answer allows dropping it, the protocol cost (2.2 vs 2.9 ms in the
+   body-less smoke run) says there is ~0.1 ms in it.

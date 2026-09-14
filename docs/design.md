@@ -131,11 +131,11 @@ Four synchronization scopes from Fleet §5.2; the launch policy is MPK's AOT mod
 1. Task descriptors: built on host once, immutable, read without sync.
 2. Task launch is ahead-of-time for every task: at bs=1 with fixed context and fixed top-6, no task has a data-dependent duration, so each worker's queue is filled once before launch (round-robin within its XCD, expert tasks by slot k) and a worker waits locally on its task's dependent event instead of being dispatched by a scheduler after the event fires. This is one synchronization hop per event (event → worker) instead of two (worker → scheduler → worker).
    The per-XCD scheduler therefore has one job: mirror global events into XCD-local flags. The scheduler workgroup (all four waves, one event per lane per pass) polls the global counters and copies each *count* into its XCD's mirror array; the 37 workers of that XCD poll the mirror. Global-counter polling traffic drops from 296 pollers to 8. The scheduler keeps a dedicated CU (1 of 38 per XCD, 2.6% of CUs), irrelevant in a bandwidth-bound regime. Whether the mirror actually stays L2-resident under the agent-scope protocol below is a D1 (b) measurement, not an assumption.
-3. Worker→worker inside a Chiplet-task: XCD-local counter. Used for gate_up→down and for split-KV partial completion. *Implemented with the same agent-scope fences as 4; the fence-free variant is a planned optimisation.*
+3. Worker→worker inside a Chiplet-task: XCD-local counter. Used for gate_up→down, for split-KV partial completion, for merge→o_proj and for the router→experts hand-off. Producers only drain their stores (the payload is in the shared L2 of the XCD); consumers invalidate their L1 (`buffer_inv sc0`). Measured in bench (d'): 0 stale words in 151 M.
 4. XCD→global event: two implementations, selected by D1 microbenchmark (a). Both use the same code path (agent-scope release fence on every producer, agent-scope atomic, agent-scope polling, acquire on the consumer); they differ only in where the counters live:
    - (i) ordinary device memory: the release fence's `buffer_wbl2` walks the XCD L2 for dirty lines.
    - (ii) counters in `hipExtMallocWithFlags(..., hipDeviceMallocUncached)` memory (MTYPE UC), so the atomic resolves at the Infinity Cache.
-   *Not implemented:* last-worker-only flushing (every producer fences), `sc1` write-through payload stores, and explicit `nt`/`sc1` cache modifiers on weight streams; the cache-residency claims below therefore describe intent, to be checked against `rocprofv3` counters.
+   Implemented: last-arriver flushing (one `buffer_wbl2` per XCD per global event), non-temporal weight streams (`-DFLEET_NT_WEIGHTS=1`, the headline binary), and `sc1` atomic payload accesses behind `--coherent-acts`. The cache-residency effect of the `nt` streams was measured as a 4% end-to-end gain, not through `rocprofv3` counters (which crash on the VM).
 
 Residency: the kernel is launched with `hipLaunchCooperativeKernel` so all 304 workgroups are guaranteed co-resident (or the launch fails), which removes the scheduler-waits-for-absent-worker deadlock by construction. Scheduler waves run at `s_setprio 3`; polling loops insert `s_sleep 1` between reads to keep fabric traffic down.
 
@@ -213,9 +213,9 @@ Measured on 2026-09-14/15 (1×MI300X VM, ROCm 7.2; raw files in `results/`, narr
 | Quantity | Estimated below | Measured |
 |---|---|---|
 | Achievable streaming bandwidth | 4.0 TB/s | 4.24 TB/s (`microbench (c)`, depth 8) |
-| Cross-XCD event, idle / under load | 2–4 µs (confidence L) | 1.44 µs / 6.76 µs at 1.64 TB/s of load (`microbench (e)`) |
+| Cross-XCD event, idle / under load | 2–4 µs (confidence L) | 1.40 µs / 6.00 µs at 1.66 TB/s of load (`microbench (e)`, final session) |
 | First correct e2e | 8–15 ms/token | 22.05 ms, then 4.08 ms after the trace-driven passes |
-| Tuned target | 2.5–3.5 ms/token | **3.73 ms best run, 3.93 ms typical (255–268 tok/s), 32/32 tokens, 27/27 layers** — 1.26–1.32 TB/s achieved; the loss is serial phases and their prologues, not bytes or events (STATUS.md). vLLM on the same box: 4.52 ms |
+| Tuned target | 2.5–3.5 ms/token | **3.75 ms (266 tok/s), 32/32 tokens, 27/27 layers** — 1.51 TB/s at the measured 5.67 GB/token; the loss is serial phases and their prologues, not bytes or events (STATUS.md). vLLM on the same box: 4.52 ms |
 | Protocol only, per token | ~0.3–0.7 ms | 2.84 ms with 1,346 events (2.20 ms without fences): the smoke run has no bodies, so every wait is back-to-back |
 | Launches/token | 1 → 1/32 | 1 launch per 32 tokens (v2 implemented) |
 
@@ -224,7 +224,7 @@ The original estimates follow, unchanged, so they can be checked against the num
 
 | Quantity | Value | Basis |
 |---|---|---|
-| Bytes/token | 4.94 GB | §1 accounting |
+| Bytes/token | 4.94 GB | §1 accounting; **measured 5.67 GB** (`rocprofv3 FETCH_SIZE`), the difference itemised in STATUS.md |
 | Floor @ 5.3 TB/s | 0.93 ms | peak HBM |
 | Floor @ 4.0 TB/s (76% achievable, streaming loads) | 1.24 ms | AMD stream microbenchmark on MI300X SPX/NPS1: 4,017 GB/s (ROCm blog, Feb 2025); confidence H |
 | Sync overhead | ~166 global events × 2–4 µs ≈ 0.3–0.7 ms | 3–6 µs is the two-hop (worker→scheduler→worker) figure; AOT launch with event mirroring is one hop; confidence L until D1 microbenchmarks (a)(b). Event count is in line with Fleet's own graph: 1,830 per-XCD signals per token on Qwen3-8B = ~229 global events |
@@ -249,7 +249,7 @@ Dominant risk to the target: expert GEMV efficiency at N-tile granularity (17.3 
 | Consecutive layers | on token 0 the kernel copies every layer's output to `layer_dump`; the launcher compares each against HF's first-decode-step states (`golden_hidden.bin`) and prints max rel, cosine and the number of consecutive layers inside the gate; `--dump-layers` writes the states for offline analysis |
 | GPU launches | `rocprofv3 --kernel-trace -o trace -- ./build/fleet_decode` → count per token |
 | Median / P95 latency | `fleet_decode --json` records `hipEvent` time per token; `--smoke` isolates the synchronisation cost |
-| Per-XCD timeline | *planned:* every task writes start/end `s_memrealtime` + XCD id to a trace buffer; a `bench/gantt.py` renders 8 XCD lanes per token, exposing bubbles, imbalance and tails |
+| Per-XCD timeline | *implemented:* every descriptor writes wait-start / ready / done `s_memrealtime` stamps, the XCD id and the end of its prologue (`--trace`); `scripts/trace_timeline.py` prints one layer's phase timeline, the launcher aggregates per kind and per layer. *Not done:* a `bench/gantt.py` renders 8 XCD lanes per token, exposing bubbles, imbalance and tails |
 | Memory traffic / bandwidth | `rocprofv3 --pmc FETCH_SIZE WRITE_SIZE` (gfx942 TCC counters); achieved BW = bytes / kernel time |
 | Occupancy / resources | `hipcc -Rpass-analysis=kernel-resource-usage` (VGPR/SGPR/LDS), `rocprofv3 --pmc SQ_WAVES SQ_BUSY_CYCLES GRBM_GUI_ACTIVE` |
 | TPOT / tok/s | derived from e2e run |

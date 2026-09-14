@@ -86,10 +86,10 @@ output against HF's (max rel, cosine) and how many consecutive layers sit
 inside the §6 gate — the evidence for the "one MoE layer through the Fleet
 path" milestone, independent of whether the 32 tokens all match.
 
-Order matters. `setup_env.sh` ends with `fleet_decode --smoke`, which runs the
-whole per-token protocol — cooperative launch at grid 304, XCD role discovery,
-all 805 events — with every task body skipped, so the synchronisation cost is
-measured before a single weight is downloaded. The microbenchmarks then decide
+Order matters. The bootstrap runs `fleet_decode --smoke` before the model
+download: the whole per-token protocol — cooperative launch at grid 304, XCD
+role discovery, all 1,346 events — with every task body skipped, so the
+synchronisation cost is measured before a single weight is downloaded. The microbenchmarks then decide
 which event scheme is cheaper and what depth the GEMV should stream at. The
 golden run comes next because every later boundary is judged against it.
 
@@ -106,12 +106,13 @@ step with its trace attribution in [docs/STATUS.md](docs/STATUS.md).
 |---|---|
 | Greedy tokens matching HF, free-running / teacher-forced | 32/32 and 32/32 |
 | Layers inside the §6 gate on the first decode step | 27 of 27 (layer 1: max rel 3.1e-3, cosine 0.999993) |
-| Per-token latency, median / p95, one cooperative launch for all 32 tokens | **3.73 ms / 3.75 ms (268 tok/s)** best run, 3.93 ms typical (three interleaved re-runs; ~5% run-to-run spread on the VM); first correct version was 22.05 ms |
+| Per-token latency, median / p95, one cooperative launch for all 32 tokens | **3.76 ms / 3.78 ms (266 tok/s)**, five runs of the final session within 3.746–3.763; first correct version was 22.05 ms |
+| Bytes per token, measured (`rocprofv3 FETCH_SIZE`) | 5.67 GB → 1.51 TB/s of the 4.2 TB/s streaming ceiling |
 | **vLLM 0.11.2 on the same VM** (AITER MLA backend, CUDA graphs, bf16, batch 1, same prompt; `bench/vllm_decode_timing.py`) | 4.52 ms (220 tok/s), same 32 tokens |
 | HF transformers eager on the same VM | 54.4 ms |
 | Launches per 32 tokens | 1 (the argmax task feeds the next embed on the device) |
 | Global events per MoE layer / per token | 2 / 58 |
-| Cross-XCD event, idle / under load (`results/microbench_summary.txt`) | 1.36 µs / 5.88 µs at 1.59 TB/s of streaming load |
+| Cross-XCD event, idle / under load (`results/microbench_summary.txt`) | 1.40 µs / 6.00 µs at 1.66 TB/s of streaming load |
 | Payload visibility under the kernel's fence placement (37 producers, one last-arriver flush) | 0 stale words in 151 M, same-XCD and cross-XCD |
 | Streamed read bandwidth / byte floor at it | 4.2 TB/s / 1.17 ms per token |
 
@@ -123,9 +124,9 @@ Two scripts exist so the design document cannot quietly be wrong:
 4.935 GB per token, 31.41 GB resident, a 0.93 ms floor at 5.3 TB/s. `taskgraph.py`
 builds the graph §3 describes and fails if any event has a producer count that
 would deadlock the kernel: 66 logical tasks per MoE layer (114 with split-KV),
-6 global events per layer, 1,791 logical tasks per token (3,087 with split-KV).
-A Chiplet-task reaches the device as one descriptor per worker, so those
-become 33,183 descriptors (2 MB) in 296 per-worker queues of 112–113 each.
+2 global events per MoE layer, 14,914 logical tasks per token with 16 KV
+chunks. A Chiplet-task reaches the device as one descriptor per worker, so
+those become 54,082 descriptors (3.4 MB) in 296 per-worker queues.
 `tests/test_queue_simulation.py` then *executes* those queues under the
 kernel's event protocol for three tokens in adversarial worker orders — the
 wiring between descriptor fields and wait targets is where the first version's
