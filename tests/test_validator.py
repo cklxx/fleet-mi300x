@@ -18,7 +18,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src" / "host"))
 
-from taskgraph import (Flags, TaskKind, XCDS, WORKERS_PER_XCD,  # noqa: E402
+from taskgraph import (Flags, Scope, TaskKind, XCDS, WORKERS_PER_XCD,  # noqa: E402
                        build, load_cfg, validate)
 
 CONFIG = ROOT / "reference" / "dsv2lite_config.json"
@@ -30,6 +30,7 @@ VARIANTS = {
     "top-k published": dict(kv_chunks=16, topk_published=True),
     "prefetch": dict(kv_chunks=16, prefetch=True),
     "split workers": dict(kv_chunks=16, split_workers=18, k_chunk=512),
+    "o_proj row split": dict(kv_chunks=16, oproj_row_split=True),
 }
 
 
@@ -43,6 +44,16 @@ def first(tasks, pred):
         if pred(t):
             return t
     raise AssertionError("no task matched")
+
+
+def xcd_local_merge(b) -> None:
+    """Release a row-split o_proj from an XCD-local merge. The graph stays
+    *locally* consistent -- each XCD waits on a counter only it signals --
+    so nothing else notices, while every o_proj reads 7/8 of o before the
+    other XCDs have written it. Silent wrong answers, not a hang."""
+    for e in {t.wait_event for t in b.tasks
+              if (t.flags & Flags.OPROJ_ROW_SPLIT) and t.kind == TaskKind.O_PROJ}:
+        b.events[e]["scope"] = int(Scope.XCD_LOCAL)
 
 
 def sabotage(label: str, g, mutate, want: str) -> bool:
@@ -67,6 +78,10 @@ def main() -> int:
         results.append(check(f"clean: {name}", not errs, errs[0][:64] if errs else ""))
 
     g = graphs["default"]
+
+    results.append(sabotage(
+        "row-split o_proj on an XCD-local merge is caught",
+        graphs["o_proj row split"], xcd_local_merge, "row-split o_proj"))
 
     results.append(sabotage(
         "event producer count off by one is caught", g,

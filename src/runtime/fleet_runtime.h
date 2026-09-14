@@ -127,6 +127,9 @@ enum TaskFlags : int16_t {
                               // the top-k and publishes it for the experts
     FLAG_TOPK_READ = 512,     // expert: read that published top-k (64 B) rather
                               // than repeating softmax + top-k per task
+    FLAG_OPROJ_ROW_SPLIT = 2048, // o_proj splits W_o's output rows over the 8 XCDs
+                              // against the full o[2048] (so the merge boundary is
+                              // global) instead of K-splitting into 8 fp32 partials
     FLAG_PUB_WAIT = 1024,     // the task waits on local_event *inside its body*, after
                               // the work that does not depend on the publication, and
                               // then reads a published buffer instead of recomputing.

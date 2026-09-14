@@ -52,6 +52,7 @@ VARIANTS = {
     "top-k published": ("taskgraph_d16_topkpub.bin", []),
     "q_c per task": ("taskgraph_d16_qcpt.bin", []),
     "idle-worker prefetch": ("taskgraph_d16_prefetch.bin", []),
+    "o_proj row split": ("taskgraph_d16_orows.bin", []),
     "K-chunk tiling": ("taskgraph_d16_k512.bin", []),
     "split workers + tiling": ("taskgraph_d16_split18_k512.bin", []),
 }

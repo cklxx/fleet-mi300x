@@ -104,6 +104,9 @@ class Flags(IntFlag):
                           # local_event publishes the top-k for the experts
     TOPK_READ = 512       # expert: read that published top-k instead of redoing
                           # softmax + top-k per task
+    OPROJ_ROW_SPLIT = 2048  # o_proj splits W_o's output rows over the 8 XCDs against
+                          # the full o[2048]; the merge boundary becomes global and
+                          # the router prologue has no partials to fold
     PUB_WAIT = 1024       # the task waits on local_event inside its body, after the
                           # work that does not depend on the publication, and then
                           # reads the published buffer instead of recomputing it
@@ -252,8 +255,16 @@ def build_attention(g: Graph, layer: int, e_qkv: list[int], cfg: dict) -> list[i
     heads, kv_chunks = cfg["heads"], cfg["kv_chunks"]
     heads_per_xcd = heads // XCDS
 
-    e_merge = [g.new_event(Scope.XCD_LOCAL, heads_per_xcd * kv_chunks,
-                           f"L{layer}.merge.x{x}") for x in range(XCDS)]
+    # --oproj-row-split: o_proj takes a slice of W_o's output ROWS, so every
+    # XCD needs all 16 heads' o and this boundary has to be one global event.
+    # That is the cost side of the A/B; the saving is the fold it removes.
+    row_split = cfg.get("oproj_row_split", False)
+    if row_split:
+        e_merge = [g.new_event(Scope.GLOBAL, heads * kv_chunks,
+                               f"L{layer}.merge")] * XCDS
+    else:
+        e_merge = [g.new_event(Scope.XCD_LOCAL, heads_per_xcd * kv_chunks,
+                               f"L{layer}.merge.x{x}") for x in range(XCDS)]
     # q_c publication (--qc-published): every KV chunk of a head used to
     # stream all 131 KB of W_UK to build the same q_c. Publishers run on the
     # workers that would otherwise idle through this phase (32 of 37 take an
@@ -287,7 +298,8 @@ def build_attention(g: Graph, layer: int, e_qkv: list[int], cfg: dict) -> list[i
         xcd = h // heads_per_xcd
         for chunk in range(kv_chunks):
             g.cu_task(Task(TaskKind.MERGE_UV, layer, xcd, e_attn[h], e_merge[xcd],
-                           Scope.XCD_LOCAL, head=h, kv_chunk=chunk, n_split=kv_chunks))
+                           Scope.GLOBAL if row_split else Scope.XCD_LOCAL,
+                           head=h, kv_chunk=chunk, n_split=kv_chunks))
     return e_merge
 
 
@@ -320,16 +332,27 @@ def build_prefetch(g: Graph, layer: int, e_qkv: list[int]) -> None:
         assert first == (xcd + 1) * per_xcd
 
 
-def build_o_proj(g: Graph, layer: int, e_merge: list[int]) -> int:
-    """o_proj K-split (§12): XCD k multiplies its own heads' 256 columns of
-    W_o against its o slice — the same 1 MB per XCD as the row split, but
-    waiting on an XCD-local event instead of the global merge. The 8 fp32
-    partials are folded by every router worker in its prologue, so the
-    layer keeps one global event here instead of two."""
+def build_o_proj(g: Graph, layer: int, e_merge: list[int],
+                 row_split: bool = False) -> int:
+    """o_proj, two ways, both reading 1 MB of W_o per XCD.
+
+    K-split (default, §12): XCD k multiplies its own heads' 256 columns of
+    W_o against its o slice, so it waits on the XCD-LOCAL merge and the layer
+    keeps ONE global event. It pays for that with 8 fp32 partials that every
+    router worker folds in its prologue.
+
+    Row-split (--oproj-row-split): XCD k takes 256 of W_o's 2048 output rows
+    against the full o[2048] and writes x through EPI_RESIDUAL, so there are
+    no partials and the router prologue is a plain stage. It pays with a
+    GLOBAL merge boundary (two global events per layer) and a K of 2048
+    instead of 256, which drops o_proj out of the half-wave GEMV path.
+
+    Which side wins is a measurement, not an argument: see STATUS.md."""
     e_oproj = g.new_event(Scope.GLOBAL, chiplet_producers(), f"L{layer}.o_proj")
+    flags = Flags.OPROJ_ROW_SPLIT if row_split else Flags.NONE
     for xcd in range(XCDS):
         g.chiplet_task(Task(TaskKind.O_PROJ, layer, xcd, e_merge[xcd], e_oproj,
-                            Scope.GLOBAL), [xcd])
+                            Scope.GLOBAL, flags=flags), [xcd])
     return e_oproj
 
 
@@ -342,7 +365,7 @@ def build_moe_layer(g: Graph, layer: int, prev_event: int | None,
     e_merge = build_attention(g, layer, e_qkv, cfg)
     if cfg.get("prefetch"):
         build_prefetch(g, layer, e_qkv)
-    e_oproj = build_o_proj(g, layer, e_merge)
+    e_oproj = build_o_proj(g, layer, e_merge, cfg.get("oproj_row_split", False))
 
     # post-attention norm + router, once per XCD as a Chiplet-task: every
     # worker norms x (8 KB, redundant) and computes ~2 router rows into this
@@ -358,9 +381,12 @@ def build_moe_layer(g: Graph, layer: int, prev_event: int | None,
         e = g.new_event(Scope.XCD_LOCAL, WORKERS_PER_XCD, f"L{layer}.norm.x{xcd}")
         pub = g.new_event(Scope.XCD_LOCAL, WORKERS_PER_XCD,
                           f"L{layer}.topk.x{xcd}") if published else None
+        nr_flags = Flags.TOPK_PUBLISH if published else Flags.NONE
+        if cfg.get("oproj_row_split", False):
+            nr_flags |= Flags.OPROJ_ROW_SPLIT    # prologue stages instead of folding
         g.chiplet_task(Task(TaskKind.NORM_ROUTER, layer, xcd, e_oproj, e, Scope.XCD_LOCAL,
                             local_event=pub, n_split=WORKERS_PER_XCD,
-                            flags=Flags.TOPK_PUBLISH if published else Flags.NONE), [xcd])
+                            flags=nr_flags), [xcd])
         e_router.append(e)
 
     # experts: 8 balanced units = top_k routed + shared split in two.
@@ -417,13 +443,16 @@ def build_dense_layer(g: Graph, layer: int, prev_event: int | None,
     e_merge = build_attention(g, layer, e_qkv, cfg)
     if cfg.get("prefetch"):
         build_prefetch(g, layer, e_qkv)
-    e_oproj = build_o_proj(g, layer, e_merge)
+    e_oproj = build_o_proj(g, layer, e_merge, cfg.get("oproj_row_split", False))
 
     # the dense layer has no experts, so nothing to publish
     e_norm = []
     for xcd in range(XCDS):
         e = g.new_event(Scope.XCD_LOCAL, WORKERS_PER_XCD, f"L{layer}.norm.x{xcd}")
-        g.chiplet_task(Task(TaskKind.NORM_ROUTER, layer, xcd, e_oproj, e, Scope.XCD_LOCAL), [xcd])
+        g.chiplet_task(Task(TaskKind.NORM_ROUTER, layer, xcd, e_oproj, e, Scope.XCD_LOCAL,
+                            flags=(Flags.OPROJ_ROW_SPLIT
+                                   if cfg.get("oproj_row_split", False)
+                                   else Flags.NONE)), [xcd])
         e_norm.append(e)
 
     e_gate_up = g.new_event(Scope.GLOBAL, chiplet_producers(),
@@ -545,6 +574,19 @@ def validate(g: Graph) -> list[str]:
                     errors.append(f"task {t.index}: PUB_WAIT on event {ev['id']} with "
                                   f"{ev['producers']} producers, scope {ev['scope']}; "
                                   f"expected {QABS_SLICES} XCD-local")
+    # Row-split o_proj multiplies against the WHOLE o[2048], so the merge that
+    # releases it must be GLOBAL. Left XCD-local the graph still looks locally
+    # consistent -- each XCD waits on a counter only it signals -- while every
+    # o_proj reads 7/8 of its input before the other XCDs have written it.
+    for t in g.tasks:
+        if (t.flags & Flags.OPROJ_ROW_SPLIT) and t.kind == TaskKind.O_PROJ:
+            if t.wait_event is None:
+                errors.append(f"task {t.index}: row-split o_proj has no wait event")
+            elif g.events[t.wait_event]["scope"] != int(Scope.GLOBAL):
+                errors.append(f"task {t.index}: row-split o_proj waits on event "
+                              f"{t.wait_event} (scope "
+                              f"{g.events[t.wait_event]['scope']}); needs GLOBAL, "
+                              f"or it reads o before the other XCDs wrote it")
     for t in g.tasks:
         if t.flags & Flags.TOPK_PUBLISH:
             if t.local_event is None or t.n_split != WORKERS_PER_XCD:
@@ -734,7 +776,7 @@ def report(g: Graph, cfg: dict) -> None:
 def load_cfg(config: Path, kv_chunks: int, prefetch: bool = False,
              k_chunk: int = EXPERT_K_CHUNK, kva_shared: bool = True,
              split_workers: int = 0, topk_published: bool = False,
-             qc_published: bool = True) -> dict:
+             qc_published: bool = True, oproj_row_split: bool = False) -> dict:
     c = json.loads(config.read_text())
     return {
         "prefetch": prefetch,
@@ -743,6 +785,7 @@ def load_cfg(config: Path, kv_chunks: int, prefetch: bool = False,
         "split_workers": split_workers,
         "topk_published": topk_published,
         "qc_published": qc_published,
+        "oproj_row_split": oproj_row_split,
         "layers": c["num_hidden_layers"],
         "heads": c["num_attention_heads"],
         "top_k": c["num_experts_per_tok"],
@@ -777,13 +820,19 @@ def main() -> None:
                     help="the router's last arriver publishes the top-k and the expert tasks "
                          "read it (64 B); measured 0.4%% slower than the default, where every "
                          "expert task redoes softmax + top-k in parallel (STATUS.md)")
+    ap.add_argument("--oproj-row-split", action="store_true",
+                    help="o_proj splits W_o's 2048 output rows over the 8 XCDs against the "
+                         "full o[2048] and writes x directly, removing the 8 fp32 partials "
+                         "the router prologue folds; costs a GLOBAL merge boundary (two "
+                         "global events per layer) and K 256 -> 2048")
     ap.add_argument("--split-workers", type=int, default=0,
                     help="G: expert gate_up on workers [0,G) and down on [G,37) per XCD, "
                          "so --k-chunk tiling can overlap them")
     a = ap.parse_args()
 
     cfg = load_cfg(a.config, a.kv_chunks, a.prefetch, a.k_chunk, not a.kva_replicated,
-                   a.split_workers, a.topk_published, not a.qc_per_task)
+                   a.split_workers, a.topk_published, not a.qc_per_task,
+                   a.oproj_row_split)
     g = build(cfg)
 
     if a.emit:

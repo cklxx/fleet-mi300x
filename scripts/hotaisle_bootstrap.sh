@@ -59,6 +59,7 @@ python3 src/host/taskgraph.py --kv-chunks 16 --prefetch --emit build/taskgraph_d
 python3 src/host/taskgraph.py --kv-chunks 16 --kva-replicated --emit build/taskgraph_d16_kvarep.bin | tail -1
 python3 src/host/taskgraph.py --kv-chunks 16 --topk-published --emit build/taskgraph_d16_topkpub.bin | tail -1
 python3 src/host/taskgraph.py --kv-chunks 16 --qc-per-task --emit build/taskgraph_d16_qcpt.bin | tail -1
+python3 src/host/taskgraph.py --kv-chunks 16 --oproj-row-split --emit build/taskgraph_d16_orows.bin | tail -1
 python3 src/host/taskgraph.py --kv-chunks 16 --split-workers 18 --k-chunk 512 --emit build/taskgraph_d16_split18_k512.bin | tail -1
 python3 src/host/taskgraph.py --kv-chunks 16 --split-workers 18 --emit build/taskgraph_d16_split18.bin | tail -1
 python3 src/host/taskgraph.py --kv-chunks 16 --split-workers 22 --k-chunk 512 --emit build/taskgraph_d16_split22_k512.bin | tail -1
@@ -105,6 +106,16 @@ run_variant nt_d16_fenced    $BIN                 build/taskgraph_d16.bin
 run_variant nt_d16_coherent  $BIN                 build/taskgraph_d16_kvarep.bin   --coherent-acts
 run_variant nt_d16_fenced_b  $BIN                 build/taskgraph_d16.bin
 run_variant nt_d16_coherent_b $BIN                build/taskgraph_d16_kvarep.bin   --coherent-acts
+
+# o_proj K-split (default) vs row-split, three alternating pairs. The effect
+# is ~1% at most and the within-session spread is ~1%, so a single pair cannot
+# decide it; alternate and compare medians (the q_c A/B was decided this way).
+run_variant orows_ksplit_1  $BIN                build/taskgraph_d16.bin
+run_variant orows_rowsplit_1 $BIN               build/taskgraph_d16_orows.bin
+run_variant orows_ksplit_2  $BIN                build/taskgraph_d16.bin
+run_variant orows_rowsplit_2 $BIN               build/taskgraph_d16_orows.bin
+run_variant orows_ksplit_3  $BIN                build/taskgraph_d16.bin
+run_variant orows_rowsplit_3 $BIN               build/taskgraph_d16_orows.bin
 run_variant plain_d16        ./build/fleet_decode build/taskgraph_d16.bin
 run_variant nt_d8            $BIN                 build/taskgraph_d8.bin
 run_variant nt_d16_kchunk512 $BIN                 build/taskgraph_d16_k512.bin

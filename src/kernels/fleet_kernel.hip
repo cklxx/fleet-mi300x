@@ -248,11 +248,19 @@ __device__ inline PrefetchPlan prefetch_plan(const TaskDescriptor& t, const Mode
             p.row_bytes = (int64_t)d.kv_lora * 2; p.stride = p.row_bytes; p.rows = rows;
             break;
         }
-        case TASK_O_PROJ: {      // K-split: 512 B of each of this worker's rows
-            const int kc = d.heads * d.v_head / kNumXCDs;
-            p.base = reinterpret_cast<const char*>(w.layer_o_proj[L])
-                     + (int64_t)worker * d.heads * d.v_head * 2 + (int64_t)xcd * kc * 2;
-            p.row_bytes = (int64_t)kc * 2; p.stride = (int64_t)nw * d.heads * d.v_head * 2; p.rows = 64;
+        case TASK_O_PROJ: {
+            const int64_t hvb = (int64_t)d.heads * d.v_head * 2;
+            if (t.flags & FLAG_OPROJ_ROW_SPLIT) {   // 4 KB of each of ~7 whole rows
+                const RowSlice sl = xcd_rows(d.hidden, xcd, kNumXCDs);
+                p.base = reinterpret_cast<const char*>(w.layer_o_proj[L])
+                         + (int64_t)(sl.begin + worker) * hvb;
+                p.row_bytes = hvb; p.stride = (int64_t)nw * hvb; p.rows = 7;
+            } else {                                // K-split: 512 B of 64 rows
+                const int kc = d.heads * d.v_head / kNumXCDs;
+                p.base = reinterpret_cast<const char*>(w.layer_o_proj[L])
+                         + (int64_t)worker * hvb + (int64_t)xcd * kc * 2;
+                p.row_bytes = (int64_t)kc * 2; p.stride = (int64_t)nw * hvb; p.rows = 64;
+            }
             break;
         }
         case TASK_NORM_ROUTER: {
@@ -349,8 +357,20 @@ __device__ void task_norm_router(const ModelDims& d, const Weights& w,
                                  Activations& act, Scratch& s, int layer,
                                  int xcd, int worker, bool moe, const TokenCtx& tc, bool coh,
                                  const TaskDescriptor& t, const RuntimeState& rt) {
-    // x[1] = bf16(x[0] + bf16(o_proj)) from the 8 K-split partials
-    stage_residual_f32(d, act.x[0], act.oproj_partial, act.x[1], s.vec, xcd, worker, coh);
+    // x[1] = bf16(x[0] + bf16(o_proj)). K-split leaves 8 fp32 partials for
+    // this prologue to fold; row-split already wrote x[1] through o_proj's own
+    // EPI_RESIDUAL epilogue, so there is nothing to fold and we only stage.
+    if (t.flags & FLAG_OPROJ_ROW_SPLIT) {
+        if (coh) {
+            for (int i = threadIdx.x; i < d.hidden; i += kBlockThreads)
+                s.vec[i] = ld_coh(act.x[1] + i, true);
+            __syncthreads();
+        } else {
+            stage_vector(act.x[1], s.vec, d.hidden);
+        }
+    } else {
+        stage_residual_f32(d, act.x[0], act.oproj_partial, act.x[1], s.vec, xcd, worker, coh);
+    }
     FLEET_STAMP_STAGE();
     rms_norm_lds(d, w.layer_norm_post[layer], s.vec, s.smem);
     FLEET_STAMP();
@@ -677,12 +697,23 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
         // o slice, all 2048 output rows over the 37 workers, fp32 partial into
         // oproj_partial[xcd]; the router prologue folds the 8 partials.
         case TASK_O_PROJ: {
-            const int kc = d.heads * d.v_head / kNumXCDs;
-            stage_vector(act.o + (int64_t)xcd * kc, s.vec, kc);
-            FLEET_STAMP();
-            gemv_rows(w.layer_o_proj[L] + (int64_t)xcd * kc, d.heads * d.v_head, s.vec,
-                      act.oproj_partial + (int64_t)xcd * d.hidden, nullptr, EPI_NONE, 1.f,
-                      d.hidden, kc, /*xcd=*/0, /*n_xcds=*/1, worker, nw, coh);
+            if (t.flags & FLAG_OPROJ_ROW_SPLIT) {
+                // Row-split: this XCD's 256 of the 2048 output rows against the
+                // whole o[2048] (the merge that released us was global), and the
+                // residual add rides the epilogue, so nothing is left to fold.
+                const int hv = d.heads * d.v_head;
+                stage_vector(act.o, s.vec, hv);
+                FLEET_STAMP();
+                gemv_rows(w.layer_o_proj[L], hv, s.vec, act.x[1], act.x[0],
+                          EPI_RESIDUAL, 1.f, d.hidden, hv, xcd, kNumXCDs, worker, nw, coh);
+            } else {
+                const int kc = d.heads * d.v_head / kNumXCDs;
+                stage_vector(act.o + (int64_t)xcd * kc, s.vec, kc);
+                FLEET_STAMP();
+                gemv_rows(w.layer_o_proj[L] + (int64_t)xcd * kc, d.heads * d.v_head, s.vec,
+                          act.oproj_partial + (int64_t)xcd * d.hidden, nullptr, EPI_NONE, 1.f,
+                          d.hidden, kc, /*xcd=*/0, /*n_xcds=*/1, worker, nw, coh);
+            }
             break;
         }
 

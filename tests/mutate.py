@@ -55,6 +55,8 @@ MUTATIONS = [
     ("expert_addressing", [(EXPERT, "(int64_t)half * 2 * rows * hidden",
                             "(int64_t)half * rows * hidden")],
      "reintroduce the shared-half offset bug", "caught"),
+    ("validator", [(GRAPH, "if (t.flags & Flags.OPROJ_ROW_SPLIT) and t.kind == TaskKind.O_PROJ:", "if False:")],
+     "delete the row-split o_proj global-merge check", "caught"),
     ("validator", [(GRAPH, PER_TASK, "if False:")],
      "delete the per-task XCD-locality check", "redundant"),
     ("validator", [(GRAPH, PER_EVENT, "if False:")],

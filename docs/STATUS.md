@@ -297,7 +297,7 @@ The plan was eight structural steps to ~2.5 ms. Measured one by one:
 | 2b. kv_a once instead of 8 copies | kept (v0.15): −0.6%, −0.51 GB/token |
 | 2c. Routing once per worker instead of twice | kept (v0.15): −2.2% |
 | 3. Tile-granular gate_up→down | slower on one worker group (nothing overlaps) and slower again on two (`--split-workers`: 18 CUs cannot pull an XCD's share of HBM). The machinery stays behind `--k-chunk` / `--split-workers` |
-| 4. o_proj K-split per XCD | kept: merge→o_proj is XCD-local, 2 global events per layer; needed the half-wave GEMV to pay off |
+| 4. o_proj K-split per XCD | kept: merge->o_proj is XCD-local, 2 global events per layer; needed the half-wave GEMV to pay off. **Never A/B'd on its own**: it shipped in v0.11 bundled with the one-writer fold and the tiling, and that bundle measured slower as a whole. `--oproj-row-split` now builds the row-split alternative so the pair can be measured; it is prepared, not decided |
 | 5. Activations without L2 fences | MTYPE-UC allocation does not deliver it here (bench d''); agent-scope atomic payload accesses do (bench d'''): `--coherent-acts`, see below |
 | 6. Non-temporal weight streams | kept, −4% |
 | 7. Idle-worker prefetch | no gain; kept as an option |
@@ -532,3 +532,14 @@ while deleting both is caught. That is recorded rather than papered over.
 5. Understand why `--coherent-acts` needs the producer writeback; the
    protocol's worst case (3.0 ms in the body-less smoke run) says the
    fences are not free even though dropping the acquires bought nothing.
+6. **o_proj K-split vs row-split, prepared and unmeasured.** Row-split
+   removes the 8 fp32 partials the router prologue folds, and pays a
+   GLOBAL merge boundary (two global events per layer) plus K 256 ->
+   2048, which drops o_proj out of the half-wave GEMV path. Estimated
+   ~0.8% after the halving rule, against a ~1% within-session spread,
+   so it needs alternating pairs, not one run. The bootstrap emits
+   `build/taskgraph_d16_orows.bin` and runs three alternating pairs
+   (`orows_ksplit_*` / `orows_rowsplit_*`). Note row-split changes the
+   fp32 summation order before the single bf16 round, so the 32/32
+   token gate is part of the result, not a formality -- though it is
+   structurally *closer* to HF, which does one full dot product.

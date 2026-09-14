@@ -39,6 +39,7 @@ GRAPH_VARIANTS = [
     ("top-k published", ["--kv-chunks", "16", "--topk-published"]),
     ("q_c per task", ["--kv-chunks", "16", "--qc-per-task"]),
     ("idle-worker prefetch", ["--kv-chunks", "16", "--prefetch"]),
+    ("o_proj row split", ["--kv-chunks", "16", "--oproj-row-split"]),
     ("split workers + tiling", ["--kv-chunks", "16", "--split-workers", "18",
                                 "--k-chunk", "512"]),
 ]
