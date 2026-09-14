@@ -23,6 +23,8 @@ tokens. No tensor parallelism, no continuous batching, no speculative decoding.
 src/host/       model_analysis.py   per-token HBM byte accounting from config.json
                 taskgraph.py        builds/validates the task DAG, fans Chiplet-tasks
                                     out to per-worker descriptors, emits them
+                phase_rate.py       per-phase bytes vs trace time, ranked; the
+                                    byte model is reconciled with FETCH_SIZE (§10)
                 reference_decode.py NumPy absorbed-MLA decode (the spec for each task)
                 reference_run.py    HF golden states + 32 greedy tokens + the cache
                                     and token files the launcher decodes against
@@ -58,6 +60,15 @@ python3 -m venv .venv && .venv/bin/pip install numpy torch transformers
 .venv/bin/python tests/test_queue_simulation.py      # the event protocol, 3 tokens
 .venv/bin/python tests/test_row_partition.py         # every GEMV row owned exactly once
 .venv/bin/python tests/test_expert_addressing.py     # packed experts, shared halves, 8-unit phase
+.venv/bin/python tests/test_phase_rate.py            # trace/graph parsers, byte model terms
+python3 src/host/phase_rate.py --summary results/trace_v16_default_summary.txt \
+        --timeline results/timeline_v16_default_L5.txt \
+        --measured-bytes results/prof_fetch_v1.csv --tokens 4 --kva-shared \
+        --microbench results/microbench.json         # this phase table, from results/
+# results/ holds two FETCH_SIZE profiles from two builds. The tool prints the
+# dispatch footprint of whichever you hand it (v0.16 is 128+216 vgpr/agpr =
+# 344 against isa_summary.txt's 342); pick the one that matches the build under
+# test, or the reconciliation moves by 8 points.
 bash scripts/hip_syntax_check.sh                     # clang front end, HIP mode
 ```
 
