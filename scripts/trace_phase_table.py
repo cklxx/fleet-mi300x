@@ -60,31 +60,46 @@ def main() -> int:
     step_us = (max(s[2] for _, s in rows) - t0) * US
 
     agg = {}
+    layers = sorted({t["layer"] for t, _ in rows})
+    per_layer = {}
     for t, s in rows:
-        k = agg.setdefault(t["kind"], dict(n=0, busy=0.0, stage=0.0, prologue=0.0, last=0))
+        k = agg.setdefault(t["kind"], dict(n=0, busy=0.0, stage=0.0, prologue=0.0, last=0, ld=0))
         k["n"] += 1
         k["busy"] += (s[2] - s[1]) * US
         k["prologue"] += ((s[3] >> 32) & 0xFFFFFF) * US
         k["stage"] += ((s[3] >> 8) & 0xFFFFFF) * US
         k["last"] = max(k["last"], s[2])
+        k["ld"] = max(k["ld"], s[2] - s[1])
+        pl = per_layer.setdefault((t["layer"], t["kind"]), [10**18, 0])
+        pl[0] = min(pl[0], s[1])
+        pl[1] = max(pl[1], s[2])
+
+    # per-kind span inside one layer, averaged over the layers that run it
+    spans = {}
+    for (layer, kind), (fr, ld) in per_layer.items():
+        spans.setdefault(kind, []).append((ld - fr) * US)
 
     wide = max(len(TaskKind(k).name) for k in agg) if agg else 10
-    print(f"step: {len(rows)} descriptors, {len({t['layer'] for t, _ in rows})} layers, "
-          f"span {step_us:.1f} us")
-    print(f"  {'phase'.ljust(wide)} {'n':>6} {'busy_us':>10} {'stage_us':>10} {'prologue_us':>11} {'finishes_at':>11}")
+    print(f"step: {len(rows)} descriptors, {len(layers)} layers, span {step_us:.1f} us on the device clock")
+    print()
+    print(f"  {'phase'.ljust(wide)} {'n':>6} {'worker_us':>10} {'per_task':>9} "
+          f"{'in_layer_us':>11} {'stage_us':>9} {'prologue_us':>11} {'finishes_at':>11}")
     order = sorted(agg.items(), key=lambda kv: kv[1]["last"])
     for kind, k in order:
+        avg_layer = sum(spans[kind]) / len(spans[kind])
         print(f"  {TaskKind(kind).name.ljust(wide)} {k['n']:>6} {k['busy']:>10.1f} "
-              f"{k['stage']:>10.1f} {k['prologue']:>11.1f} {(k['last'] - t0) * US:>10.1f}")
+              f"{k['busy'] / k['n']:>9.1f} {avg_layer:>11.1f} {k['stage']:>9.1f} "
+              f"{k['prologue']:>11.1f} {(k['last'] - t0) * US:>10.1f}")
 
-    busy = sum(k["busy"] for k in agg.values())
-    stage = sum(k["stage"] for k in agg.values())
-    pro = sum(k["prologue"] for k in agg.values())
     print()
-    print(f"  {'body total':<{wide}} {len(rows):>6} {busy:>10.1f} {stage:>10.1f} {pro:>11.1f}")
-    print(f"  {'step span':<{wide}} {'':>6} {step_us:>10.1f}")
-    print(f"  {'non-body time':<{wide}} {'':>6} {step_us - busy:>10.1f}   "
-          f"(step span - body total; waits, publication, gaps)")
+    print("  worker_us   = sum of task durations; counts every worker, so it is occupancy, not wall time")
+    print("  in_layer_us = mean span of this phase inside one layer (first ready -> last done)")
+    print("  finishes_at = when the phase's last task signalled, on the step clock")
+    print()
+    print(f"  step span on the device clock: {step_us:.1f} us")
+    print(f"  busiest single task per phase: "
+          + ", ".join(f"{TaskKind(k).name}={k['ld'] * US:.0f}us" for k, k in
+                      sorted(agg.items(), key=lambda kv: -kv[1]["ld"])[:5]))
     return 0
 
 
