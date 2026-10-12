@@ -19,7 +19,7 @@ Compared with the v0.9 graph (six global events) the differences are:
   * the router runs once per XCD as a Chiplet-task (256 KB of weights,
     replicated 8x, spread over 37 CUs), so the experts wait on an XCD-local
     event and pick the top-k themselves;
-  * there is no REDUCE task: every consumer folds the 8 partials it needs in
+  * by default there is no REDUCE task: every consumer folds the 8 partials it needs in
     its prologue (FOLD_PARTIALS on the next q/kv_a and lm_head; the router
     always folds the o_proj partials) and worker (0,0) publishes the result
     to the other x buffer;
@@ -27,6 +27,10 @@ Compared with the v0.9 graph (six global events) the differences are:
     so merge → o_proj is XCD-local;
   * gate_up → down can be tiled by K-chunk of h (--k-chunk); off by default,
     measured no gain because down runs on the same workers as gate_up.
+
+Experimental --local-fold and --local-kva insert explicit per-XCD assembly
+tasks after baseline worker assignment. Both default off; existing graph bytes
+and all q_c publisher / attention worker assignments stay unchanged.
 
 Two granularities are reported. A *logical task* is a node of the graph above.
 A *descriptor* is what a worker dequeues: a CU-task is one descriptor, a
@@ -73,7 +77,7 @@ class TaskKind(IntEnum):
     NORM_ROUTER = 4    # RMSNorm + router logits, Chiplet-task per XCD
     EXPERT_GATE_UP = 5  # gate_up + SiLU⊙up, Chiplet-task per XCD
     EXPERT_DOWN = 6    # down x routing weight, Chiplet-task per XCD
-    REDUCE = 7         # (retired: folded into the next QKV / lm_head prologue)
+    REDUCE = 7         # opt-in local assembly; head 0/1 = fp32/bf16 fold, 2 = kv_a
     DENSE_GATE_UP = 8  # layer 0 only
     DENSE_DOWN = 9     # layer 0 only
     EMBED = 10
@@ -107,6 +111,8 @@ class Flags(IntFlag):
     OPROJ_ROW_SPLIT = 2048  # o_proj splits W_o's output rows over the 8 XCDs against
                           # the full o[2048]; the merge boundary becomes global and
                           # the router prologue has no partials to fold
+    LOCAL_FOLD = 4096     # explicit per-XCD residual assembly, then local reader staging
+    LOCAL_KVA = 8192      # explicit per-XCD gather of the single projected kv_a
     PUB_WAIT = 1024       # the task waits on local_event inside its body, after the
                           # work that does not depend on the publication, and then
                           # reads the published buffer instead of recomputing it
@@ -129,6 +135,7 @@ IMPLEMENTATION: dict[str, str] = {
     "ARGMAX": "fleet-verified",
     "PREFETCH": "fleet-experimental",
     "Q_ABSORB": "fleet-experimental",
+    "REDUCE": "fleet-unverified",
 }
 
 
@@ -574,6 +581,51 @@ def validate(g: Graph) -> list[str]:
                     errors.append(f"task {t.index}: PUB_WAIT on event {ev['id']} with "
                                   f"{ev['producers']} producers, scope {ev['scope']}; "
                                   f"expected {QABS_SLICES} XCD-local")
+    # A count-one local event is a payload publication, not permission to skip
+    # the original global acquire. Validate both sides and the buffer selector.
+    publishers = {t.signal_event: t for t in g.tasks if t.kind == TaskKind.REDUCE}
+    source_kinds = {}
+    attention_workers = {}
+    for t in g.tasks:
+        if t.kind in (TaskKind.Q_ABSORB, TaskKind.ATTENTION):
+            attention_workers.setdefault((t.layer, t.xcd), set()).add(t.worker)
+        if t.signal_event is not None:
+            source_kinds.setdefault(t.signal_event, set()).add(t.kind)
+    for t in g.tasks:
+        local_flags = t.flags & (Flags.LOCAL_FOLD | Flags.LOCAL_KVA)
+        if t.kind == TaskKind.REDUCE:
+            want_flag = Flags.LOCAL_KVA if t.head == 2 else Flags.LOCAL_FOLD
+            want_source = {0: TaskKind.O_PROJ, 1: TaskKind.EXPERT_DOWN,
+                           2: TaskKind.QKV_FUSED}.get(t.head)
+            if (want_source is None or local_flags != want_flag
+                    or t.wait_event is None or t.signal_event is None):
+                errors.append(f"task {t.index}: invalid local assembly descriptor")
+                continue
+            incoming, outgoing = g.events[t.wait_event], g.events[t.signal_event]
+            if (incoming["scope"] != int(Scope.GLOBAL)
+                    or source_kinds.get(t.wait_event) != {want_source}):
+                errors.append(f"task {t.index}: local assembly needs its original GLOBAL payload")
+            if (outgoing["scope"] != int(Scope.XCD_LOCAL) or outgoing["producers"] != 1
+                    or t.signal_scope != Scope.XCD_LOCAL):
+                errors.append(f"task {t.index}: local assembly must publish one XCD-local arrival")
+            if t.head == 2 and t.worker in attention_workers.get((t.layer, t.xcd), set()):
+                errors.append(f"task {t.index}: local kv_a gather steals an attention/q_c worker")
+            continue
+        if not local_flags:
+            continue
+        variant = (0 if t.kind == TaskKind.NORM_ROUTER else
+                   1 if t.kind in (TaskKind.QKV_FUSED, TaskKind.LM_HEAD) else
+                   2 if t.kind == TaskKind.ATTENTION else -1)
+        flag = Flags.LOCAL_KVA if variant == 2 else Flags.LOCAL_FOLD
+        pub = publishers.get(t.wait_event)
+        if (variant < 0 or local_flags != flag or pub is None
+                or pub.head != variant or pub.layer != t.layer or pub.xcd != t.xcd
+                or t.wait_scope != Scope.XCD_LOCAL or t.wait_count != 1):
+            errors.append(f"task {t.index}: local reader lacks its matching XCD publication")
+        if variant == 1 and not t.flags & Flags.FOLD_PARTIALS:
+            errors.append(f"task {t.index}: local expert-fold reader lost FOLD_PARTIALS")
+        if variant == 2 and (not t.flags & Flags.KVA_SHARED or not t.flags & Flags.PUB_WAIT):
+            errors.append(f"task {t.index}: local kv_a reader lost shared projection/q_c publication")
     # Row-split o_proj multiplies against the WHOLE o[2048], so the merge that
     # releases it must be GLOBAL. Left XCD-local the graph still looks locally
     # consistent -- each XCD waits on a counter only it signals -- while every
@@ -697,9 +749,82 @@ def assign_workers(g: Graph) -> None:
         cursor[t.xcd] += 1
 
 
+def add_local_assembly(g: Graph, cfg: dict) -> None:
+    """Insert optional publishers AFTER baseline CU assignment.
+
+    Pinned assembly tasks must not advance the round-robin cursor: that would
+    displace q_c publishers onto attention workers and erase v0.18's overlap.
+    Existing event IDs and descriptor order are preserved. New count-one local
+    events publish distinct per-XCD buffers after the original global acquire.
+    Their storage can be reused only after all previous readers finish: global
+    qkv/o_proj/down boundaries already enforce that lifetime across layers.
+    """
+    local_fold, local_kva = cfg.get("local_fold", False), cfg.get("local_kva", False)
+    if not (local_fold or local_kva):
+        return
+    if local_fold and (cfg.get("oproj_row_split", False)
+                       or not cfg.get("kva_shared", False)):
+        raise ValueError("--local-fold requires shared kv_a and K-split o_proj")
+    if local_kva and (cfg["heads"] != 16 or cfg["kv_chunks"] != 16
+                      or not cfg.get("qc_published", True)
+                      or not cfg.get("kva_shared", False)):
+        raise ValueError("--local-kva requires 16 heads, --kv-chunks 16, "
+                         "q_c publication and shared kv_a")
+
+    # There is exactly one free worker per XCD: 37 - 32 attention - 4 q_c.
+    # Include the initial embed and all preceding CU tasks by inspecting the
+    # completed baseline assignment, rather than guessing its rotating cursor.
+    idle = {}
+    if local_kva:
+        busy = {}
+        for t in g.tasks:
+            if t.kind in (TaskKind.Q_ABSORB, TaskKind.ATTENTION):
+                busy.setdefault((t.layer, t.xcd), set()).add(t.worker)
+        for key, workers in busy.items():
+            free = set(range(WORKERS_PER_XCD)) - workers
+            if len(free) != 1:
+                raise ValueError("--local-kva needs exactly one idle attention worker "
+                                 f"per XCD; layer/XCD {key} has {len(free)}")
+            idle[key] = free.pop()
+
+    originals, g.tasks = g.tasks, []
+    publications = {}
+    for t in originals:
+        variant = None
+        if local_fold:
+            if t.kind == TaskKind.NORM_ROUTER:
+                variant = 0
+            elif t.kind in (TaskKind.QKV_FUSED, TaskKind.LM_HEAD) \
+                    and t.flags & Flags.FOLD_PARTIALS:
+                variant = 1
+        if local_kva and t.kind == TaskKind.ATTENTION:
+            variant = 2
+        if variant is not None:
+            key = (t.layer, variant)
+            flag = Flags.LOCAL_KVA if variant == 2 else Flags.LOCAL_FOLD
+            if key not in publications:
+                assert t.wait_event is not None
+                assert g.events[t.wait_event]["scope"] == Scope.GLOBAL
+                events = []
+                for xcd in range(XCDS):
+                    label = (f"L{t.layer}.local_kva.x{xcd}" if variant == 2 else
+                             f"L{t.layer}.local_fold{variant}.x{xcd}")
+                    event = g.new_event(Scope.XCD_LOCAL, 1, label)
+                    worker = idle[(t.layer, xcd)] if variant == 2 else 0
+                    g.cu_task(Task(TaskKind.REDUCE, t.layer, xcd, t.wait_event,
+                                   event, Scope.XCD_LOCAL, head=variant,
+                                   worker=worker, flags=flag))
+                    events.append(event)
+                publications[key] = events
+            t.wait_event = publications[key][t.xcd]
+            t.flags |= flag
+        g.add(t)
+
+
 def build(cfg: dict) -> Graph:
     g = build_graph(cfg)
     assign_workers(g)
+    add_local_assembly(g, cfg)
     finalize(g)
     return g
 
@@ -776,7 +901,8 @@ def report(g: Graph, cfg: dict) -> None:
 def load_cfg(config: Path, kv_chunks: int, prefetch: bool = False,
              k_chunk: int = EXPERT_K_CHUNK, kva_shared: bool = True,
              split_workers: int = 0, topk_published: bool = False,
-             qc_published: bool = True, oproj_row_split: bool = False) -> dict:
+             qc_published: bool = True, oproj_row_split: bool = False,
+             local_fold: bool = False, local_kva: bool = False) -> dict:
     c = json.loads(config.read_text())
     return {
         "prefetch": prefetch,
@@ -786,6 +912,8 @@ def load_cfg(config: Path, kv_chunks: int, prefetch: bool = False,
         "topk_published": topk_published,
         "qc_published": qc_published,
         "oproj_row_split": oproj_row_split,
+        "local_fold": local_fold,
+        "local_kva": local_kva,
         "layers": c["num_hidden_layers"],
         "heads": c["num_attention_heads"],
         "top_k": c["num_experts_per_tok"],
@@ -825,6 +953,12 @@ def main() -> None:
                          "full o[2048] and writes x directly, removing the 8 fp32 partials "
                          "the router prologue folds; costs a GLOBAL merge boundary (two "
                          "global events per layer) and K 256 -> 2048")
+    ap.add_argument("--local-fold", action="store_true",
+                    help="experimental: assemble residual folds once per XCD and fan "
+                         "out locally (default off; shared kv_a and K-split o_proj only)")
+    ap.add_argument("--local-kva", action="store_true",
+                    help="experimental: gather the single projected kv_a into each "
+                         "XCD's own buffer (default off; 16 KV chunks and q_c publication)")
     ap.add_argument("--split-workers", type=int, default=0,
                     help="G: expert gate_up on workers [0,G) and down on [G,37) per XCD, "
                          "so --k-chunk tiling can overlap them")
@@ -832,8 +966,11 @@ def main() -> None:
 
     cfg = load_cfg(a.config, a.kv_chunks, a.prefetch, a.k_chunk, not a.kva_replicated,
                    a.split_workers, a.topk_published, not a.qc_per_task,
-                   a.oproj_row_split)
-    g = build(cfg)
+                   a.oproj_row_split, a.local_fold, a.local_kva)
+    try:
+        g = build(cfg)
+    except ValueError as exc:
+        ap.error(str(exc))
 
     if a.emit:
         emit(g, a.emit)

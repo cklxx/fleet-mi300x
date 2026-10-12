@@ -48,6 +48,9 @@
 
 #include "../runtime/fleet_runtime.h"
 #include "../runtime/fleet_types.h"
+#include "../kernels/local_assembly.h"
+// Preserve v0.18 HIP_CHECK __LINE__ literals in the flags-off object.
+#line 51
 
 #define HIP_CHECK(expr)                                                        \
     do {                                                                       \
@@ -296,6 +299,12 @@ static void describe_abort(uint32_t code, const std::map<int, std::string>& labe
     } else if (kind == kAbortBarrierTimeout) {
         std::fprintf(stderr, "abort: the grid barrier timed out — fewer than %d "
                      "workgroups became resident\n", kGrid);
+#if FLEET_LOCAL_FOLD || FLEET_LOCAL_KVA
+    } else if (kind == kAbortLocalPayload) {
+        std::fprintf(stderr, "abort: local assembly payload mismatch at descriptor %u\n",
+                     code & 0x0fffffffu);
+#endif
+#line 299
     } else {
         std::fprintf(stderr, "abort: unknown code 0x%08x\n", code);
     }
@@ -400,6 +409,29 @@ int main(int argc, char** argv) {
 
     // ---- graph
     auto tasks = load_descriptors(graph_path);
+#if FLEET_LOCAL_FOLD || FLEET_LOCAL_KVA
+    bool local_fold = false, local_kva = false;
+    for (const auto& t : tasks) {
+        local_fold |= (t.flags & kLocalFoldFlag) != 0;
+        local_kva |= (t.flags & kLocalKvaFlag) != 0;
+        if ((t.flags & kLocalFoldFlag) && !FLEET_LOCAL_FOLD)
+            die("graph requires -DFLEET_LOCAL_FOLD=1 in both translation units");
+        if ((t.flags & kLocalKvaFlag) && !FLEET_LOCAL_KVA)
+            die("graph requires -DFLEET_LOCAL_KVA=1 in both translation units");
+        if (t.kind == TASK_REDUCE) {
+            const bool fold = (t.flags & kLocalFoldFlag) != 0;
+            const bool kva = (t.flags & kLocalKvaFlag) != 0;
+            if (fold == kva || (fold && t.head != kFoldOproj && t.head != kFoldExpert)
+                            || (kva && t.head != kGatherKva))
+                die("invalid local assembly descriptor");
+        }
+    }
+    if ((local_fold || local_kva) && (coherent_acts || prefetch_next))
+        die("local assembly requires the default fenced path without prefetch-next");
+    std::printf("local assembly: fold=%d kva=%d payload-verification=%d\n",
+                (int)local_fold, (int)local_kva, FLEET_VERIFY_LOCAL_ASSEMBLY);
+#endif
+#line 403
     auto q = build_queues(tasks);
     auto labels = load_event_labels(graph_path);
     int max_event = -1, kv_chunks = 1;
@@ -580,10 +612,24 @@ int main(int argc, char** argv) {
         // activations (§5)
         act.x[0] = dev_alloc<float>(d.hidden);
         act.x[1] = dev_alloc<float>(d.hidden);
+#if FLEET_LOCAL_FOLD
+        // A private fold slot per XCD, separate from the normed expert input.
+        // Keeping the extension in this allocation leaves Activations' ABI frozen.
+        act.x_norm = dev_alloc<float>((size_t)kNumXCDs * d.hidden * (local_fold ? 2 : 1));
+#else
         act.x_norm = dev_alloc<float>((size_t)kNumXCDs * d.hidden);
+#endif
+#line 584
         act.q = dev_alloc<float>((size_t)d.heads * d.q_head_dim);
         act.q_absorbed = dev_alloc<float>((size_t)d.heads * kQAbsSlices * d.kv_lora);
+#if FLEET_LOCAL_KVA
+        // Slot 0 remains the shared projection; slots 1..8 are local copies.
+        act.kv_a = dev_alloc<float>((size_t)(kNumXCDs + (local_kva ? 1 : 0))
+                                    * (d.kv_lora + d.qk_rope));
+#else
         act.kv_a = dev_alloc<float>((size_t)kNumXCDs * (d.kv_lora + d.qk_rope));
+#endif
+#line 587
         act.attn_partial = dev_alloc<float>((size_t)d.heads * kv_chunks * kPartialStride);
         act.o = dev_alloc<float>((size_t)d.heads * d.v_head);
         act.expert_h = dev_alloc<float>(std::max((size_t)kNumXCDs * d.moe_inter, (size_t)d.dense_inter));

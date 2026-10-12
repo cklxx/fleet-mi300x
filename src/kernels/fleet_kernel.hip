@@ -21,6 +21,7 @@
 #include "gemv.h"
 #include "attention.h"
 #include "expert.h"
+#include "local_assembly.h"
 
 namespace fleet {
 
@@ -199,6 +200,47 @@ __device__ inline void stage_residual(const ModelDims& d, const float* __restric
     }
 }
 
+#if FLEET_VERIFY_LOCAL_ASSEMBLY
+__device__ inline bool same_payload(float a, float b) {
+    union { float f; uint32_t u; } x, y;
+    x.f = a; y.f = b;
+    return x.u == y.u;
+}
+
+// Diagnostic-only consumer proof, under the real decode's traffic. Read the
+// assembled payload FIRST through the ordinary local path, then compare to
+// agent-scope loads of the original, globally published operands. Do not add
+// a global invalidate that could conceal a missing local publication/acquire.
+// These builds are correctness probes and must never supply timing verdicts.
+__device__ inline void verify_local_fold(const ModelDims& d, const Activations& act,
+                                         const RuntimeState& rt, const float* vec,
+                                         bool oproj, int task_index) {
+    for (int i = threadIdx.x; i < d.hidden; i += kBlockThreads) {
+        float acc;
+        if (oproj) {
+            acc = ld_coh(act.oproj_partial + i, true);
+            for (int x = 1; x < kNumXCDs; ++x)
+                acc += ld_coh(act.oproj_partial + x * d.hidden + i, true);
+        } else {
+            acc = 0.f;
+            for (int x = 0; x < kNumXCDs; ++x) {
+                const uint32_t bits = __hip_atomic_load(
+                    reinterpret_cast<const uint32_t*>(act.expert_out + x * d.hidden) + i / 2,
+                    __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+                float lo, hi;
+                unpack_bf16x2(bits, lo, hi);
+                acc += (i & 1) ? hi : lo;
+            }
+        }
+        const float expected = bf16_round(ld_coh(act.x[oproj ? 0 : 1] + i, true)
+                                           + bf16_round(acc));
+        if (!same_payload(vec[i], expected))
+            raise_abort(rt, kAbortLocalPayload | (uint32_t)task_index);
+    }
+    __syncthreads();
+}
+#endif
+
 // Layer-boundary capture (§6): vec holds the output of layer `layer`.
 __device__ inline void dump_layer(const ModelDims& d, const Activations& act, int layer,
                                   const float* __restrict__ vec, int xcd, int worker,
@@ -360,6 +402,14 @@ __device__ void task_norm_router(const ModelDims& d, const Weights& w,
     // x[1] = bf16(x[0] + bf16(o_proj)). K-split leaves 8 fp32 partials for
     // this prologue to fold; row-split already wrote x[1] through o_proj's own
     // EPI_RESIDUAL epilogue, so there is nothing to fold and we only stage.
+#if FLEET_LOCAL_FOLD
+    if (t.flags & kLocalFoldFlag) {
+        stage_vector(act.x_norm + (int64_t)(kNumXCDs + xcd) * d.hidden, s.vec, d.hidden);
+#if FLEET_VERIFY_LOCAL_ASSEMBLY
+        verify_local_fold(d, act, rt, s.vec, true, t.index);
+#endif
+    } else
+#endif
     if (t.flags & FLAG_OPROJ_ROW_SPLIT) {
         if (coh) {
             for (int i = threadIdx.x; i < d.hidden; i += kBlockThreads)
@@ -552,7 +602,43 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
         case TASK_NORM_ROUTER: task_norm_router(d, w, act, s, L, xcd, worker,
                                                 L >= d.first_k_dense, tc, coh, t, rt); break;
         case TASK_ARGMAX:      task_argmax(d, act, rt, tc); break;
+#if FLEET_LOCAL_FOLD || FLEET_LOCAL_KVA
+        case TASK_REDUCE: {
+#if FLEET_LOCAL_FOLD
+            if (t.flags & kLocalFoldFlag) {
+                // Each consumer XCD acquires the ORIGINAL global producer
+                // event before assembling. Reuse the exact ordered fold and
+                // its bf16 roundings; only XCD 0 publishes the canonical x.
+                // The local copy is separate from x_norm, x and all partials.
+                if (t.head == kFoldOproj) {
+                    stage_residual_f32(d, act.x[0], act.oproj_partial, act.x[1],
+                                       s.vec, xcd, 0, coh);
+                } else {
+                    stage_residual(d, act.x[1], act.expert_out,
+                                   L < 0 ? nullptr : act.x[0], s.vec, xcd, 0, coh);
+                }
+                float* local = act.x_norm + (int64_t)(kNumXCDs + xcd) * d.hidden;
+                for (int i = threadIdx.x; i < d.hidden; i += kBlockThreads) local[i] = s.vec[i];
+            }
+#endif
+#if FLEET_LOCAL_KVA
+            if (t.flags & kLocalKvaFlag) {
+                // Projection still writes ONE 576-row buffer (72 rows/XCD).
+                // This workgroup, physically resident on the consumer XCD,
+                // gathers ALL shards after the global acquire and republishes
+                // into its own nonaliasing slot. Even XCD 0 has a separate copy.
+                const int rows = d.kv_lora + d.qk_rope;
+                float* local = act.kv_a + (int64_t)(xcd + 1) * rows;
+                for (int i = threadIdx.x; i < rows; i += kBlockThreads) local[i] = act.kv_a[i];
+            }
+#endif
+            // The existing task epilogue joins all waves, drains stores and
+            // signals the XCD-local event; consumers take its L1 acquire.
+            break;
+        }
+#else
         case TASK_REDUCE:      break;   // retired: consumers fold in their prologue
+#endif
 
         // Publish one row slice of this head's absorbed q_c. Runs on a worker
         // that would otherwise idle through the attention phase (32 of the
@@ -622,6 +708,14 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
             // x[1] (+ its expert partials if it was MoE), published to x[0]
             const float* src = (L == 0) ? act.x[0] : act.x[1];
             const __hip_bfloat16* parts = (t.flags & FLAG_FOLD_PARTIALS) ? act.expert_out : nullptr;
+#if FLEET_LOCAL_FOLD
+            if (t.flags & kLocalFoldFlag) {
+                stage_vector(act.x_norm + (int64_t)(kNumXCDs + xcd) * d.hidden, s.vec, d.hidden);
+#if FLEET_VERIFY_LOCAL_ASSEMBLY
+                verify_local_fold(d, act, rt, s.vec, false, t.index);
+#endif
+            } else
+#endif
             stage_residual(d, src, parts, (L == 0) ? nullptr : act.x[0], s.vec, xcd, worker, coh);
             dump_layer(d, act, L - 1, s.vec, xcd, worker, tc);
             FLEET_STAMP_STAGE();
@@ -652,6 +746,18 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
             __hip_bfloat16* cache_layer = kv.data + (int64_t)L * kv.max_pos * kv.row;
             const float* kv_a = act.kv_a + ((t.flags & FLAG_KVA_SHARED) ? 0
                                             : (int64_t)xcd * (d.kv_lora + d.qk_rope));
+#if FLEET_LOCAL_KVA
+            if (t.flags & kLocalKvaFlag) {
+                kv_a = act.kv_a + (int64_t)(xcd + 1) * (d.kv_lora + d.qk_rope);
+#if FLEET_VERIFY_LOCAL_ASSEMBLY
+                stage_vector(kv_a, s.part, d.kv_lora + d.qk_rope);
+                for (int i = threadIdx.x; i < d.kv_lora + d.qk_rope; i += kBlockThreads)
+                    if (!same_payload(s.part[i], ld_coh(act.kv_a + i, true)))
+                        raise_abort(rt, kAbortLocalPayload | (uint32_t)t.index);
+                __syncthreads();
+#endif
+            }
+#endif
             kv_post(kv_a, w.layer_kv_a_norm[L], tc.cos, tc.sin, s.row,
                     d.kv_lora, d.qk_rope, d.rms_eps, s.smem,
                     /*write_cache=*/t.head == 0 && t.kv_chunk == 0,   // one writer per layer
@@ -797,6 +903,14 @@ __device__ bool run_task(const TaskDescriptor& t, const RuntimeState& rt,
             break;
 
         case TASK_LM_HEAD:
+#if FLEET_LOCAL_FOLD
+            if (t.flags & kLocalFoldFlag) {
+                stage_vector(act.x_norm + (int64_t)(kNumXCDs + xcd) * d.hidden, s.vec, d.hidden);
+#if FLEET_VERIFY_LOCAL_ASSEMBLY
+                verify_local_fold(d, act, rt, s.vec, false, t.index);
+#endif
+            } else
+#endif
             stage_residual(d, act.x[1], (t.flags & FLAG_FOLD_PARTIALS) ? act.expert_out : nullptr,
                            nullptr, s.vec, xcd, worker, coh);
             dump_layer(d, act, d.layers - 1, s.vec, xcd, worker, tc);
