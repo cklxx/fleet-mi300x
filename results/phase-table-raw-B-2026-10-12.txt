@@ -1,0 +1,23 @@
+step: 54946 descriptors, 28 layers, span 3576.8 us on the device clock
+
+  phase               n  worker_us  per_task in_layer_us  stage_us prologue_us finishes_at
+  EMBED               1        5.5       5.5         5.5       0.0         0.0        5.5
+  DENSE_GATE_UP     296     7678.6      25.9        28.8       0.0         0.0      104.9
+  DENSE_DOWN        296     5760.1      19.5        21.9       0.0         0.0      127.5
+  QKV_FUSED        7992   130700.3      16.4        18.6   35088.4     56369.2     3333.8
+  Q_ABSORB          864     5128.5       5.9         7.1       0.0         0.0     3341.8
+  ATTENTION        6912   125679.3      18.2        20.2   39783.5     54100.2     3354.4
+  MERGE_UV         6912    67108.2       9.7        13.0       0.0         0.0     3365.5
+  O_PROJ           7992    59006.5       7.4        11.8       0.0      7071.5     3374.7
+  NORM_ROUTER      7992    86185.6      10.8        12.2   36839.4     58596.7     3387.7
+  EXPERT_GATE_UP   7696   237466.7      30.9        33.7   38267.4     46036.1     3420.7
+  EXPERT_DOWN      7696   136091.1      17.7        21.6       0.0     12763.2     3440.3
+  LM_HEAD           296    37029.4     125.1       130.2       0.0      2413.6     3571.3
+  ARGMAX              1        4.4       4.4         4.4       0.0         0.0     3576.8
+
+  worker_us   = sum of task durations; counts every worker, so it is occupancy, not wall time
+  in_layer_us = mean span of this phase inside one layer (first ready -> last done)
+  finishes_at = when the phase's last task signalled, on the step clock
+
+  step span on the device clock: 3576.8 us
+  busiest single task per phase: LM_HEAD=129us, EXPERT_GATE_UP=35us, DENSE_GATE_UP=28us, DENSE_DOWN=21us, EXPERT_DOWN=20us
