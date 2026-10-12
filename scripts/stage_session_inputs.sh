@@ -68,7 +68,7 @@ fi
 # shellcheck disable=SC1091
 . .venv/bin/activate
 python -m pip install -q --upgrade pip
-python -m pip install -q numpy "huggingface_hub"
+python -m pip install -q numpy "huggingface_hub[hf_transfer]"
 python -m pip install -q --index-url https://download.pytorch.org/whl/rocm7.0 torch
 python -m pip install -q "transformers>=4.39,<5" "tokenizers<0.20" accelerate safetensors
 python - <<'PY'
@@ -88,12 +88,16 @@ if [ -f "$MODEL/config.json" ] && [ "$FORCE" -eq 0 ]; then
   echo "already present ($(du -sh "$MODEL" 2>/dev/null | cut -f1)); use --force to refetch"
 else
   mkdir -p "$MODEL"
-  HF_HUB_ENABLE_HF_TRANSFER=1 python - <<PY
+  download() {
+    HF_HUB_ENABLE_HF_TRANSFER="$1" python - <<PY
 from huggingface_hub import snapshot_download
 snapshot_download("$MODEL_REPO", local_dir="$MODEL",
                   allow_patterns=["*.json", "*.safetensors", "*.py", "tokenizer*"], max_workers=8)
 print("MODEL-DONE")
 PY
+  }
+  # hf_transfer is a large speed-up but an optional wheel; fall back rather than die.
+  download 1 || { echo "fast download failed; retrying without hf_transfer"; rm -rf "$MODEL"; mkdir -p "$MODEL"; download 0; }
 fi
 [ -f "$MODEL/config.json" ] || die "model incomplete at $MODEL"
 echo "model: $(du -sh "$MODEL" | cut -f1)"
