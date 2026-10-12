@@ -1,0 +1,125 @@
+[
+  {
+    "name": "checkout_head",
+    "command": [
+      "git",
+      "rev-parse",
+      "HEAD"
+    ],
+    "expected_seconds": 30,
+    "cap_seconds": 90,
+    "returncode": 0,
+    "elapsed_seconds": 0.013902583159506321,
+    "log": "logs/checkout_head.log"
+  },
+  {
+    "name": "checkout_status",
+    "command": [
+      "git",
+      "status",
+      "--porcelain",
+      "--untracked-files=no"
+    ],
+    "expected_seconds": 30,
+    "cap_seconds": 90,
+    "returncode": 0,
+    "elapsed_seconds": 0.01581758400425315,
+    "log": "logs/checkout_status.log"
+  },
+  {
+    "name": "tracked_py",
+    "command": [
+      "git",
+      "ls-files",
+      "--error-unmatch",
+      "tests/run_fk_session.py"
+    ],
+    "expected_seconds": 30,
+    "cap_seconds": 90,
+    "returncode": 0,
+    "elapsed_seconds": 0.012678791768848896,
+    "log": "logs/tracked_py.log"
+  },
+  {
+    "name": "tracked_json",
+    "command": [
+      "git",
+      "ls-files",
+      "--error-unmatch",
+      "tests/run_fk_session.manifest.json"
+    ],
+    "expected_seconds": 30,
+    "cap_seconds": 90,
+    "returncode": 0,
+    "elapsed_seconds": 0.012325124815106392,
+    "log": "logs/tracked_json.log"
+  },
+  {
+    "name": "remote_session",
+    "command": [
+      "ssh",
+      "-o",
+      "BatchMode=yes",
+      "-o",
+      "ConnectTimeout=10",
+      "root@165.245.132.182",
+      "cd /root/fleet-mi300x && .venv/bin/python -u tests/run_fk_session.py --worker --out /tmp/fleet-fk-25ab86cb22ce4094b4e9a3edd0fcf435 --worker-seconds 1301.4011845835485 --expected-commit ce32cd515f705037646cb2db583b788729d76ac1 --session-id 25ab86cb22ce4094b4e9a3edd0fcf435"
+    ],
+    "expected_seconds": 30,
+    "cap_seconds": 1331.4011845835485,
+    "returncode": 1,
+    "elapsed_seconds": 4.609488415997475,
+    "log": "logs/remote_session.log"
+  },
+  {
+    "name": "stop_and_seal",
+    "command": [
+      "ssh",
+      "-o",
+      "BatchMode=yes",
+      "-o",
+      "ConnectTimeout=10",
+      "root@165.245.132.182",
+      "cd /root/fleet-mi300x && .venv/bin/python -u tests/run_fk_session.py --stop-worker --out /tmp/fleet-fk-25ab86cb22ce4094b4e9a3edd0fcf435 --session-id 25ab86cb22ce4094b4e9a3edd0fcf435"
+    ],
+    "expected_seconds": 30,
+    "cap_seconds": 35,
+    "returncode": 0,
+    "elapsed_seconds": 3.8348382906988263,
+    "log": "logs/stop_and_seal.log"
+  },
+  {
+    "name": "export",
+    "command": [
+      "scp",
+      "-r",
+      "-o",
+      "BatchMode=yes",
+      "-o",
+      "ConnectTimeout=10",
+      "root@165.245.132.182:/tmp/fleet-fk-25ab86cb22ce4094b4e9a3edd0fcf435",
+      "/Users/ckl/code/fleet-mi300x/results/fk-20261012T135009Z/remote"
+    ],
+    "expected_seconds": 30,
+    "cap_seconds": 1572.9516945416108,
+    "returncode": 0,
+    "elapsed_seconds": 32.44858400011435,
+    "log": "logs/export.log"
+  },
+  {
+    "name": "delete_machine",
+    "command": [
+      "doctl",
+      "compute",
+      "droplet",
+      "delete",
+      "608406276",
+      "--force"
+    ],
+    "expected_seconds": 15,
+    "cap_seconds": 45,
+    "returncode": 1,
+    "elapsed_seconds": 0.16721729189157486,
+    "log": "logs/delete_machine.log"
+  }
+]

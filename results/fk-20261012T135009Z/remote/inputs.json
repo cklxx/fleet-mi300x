@@ -1,0 +1,22 @@
+{
+  "build/weights.bin": {
+    "bytes": 31412968448,
+    "mtime_ns": 1791812599109876922
+  },
+  "build/weights.bin.manifest": {
+    "bytes": 9561,
+    "mtime_ns": 1791812599146876457
+  },
+  "build/fleet_cache.bin": {
+    "bytes": 32845824,
+    "mtime_ns": 1791812568212264091
+  },
+  "build/golden_tokens.txt": {
+    "bytes": 144,
+    "mtime_ns": 1791812568225263928
+  },
+  "build/golden_hidden.bin": {
+    "bytes": 221184,
+    "mtime_ns": 1791812568225263928
+  }
+}

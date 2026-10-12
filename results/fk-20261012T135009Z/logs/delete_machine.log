@@ -1,0 +1,1 @@
+Error: Unable to initialize DigitalOcean API client: access token is required. (hint: run 'doctl auth init')

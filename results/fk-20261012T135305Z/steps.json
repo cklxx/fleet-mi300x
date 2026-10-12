@@ -1,0 +1,92 @@
+[
+  {
+    "name": "checkout_head",
+    "command": [
+      "git",
+      "rev-parse",
+      "HEAD"
+    ],
+    "expected_seconds": 30,
+    "cap_seconds": 90,
+    "returncode": 0,
+    "elapsed_seconds": 0.013347916770726442,
+    "log": "logs/checkout_head.log"
+  },
+  {
+    "name": "checkout_status",
+    "command": [
+      "git",
+      "status",
+      "--porcelain",
+      "--untracked-files=no"
+    ],
+    "expected_seconds": 30,
+    "cap_seconds": 90,
+    "returncode": 0,
+    "elapsed_seconds": 0.01323783304542303,
+    "log": "logs/checkout_status.log"
+  },
+  {
+    "name": "tracked_py",
+    "command": [
+      "git",
+      "ls-files",
+      "--error-unmatch",
+      "tests/run_fk_session.py"
+    ],
+    "expected_seconds": 30,
+    "cap_seconds": 90,
+    "returncode": 0,
+    "elapsed_seconds": 0.013018624857068062,
+    "log": "logs/tracked_py.log"
+  },
+  {
+    "name": "tracked_json",
+    "command": [
+      "git",
+      "ls-files",
+      "--error-unmatch",
+      "tests/run_fk_session.manifest.json"
+    ],
+    "expected_seconds": 30,
+    "cap_seconds": 90,
+    "returncode": 0,
+    "elapsed_seconds": 0.012838499620556831,
+    "log": "logs/tracked_json.log"
+  },
+  {
+    "name": "remote_session",
+    "command": [
+      "ssh",
+      "-o",
+      "BatchMode=yes",
+      "-o",
+      "ConnectTimeout=10",
+      "root@165.245.132.182",
+      "cd /root/fleet-mi300x && .venv/bin/python -u tests/run_fk_session.py --worker --out /tmp/fleet-fk-f085448b233a45d5ba8ada5ad271265f --worker-seconds 1125.220953708049 --expected-commit ce32cd515f705037646cb2db583b788729d76ac1 --session-id f085448b233a45d5ba8ada5ad271265f"
+    ],
+    "expected_seconds": 30,
+    "cap_seconds": 1155.220953708049,
+    "returncode": 0,
+    "elapsed_seconds": 213.172898624558,
+    "log": "logs/remote_session.log"
+  },
+  {
+    "name": "export",
+    "command": [
+      "scp",
+      "-r",
+      "-o",
+      "BatchMode=yes",
+      "-o",
+      "ConnectTimeout=10",
+      "root@165.245.132.182:/tmp/fleet-fk-f085448b233a45d5ba8ada5ad271265f",
+      "/Users/ckl/code/fleet-mi300x/results/fk-20261012T135305Z/remote"
+    ],
+    "expected_seconds": 30,
+    "cap_seconds": 1192.0451998752542,
+    "returncode": -9,
+    "elapsed_seconds": 1192.1540439999662,
+    "log": "logs/export.log"
+  }
+]

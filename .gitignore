@@ -6,3 +6,9 @@ __pycache__/
 *.pyc
 *.npz
 *.bin
+
+# 2026-10-12: the 6.6 MB session tarball is the tracked copy; the extracted tree, the
+# partial re-fetches and the controller's remote staging dir are derivatives.
+results/fk-20261012T135305Z/bundle/fleet-fk-*/
+results/fk-20261012T135305Z/recovered2/
+results/fk-20261012T135305Z/remote/

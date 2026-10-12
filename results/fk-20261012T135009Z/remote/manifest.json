@@ -1,0 +1,63 @@
+{
+  "schema": 1,
+  "session": "fk-2026-10-12",
+  "historical_usd_per_hour": 2.99,
+  "budget_minutes": {
+    "environment": 2,
+    "prerequisite": 5,
+    "F": 15,
+    "K": 10,
+    "FK": 10,
+    "final_validation": 3,
+    "export_delete": 5
+  },
+  "warm_hard_minutes": 50,
+  "cold_setup_allowance_minutes": 15,
+  "cold_hard_minutes": 65,
+  "heartbeat_seconds": 30,
+  "silence_probe_margin_seconds": 180,
+  "steps_seconds": {
+    "environment": [30, 90],
+    "graph": [5, 30],
+    "native_check": [90, 270],
+    "compile": [30, 210],
+    "microbench": [30, 210],
+    "decode": [10, 190],
+    "capture": [5, 30],
+    "transport": [30, 210],
+    "delete": [15, 45]
+  },
+  "pairs": 3,
+  "verdict": {
+    "delta": "control median_ms minus candidate median_ms, separate processes, repeat=1",
+    "all_deltas_strictly_positive": true,
+    "minimum_median_delta_ms": 0.030,
+    "spread": "max(paired deltas) minus min(paired deltas)",
+    "median_strictly_exceeds_spread_times": 2
+  },
+  "gates": {
+    "tokens": 32,
+    "context": 1024,
+    "tokens_per_launch": 32,
+    "matched": 32,
+    "compared": 32,
+    "layers_within_gate": 27,
+    "layers": 27,
+    "layer_max_relative_error": 0.02,
+    "layer_min_cosine": 0.999,
+    "determinism_processes": 3
+  },
+  "arms": [
+    {"name": "F", "defines": ["FLEET_LOCAL_FOLD"], "graph_flags": ["--local-fold"]},
+    {"name": "K", "defines": ["FLEET_LOCAL_KVA"], "graph_flags": ["--local-kva"]},
+    {"name": "FK", "defines": ["FLEET_LOCAL_FOLD", "FLEET_LOCAL_KVA"], "graph_flags": ["--local-fold", "--local-kva"], "requires_kept": ["F", "K"]}
+  ],
+  "reject_conditions": {
+    "F": "Sum of 53 phase maxima from original global producer completion through every reader's fold staging (final head: norm-ready) must be strictly shorter than both shipped and matching controls; record all 424 per-XCD intervals.",
+    "K": "Charge 2304 B read + 2304 B written per XCD/layer. Both 27-phase kv_post-ready and attention-body-ready tail sums must shrink versus shipped and matching controls. Reject if measured q_c producer/kv_post overlap was positive for any control reader and vanishes in the corresponding candidate reader; report per-reader and per-layer overlap.",
+    "FK": "Require F and K kept; repeat both screens versus shipped/matching-off controls and isolate F versus combined-binary K graph, K versus combined-binary F graph. Timing must beat shipped and combined-binary F-only controls."
+  },
+  "inputs": ["build/weights.bin", "build/weights.bin.manifest", "build/fleet_cache.bin", "build/golden_tokens.txt", "build/golden_hidden.bin"],
+  "nice_to_have": "Text timelines from already captured traces, after final validation; no extra GPU capture.",
+  "lifecycle": "Committed clean tracked checkout on controller and remote. Required rental-start timestamp; cap includes elapsed setup. Worker report and SHA256 inventory on every normal/error/timeout exit. Copy whole bundle into controller repository results, verify inventory, then invoke operator-supplied delete argv. Failed export blocks deletion and exits nonzero with recovery command."
+}

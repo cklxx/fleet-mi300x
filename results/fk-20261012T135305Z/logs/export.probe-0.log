@@ -1,0 +1,6 @@
+  PID  PPID ELAPSED STAT COMMAND
+48111 48023   03:01 Ss   scp -r -o BatchMode=yes -o ConnectTimeout=10 root@165.245.132.182:/tmp/fleet-fk-f085448b233a45d5ba8ada5ad271265f /Users/ckl/code/fleet-mi300x/results/fk-20261012T135305Z/remote
+$ ps -p 48111 -o pid,ppid,etime,state,command
+  PID  PPID ELAPSED STAT COMMAND
+48111 48023   19:52 Ss   scp -r -o BatchMode=yes -o ConnectTimeout=10 root@165.245.132.182:/tmp/fleet-fk-f085448b233a45d5ba8ada5ad271265f /Users/ckl/code/fleet-mi300x/results/fk-20261012T135305Z/remote
+$ ps -p 48111 -o pid,ppid,etime,state,command

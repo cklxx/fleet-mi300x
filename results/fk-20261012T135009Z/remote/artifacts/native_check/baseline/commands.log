@@ -1,0 +1,10 @@
+cwd=/tmp/fleet-v018-build-4e2d2tgl
+$ /opt/rocm/core-7.14/bin/hipcc --offload-arch=gfx942 -O3 -std=c++17 -Isrc -cuid=fleet_kernel -c src/kernels/fleet_kernel.hip -o /tmp/fleet-fk-25ab86cb22ce4094b4e9a3edd0fcf435/artifacts/native_check/baseline/plain.fleet_kernel.o
+In file included from src/kernels/fleet_kernel.hip:19:
+src/runtime/fleet_runtime.h:33:10: fatal error: 'hip/hip_runtime.h' file not found
+   33 | #include <hip/hip_runtime.h>
+      |          ^~~~~~~~~~~~~~~~~~~
+1 error generated when compiling for gfx942.
+failed to execute:/opt/rocm/core-7.14/lib/llvm/bin/clang++  --offload-arch=gfx942  -O3 -std=c++17 -Isrc -cuid=fleet_kernel -c -x hip src/kernels/fleet_kernel.hip -o "/tmp/fleet-fk-25ab86cb22ce4094b4e9a3edd0fcf435/artifacts/native_check/baseline/plain.fleet_kernel.o"
+
+exit=1

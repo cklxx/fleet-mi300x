@@ -1,0 +1,109 @@
+[
+  {
+    "name": "checkout_head",
+    "command": [
+      "git",
+      "rev-parse",
+      "HEAD"
+    ],
+    "expected_seconds": 30,
+    "cap_seconds": 90,
+    "returncode": 0,
+    "elapsed_seconds": 0.0025542220000716043,
+    "log": "logs/checkout_head.log"
+  },
+  {
+    "name": "checkout_status",
+    "command": [
+      "git",
+      "status",
+      "--porcelain",
+      "--untracked-files=no"
+    ],
+    "expected_seconds": 30,
+    "cap_seconds": 90,
+    "returncode": 0,
+    "elapsed_seconds": 0.002523984999925233,
+    "log": "logs/checkout_status.log"
+  },
+  {
+    "name": "tracked_py",
+    "command": [
+      "git",
+      "ls-files",
+      "--error-unmatch",
+      "tests/run_fk_session.py"
+    ],
+    "expected_seconds": 30,
+    "cap_seconds": 90,
+    "returncode": 0,
+    "elapsed_seconds": 0.002083714000036707,
+    "log": "logs/tracked_py.log"
+  },
+  {
+    "name": "tracked_json",
+    "command": [
+      "git",
+      "ls-files",
+      "--error-unmatch",
+      "tests/run_fk_session.manifest.json"
+    ],
+    "expected_seconds": 30,
+    "cap_seconds": 90,
+    "returncode": 0,
+    "elapsed_seconds": 0.0015825790001144924,
+    "log": "logs/tracked_json.log"
+  },
+  {
+    "name": "environment_hipcc",
+    "command": [
+      "hipcc",
+      "--version"
+    ],
+    "expected_seconds": 30,
+    "cap_seconds": 90,
+    "returncode": 0,
+    "elapsed_seconds": 0.04651917800015326,
+    "log": "logs/environment_hipcc.log"
+  },
+  {
+    "name": "environment_gpu",
+    "command": [
+      "rocminfo"
+    ],
+    "expected_seconds": 30,
+    "cap_seconds": 90,
+    "returncode": 0,
+    "elapsed_seconds": 0.030302627999844844,
+    "log": "logs/environment_gpu.log"
+  },
+  {
+    "name": "environment_disk",
+    "command": [
+      "df",
+      "-h",
+      ".",
+      "/tmp/fleet-fk-25ab86cb22ce4094b4e9a3edd0fcf435"
+    ],
+    "expected_seconds": 30,
+    "cap_seconds": 90,
+    "returncode": 0,
+    "elapsed_seconds": 0.05166392899991479,
+    "log": "logs/environment_disk.log"
+  },
+  {
+    "name": "native_check",
+    "command": [
+      "/root/fleet-mi300x/.venv/bin/python",
+      "/root/fleet-mi300x/tests/run_fk_session.py",
+      "--native-check-stream",
+      "--out",
+      "/tmp/fleet-fk-25ab86cb22ce4094b4e9a3edd0fcf435/artifacts/native_check"
+    ],
+    "expected_seconds": 90,
+    "cap_seconds": 270,
+    "returncode": 1,
+    "elapsed_seconds": 0.5163531860000603,
+    "log": "logs/native_check.log"
+  }
+]

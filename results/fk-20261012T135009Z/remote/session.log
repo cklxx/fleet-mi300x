@@ -1,0 +1,20 @@
+[2026-10-12T13:50:13+00:00] STAGE environment; allocation=120s; hard remaining=1301.4s
+[2026-10-12T13:50:13+00:00] STEP checkout_head; expected=30s; deadline<=90s; $ git rev-parse HEAD
+[2026-10-12T13:50:13+00:00] END checkout_head: exit=0, elapsed=0.00s
+[2026-10-12T13:50:13+00:00] STEP checkout_status; expected=30s; deadline<=90s; $ git status --porcelain --untracked-files=no
+[2026-10-12T13:50:13+00:00] END checkout_status: exit=0, elapsed=0.00s
+[2026-10-12T13:50:13+00:00] STEP tracked_py; expected=30s; deadline<=90s; $ git ls-files --error-unmatch tests/run_fk_session.py
+[2026-10-12T13:50:13+00:00] END tracked_py: exit=0, elapsed=0.00s
+[2026-10-12T13:50:13+00:00] STEP tracked_json; expected=30s; deadline<=90s; $ git ls-files --error-unmatch tests/run_fk_session.manifest.json
+[2026-10-12T13:50:13+00:00] END tracked_json: exit=0, elapsed=0.00s
+[2026-10-12T13:50:13+00:00] STEP environment_hipcc; expected=30s; deadline<=90s; $ hipcc --version
+[2026-10-12T13:50:13+00:00] END environment_hipcc: exit=0, elapsed=0.05s
+[2026-10-12T13:50:13+00:00] STEP environment_gpu; expected=30s; deadline<=90s; $ rocminfo
+[2026-10-12T13:50:13+00:00] END environment_gpu: exit=0, elapsed=0.03s
+[2026-10-12T13:50:13+00:00] STEP environment_disk; expected=30s; deadline<=90s; $ df -h . /tmp/fleet-fk-25ab86cb22ce4094b4e9a3edd0fcf435
+[2026-10-12T13:50:13+00:00] END environment_disk: exit=0, elapsed=0.05s
+[2026-10-12T13:50:13+00:00] STAGE prerequisite; allocation=300s; hard remaining=1301.3s
+[2026-10-12T13:50:13+00:00] STEP native_check; expected=90s; deadline<=270s; $ /root/fleet-mi300x/.venv/bin/python /root/fleet-mi300x/tests/run_fk_session.py --native-check-stream --out /tmp/fleet-fk-25ab86cb22ce4094b4e9a3edd0fcf435/artifacts/native_check
+[2026-10-12T13:50:14+00:00] END native_check: exit=1, elapsed=0.52s
+[2026-10-12T13:50:14+00:00] Stop: native_check: exit 1; full log /tmp/fleet-fk-25ab86cb22ce4094b4e9a3edd0fcf435/logs/native_check.log
+[2026-10-12T13:50:14+00:00] WORKER DONE: sealing complete raw bundle before deletion

@@ -1,0 +1,7 @@
+{
+  "status": "aborted",
+  "arms": {},
+  "commit": "ce32cd515f705037646cb2db583b788729d76ac1",
+  "session_id": "25ab86cb22ce4094b4e9a3edd0fcf435",
+  "error": "Stop: native_check: exit 1; full log /tmp/fleet-fk-25ab86cb22ce4094b4e9a3edd0fcf435/logs/native_check.log"
+}
