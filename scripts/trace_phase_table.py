@@ -98,7 +98,7 @@ def main() -> int:
     print()
     print(f"  step span on the device clock: {step_us:.1f} us")
     print(f"  busiest single task per phase: "
-          + ", ".join(f"{TaskKind(k).name}={k['ld'] * US:.0f}us" for k, k in
+          + ", ".join(f"{TaskKind(kind).name}={kv['ld'] * US:.0f}us" for kind, kv in
                       sorted(agg.items(), key=lambda kv: -kv[1]["ld"])[:5]))
     return 0
 
